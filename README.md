@@ -14,15 +14,50 @@
 git clone https://github.com/np3ir/orpheusdl.git
 cd orpheusdl
 
-# 2. Install Python dependencies
+# 2. Install core Python dependencies
 pip install -r requirements.txt
 
-# 3. Install Apple Music module dependencies
-pip install -r modules/applemusic/gamdl/requirements.txt
+# 3. Install dependencies for each module you want to use
+pip install -r modules/applemusic/gamdl/requirements.txt   # Apple Music
+pip install -r modules/tidal/requirements.txt              # Tidal (if exists)
+pip install -r modules/spotify/requirements.txt            # Spotify (if exists)
 
-# 4. Copy the example settings
+# 4. Copy the example settings and configure your credentials
 copy config\settings_example.json config\settings.json   # Windows
 # cp config/settings_example.json config/settings.json   # Linux/Mac
+```
+
+### Module Setup
+
+All modules are included in the `modules/` directory. Each service requires its own credentials configured in `config/settings.json`.
+
+#### 🍎 Apple Music
+- Requires `config/cookies.txt` — see **Apple Music — Cookies Setup** below
+- No account login required in settings.json (authentication via cookies)
+
+#### 🌊 Tidal
+- Requires a Tidal HiFi (Plus) subscription
+- Run `python orpheus.py` and it will prompt you to authenticate via TV login (browser)
+
+#### 🟠 Deezer
+- Add your ARL token to `settings.json`:
+```json
+"deezer": {
+    "arl": "your_arl_token_here"
+}
+```
+- Get your ARL from the `arl` cookie at [deezer.com](https://www.deezer.com) after logging in
+
+#### 🟢 Spotify
+- Requires Spotify Premium
+- Authentication handled automatically on first run
+
+#### ☁️ SoundCloud
+- Add your OAuth token to `settings.json`:
+```json
+"soundcloud": {
+    "web_access_token": "OAuth 2-..."
+}
 ```
 
 ### Apple Music — Cookies Setup
