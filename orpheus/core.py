@@ -36,6 +36,8 @@ class Orpheus:
         self.default_global_settings = {
             "general": {
                 "download_path": "./downloads/",
+                "video_download_path": "./videos/",
+                "download_videos": True,
                 "download_quality": "hifi",
                 "search_limit": 10,
                 "concurrent_downloads": 5,
@@ -138,12 +140,15 @@ class Orpheus:
         os.makedirs('extensions', exist_ok=True)
         for extension in os.listdir('extensions'):  # Loading extensions
             if os.path.isdir(f'extensions/{extension}') and os.path.exists(f'extensions/{extension}/interface.py'):
-                class_ = getattr(importlib.import_module(f'extensions.{extension}.interface'), 'OrpheusExtension', None)
-                if class_:
-                    self.extension_list.add(extension)
-                    logging.debug(f'Orpheus: {extension} extension detected')
-                else:
-                    raise Exception('Error loading extension: "{extension}"')
+                try:
+                    class_ = getattr(importlib.import_module(f'extensions.{extension}.interface'), 'OrpheusExtension', None)
+                    if class_:
+                        self.extension_list.add(extension)
+                        logging.debug(f'Orpheus: {extension} extension detected')
+                    else:
+                        raise Exception(f'Error loading extension: "{extension}"')
+                except Exception as e:
+                    logging.warning(f"Failed to load extension '{extension}': {e}")
 
         # Module preparation (not loaded yet for performance purposes)
         os.makedirs('modules', exist_ok=True)
@@ -154,13 +159,16 @@ class Orpheus:
         logging.debug('Orpheus: Modules detected: ' + ", ".join(module_list))
 
         for module in module_list:  # Loading module information into module_settings
-            module_information: ModuleInformation = getattr(importlib.import_module(f'modules.{module}.interface'), 'module_information', None)
-            if module_information and not ModuleFlags.private in module_information.flags and not private_mode:
-                self.module_list.add(module)
-                self.module_settings[module] = module_information
-                logging.debug(f'Orpheus: {module} added as a module')
-            else:
-                raise Exception(f'Error loading module information from module: "{module}"') # TODO: replace with InvalidModuleError
+            try:
+                module_information: ModuleInformation = getattr(importlib.import_module(f'modules.{module}.interface'), 'module_information', None)
+                if module_information and not ModuleFlags.private in module_information.flags and not private_mode:
+                    self.module_list.add(module)
+                    self.module_settings[module] = module_information
+                    logging.debug(f'Orpheus: {module} added as a module')
+                else:
+                    raise Exception(f'Error loading module information from module: "{module}"') # TODO: replace with InvalidModuleError
+            except Exception as e:
+                logging.warning(f"Failed to load module '{module}': {e}")
 
         duplicates = set()
         for module in self.module_list: # Detecting duplicate url constants
@@ -180,7 +188,7 @@ class Orpheus:
                     elif ModuleFlags.private in module_info.flags: # Replacing public modules with private ones
                         if ModuleFlags.private in self.module_settings[constant].flags: duplicates.add(constant)
                     else:
-                        duplicates.add(sorted([module, self.module_netloc_constants[constant]]))
+                        duplicates.add(tuple(sorted([module, self.module_netloc_constants[constant]])))
         if duplicates: raise Exception('Multiple modules installed that connect to the same service names: ' + ', '.join(' and '.join(duplicates)))
 
         self.update_module_storage()
@@ -507,4 +515,4 @@ def orpheus_core_download(orpheus_session: Orpheus, media_to_download, third_par
                 downloader.print('No tracks were deferred due to rate limiting.', drop_level=0)
                 print()  # Add blank line after message
 
-    if os.path.exists('temp'): shutil.rmtree('temp')
+    if os.path.exists('temp'): shutil.rmtree('temp', ignore_errors=True)

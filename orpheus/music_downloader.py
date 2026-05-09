@@ -1,18 +1,35 @@
-import logging, os, ffmpeg
+import logging
+import os
 import shutil
 import unicodedata
-from dataclasses import asdict
-from time import strftime, gmtime
 import json
-from enum import Enum
 import uuid
 import time
 import re
 import platform
+import asyncio
+import sys
+import sqlite3
+import threading
+import traceback
+from dataclasses import asdict, dataclass
+from time import strftime, gmtime
+from datetime import datetime
+from enum import Enum
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Third party imports
+import ffmpeg
 from ffmpeg import Error
 
+
+# --- FIX: Import tqdm AFTER utils to avoid conflicts ---
+try:
+    from tqdm import tqdm as tqdm_progress
+except ImportError:
+    tqdm_progress = None
+
+# Local imports
 from orpheus.tagging import tag_file
 from utils.models import *
 from utils.utils import *
@@ -22,138 +39,327 @@ from utils.exceptions import *
 try:
     from modules.spotify.spotify_api import SpotifyRateLimitDetectedError
 except ModuleNotFoundError:
-    # Define a dummy exception if Spotify module isn't found
-    # This allows 'except SpotifyRateLimitDetectedError:' blocks elsewhere
-    # in this file to still compile, though they will never be triggered.
     class SpotifyRateLimitDetectedError(Exception):
         pass
 
-# Platform colors from GUI (hex colors converted to closest ANSI equivalents)
+# ============================================================
+# CONFIGURACIÓN PERSONALIZADA DE USUARIO
+# ============================================================
+
+# OPCIONAL: Define aquí la estructura si no quieres usar el settings.json.
+# Si usas el truco de "|||" en settings.json, esto se ignora.
+PLAYLIST_TRACK_STRUCTURE = "E:/{name}/{artists} - {title_clean}{explicit}{master: [m]}{dolby: [atmos]}"
+
+# ============================================================
+# CONSTANTES Y REGEX
+# ============================================================
+
 PLATFORM_COLORS = {
-    "tidal": "\033[96m",         # Bright cyan (#33ffe7 -> bright cyan)
-    "jiosaavn": "\x1b[96m",      # Cyan (#1eccb0 -> cyan) 
-    "apple music": "\033[91m",   # Bright red (#FA586A -> bright red)
-    "beatport": "\033[92m",      # Bright green (#00ff89 -> bright green)
-    "beatsource": "\033[94m",    # Bright blue (#16a8f4 -> bright blue)
-    "deezer": "\033[38;5;129m",        # Bright magenta (#a238ff -> bright magenta)
-    "qobuz": "\033[34m",         # Blue (#0070ef -> blue)
-    "soundcloud": "\033[38;5;208m",    # Bright yellow/orange (#ff5502 -> bright yellow as closest)
-    "spotify": "\033[32m",       # Green (#1cc659 -> green)
-    "napster": "\033[94m",       # Bright blue (#295EFF -> bright blue)
-    "kkbox": "\033[36m",         # Cyan (#27B1D8 -> cyan)
-    "idagio": "\033[35m",        # Magenta (#5C34FE -> magenta)
-    "bugs": "\033[31m",          # Red (#FF3B28 -> red)
-    "nugs": "\033[31m"           # Red (#C83B30 -> red)
+    "tidal": "\033[96m",
+    "jiosaavn": "\x1b[96m",
+    "apple music": "\033[91m",
+    "beatport": "\033[92m",
+    "beatsource": "\033[94m",
+    "deezer": "\033[38;5;129m",
+    "qobuz": "\033[34m",
+    "soundcloud": "\033[38;5;208m",
+    "spotify": "\033[32m",
+    "napster": "\033[94m",
+    "kkbox": "\033[36m",
+    "idagio": "\033[35m",
+    "bugs": "\033[31m",
+    "nugs": "\033[31m"
 }
 
 RESET_COLOR = "\033[0m"
 
+MAX_ARTISTS_LEN = 40
+MAX_TITLE_LEN = 50
+ASCII_ONLY = False
+
+_WIN_FORBIDDEN_RE = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
+_DRIVE_RE = re.compile(r"^[A-Za-z]:$")
+
+_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *{f"COM{i}" for i in range(1, 10)},
+    *{f"LPT{i}" for i in range(1, 10)},
+}
+
+# --- REGEX PARA LIMPIEZA DE TÍTULOS ---
+_RE_ANTI_FEAT = re.compile(r"\s*\((?:f(?:ea)?t\.?|with|starring)\s+(.*?)\)", flags=re.IGNORECASE)
+_RE_NORMALIZE = re.compile(r'[\W_]+')
+
+
+# ============================================================
+# UTILS GENERALES
+# ============================================================
+
 def get_colored_platform_name(service_name):
-    """Get the platform name with appropriate ANSI color coding"""
     if not service_name:
         return "Unknown"
-    
-    # Normalize the service name to lowercase for matching
     normalized_name = service_name.lower()
-    
-    # Get the color for this platform
     color_code = PLATFORM_COLORS.get(normalized_name, "")
-    
-    # Return colored platform name
     if color_code:
         return f"{color_code}{service_name}{RESET_COLOR}"
     else:
         return service_name
 
+
 def beauty_format_seconds(seconds: int) -> str:
     time_data = gmtime(seconds)
-
     time_format = "%Mm:%Ss"
-    # if seconds are higher than 3600s also add the hour format
     if time_data.tm_hour > 0:
         time_format = "%Hh:" + time_format
-    # TODO: also add days to time_format if hours > 24?
-
-    # return the formatted time string
     return strftime(time_format, time_data)
 
 
 def simplify_error_message(error_str: str) -> str:
-    """Convert complex error messages into user-friendly one-liners"""
     error_lower = error_str.lower()
-    
-    # Track unavailable/not found errors
     if any(phrase in error_lower for phrase in ['track is unavailable', 'track unavailable', 'unavailable']):
         return "This song is unavailable."
-    
-    # JSON API error responses with 404 code (e.g., Qobuz)
     if '"code":404' in error_str or '"code": 404' in error_str:
         return "This song is unavailable."
-    
-    # HTTP status code 404 in plain text
     if 'status code 404' in error_lower or 'error 404' in error_lower:
         return "This song is unavailable."
-    
-    # Apple Music errors
     if 'apple music' in error_lower:
         if 'unexpected error during download' in error_lower:
-            # Check if it's likely an FFmpeg/processing issue
             if any(keyword in error_lower for keyword in ['ffmpeg', 'remux', 'processing', 'legacy remux', 'expected']):
                 return "Apple Music streaming error (FFmpeg required for processing)"
             return "Apple Music download error"
-        elif any(keyword in error_lower for keyword in ['ffmpeg', 'remux', 'processing', 'legacy remux']):
-            return "Apple Music streaming error (FFmpeg required for processing)"
-        elif 'not authenticated' in error_lower or 'cookies.txt' in error_lower:
-            return "Apple Music authentication error (cookies.txt required)"
         return "Apple Music error"
-    
-    # SoundCloud HLS streaming errors
-    if 'soundcloud' in error_lower and ('hls' in error_lower or 'hls_unexpected_error_in_try_block' in error_lower):
-        if 'ffmpeg' in error_lower or 'url' in error_lower or 'hls_unexpected_error_in_try_block' in error_lower:
-            return "SoundCloud streaming error (FFmpeg required for HLS streams)"
-        return "SoundCloud streaming error"
-    
-    # Generic FFmpeg errors
-    if 'ffmpeg' in error_lower and ('process failed' in error_lower or 'error opening' in error_lower):
+    if 'ffmpeg' in error_lower:
         return "Audio processing error (FFmpeg)"
-    
-    # Network/URL errors
-    if any(phrase in error_lower for phrase in ['url', 'network', 'connection', 'timeout']):
-        return "Network/connection error"
-    
-    # File system errors
-    if any(phrase in error_lower for phrase in ['no such file', 'permission denied', 'file not found']):
-        return "File system error"
-    
-    # Authentication errors
-    if any(phrase in error_lower for phrase in ['auth', 'login', 'credential', 'token']):
-        return "Authentication error"
-    
-    # Rate limiting
-    if any(phrase in error_lower for phrase in ['rate limit', 'too many requests', '429']):
-        return "Rate limited - too many requests"
-    
-    # Generic fallback - try to extract the most relevant part
-    if ':' in error_str:
-        # Take the last part after the final colon, which is usually the most specific error
-        parts = error_str.split(':')
-        last_part = parts[-1].strip()
-        if len(last_part) > 10 and len(last_part) < 100:  # Reasonable length
-            return last_part
-    
-    # If error is too long, truncate it
     if len(error_str) > 80:
         return error_str[:77] + "..."
-    
     return error_str
 
-# Helper function to serialize Enums for JSON
+
 def json_enum_serializer(obj):
     if isinstance(obj, Enum):
         return obj.name
-    # Let the default encoder raise TypeError for other unserializable types
     raise TypeError(f'Object of type {obj.__class__.__name__} is not JSON serializable')
 
+
+def _truncate(s: str, max_len: int) -> str:
+    if not isinstance(s, str): s = str(s)
+    s = s.strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len]
+
+
+def sanitise_name(path: str) -> str:
+    if path is None:
+        return ""
+    s = str(path).strip()
+    s = unicodedata.normalize("NFC", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) not in ("Cc", "Cf", "Cs"))
+    replacements = {
+        "/": "／", "\\": "＼", ":": "：", "*": "＊",
+        "?": "？", '"': "＂", "<": "＜", ">": "＞", "|": "｜",
+    }
+    for char, repl in replacements.items():
+        s = s.replace(char, repl)
+    if ASCII_ONLY:
+        s = s.encode("ascii", "ignore").decode("ascii", "ignore")
+    s = _WIN_FORBIDDEN_RE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.rstrip(". ")
+    if s.upper().split('.')[0] in _RESERVED_NAMES:
+        s = f"_{s}"
+    return s if s else "Unknown"
+
+
+def _sanitize_segment(segment: str, index: int) -> str:
+    s = (segment or "").strip()
+    if index == 0 and _DRIVE_RE.match(s):
+        return s.upper()
+    return sanitise_name(s)
+
+
+# ============================================================
+# LÓGICA DE LIMPIEZA AVANZADA (ANTI-FEAT)
+# ============================================================
+
+def normalize_text(text: str) -> str:
+    if not text: return ""
+    return _RE_NORMALIZE.sub('', text).lower()
+
+def clean_track_title_logic(track_title: str, artist_name: str) -> str:
+    match = _RE_ANTI_FEAT.search(track_title)
+    if match:
+        feat_artist = match.group(1)
+        simple_feat = normalize_text(feat_artist)
+        simple_main_artist = normalize_text(artist_name)
+        if len(simple_feat) > 2 and simple_feat in simple_main_artist:
+            return track_title.replace(match.group(0), "").strip()
+    return track_title
+
+
+# ============================================================
+# LÓGICA DE FORMATO Y TEMPLATES
+# ============================================================
+
+class Explicit:
+    def __init__(self, val):
+        self.val = val
+
+    def __format__(self, fmt):
+        if not self.val:
+            return ""
+        if "shortparens" in fmt: return " (explicit)"
+        if "parens" in fmt: return " (explicit)"
+        if "upper" in fmt: return "EXPLICIT" if "long" in fmt else "E"
+        return " (explicit)"
+
+
+class UserFormat:
+    def __init__(self, val): self.val = val
+    def __format__(self, fmt): return fmt if self.val else ""
+
+
+def format_template_advanced(template: str, data: dict, with_asterisk_ext: bool = False) -> str:
+    template = template.strip().lstrip('\ufeff').replace("\\", "/")
+    if 'now' not in data:
+        data['now'] = datetime.now()
+    parts = template.split("/")
+    rendered_parts = []
+    
+    is_unc = template.startswith("//") or template.startswith("\\\\")
+    is_absolute_win = bool(_DRIVE_RE.match(parts[0])) if parts else False
+    
+    if is_unc: parts = [p for p in parts if p]
+    
+    for idx, part in enumerate(parts):
+        try:
+            rendered = part.format(**data)
+        except Exception:
+            rendered = part.replace(":", "-").replace("{", "(").replace("}", ")")
+        
+        if idx == 0 and is_absolute_win:
+            rendered_parts.append(rendered.upper())
+        else:
+            seg_idx = idx if not is_unc else idx + 99
+            rendered_parts.append(_sanitize_segment(rendered, seg_idx))
+            
+    path = "/".join(rendered_parts)
+    if is_unc: path = "//" + path
+    return path + ".*" if with_asterisk_ext else path
+
+
+def clean_string_logic(text):
+    if not text: return ""
+    text = re.sub(r"\s*\(\s*(?:feat|ft|featuring|with|con|invitado|invitada|colaboraci[óo]n|prod|dueto)\.?\s+.*?\)", "",
+                  text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def determine_release_type(track_info=None, album_info=None):
+    valid_types = {'SINGLE', 'EP', 'ALBUM', 'COMPILATION', 'ANTHOLOGY'}
+    sources = []
+    if album_info: sources.append(album_info)
+    if track_info: sources.append(track_info)
+    for source in sources:
+        if hasattr(source, 'type'):
+            val = str(getattr(source, 'type', '')).upper().strip()
+            if val in valid_types: return f"({val})"
+    return "(ALBUM)"
+
+
+def _normalize_for_compare(s: str) -> str:
+    """Normalize string for fuzzy comparison: remove diacritics, lowercase, collapse spaces."""
+    decomposed = unicodedata.normalize('NFD', s)
+    stripped = ''.join(c for c in decomposed if unicodedata.category(c) != 'Mn')
+    return re.sub(r'\s+', ' ', stripped).lower().strip()
+
+
+def _get_initials(name: str) -> str:
+    if not name: return '#'
+    ch = name.strip()[0].upper()
+    decomposed = unicodedata.normalize('NFD', ch)
+    base = ''.join(c for c in decomposed if unicodedata.category(c) != 'Mn').upper()
+    return base if ('A' <= base <= 'Z') else '#'
+
+
+def prepare_template_data(track_info: TrackInfo = None, album_info: AlbumInfo = None, extra_tags: dict = None) -> dict:
+    data = {}
+    if track_info:
+        artists_list = track_info.artists if isinstance(track_info.artists, list) else [str(track_info.artists)]
+        flat_artists = []
+        for a in artists_list:
+            flat_artists.extend(re.split(r'\s*[／/]\s*', str(a)))
+        artists_list = [a for a in flat_artists if a]
+        main_artist = artists_list[0] if artists_list else "Unknown Artist"
+        original_title = track_info.name
+        
+        clean_title = clean_track_title_logic(original_title, ", ".join(artists_list))
+        clean_title = clean_string_logic(clean_title)
+        
+        bit_depth = getattr(track_info, 'bit_depth', 0) or 0
+        sample_rate = getattr(track_info, 'sample_rate', 0) or 0
+        sample_rate_khz = f"{sample_rate / 1000:g}" if sample_rate else ""
+        
+        is_master = False
+        if bit_depth > 16 or sample_rate > 48000: is_master = True
+        
+        is_dolby = False
+        if track_info.codec:
+            c_name = track_info.codec.name if hasattr(track_info.codec, 'name') else str(track_info.codec)
+            if c_name in ['EAC3', 'AC4', 'AC3']: is_dolby = True
+
+        t_tags = getattr(track_info, 'tags', None)
+        release_date = (getattr(t_tags, 'release_date', None) or "") if t_tags else ""
+        if release_date and len(release_date) > 10:
+            release_date = release_date[:10]
+        album_name_raw = getattr(t_tags, 'album', None) or getattr(track_info, 'album', None) or ""
+        album_artist_raw = (getattr(t_tags, 'album_artist', None) or "") if t_tags else ""
+        if not album_artist_raw:
+            album_artist_raw = main_artist
+
+        data.update({
+            'name': original_title,
+            'title': original_title,
+            'title_clean': clean_title,
+            'title_trunc': _truncate(original_title, MAX_TITLE_LEN),
+            'artist': main_artist,
+            'artists': " / ".join(str(a) for a in artists_list),
+            'album_artist': album_artist_raw,
+            'explicit': Explicit(track_info.explicit),
+            'quality': f"({track_info.codec.name})" if track_info.codec else '',
+            'master': UserFormat(is_master),
+            'dolby': UserFormat(is_dolby),
+            'bit_depth': bit_depth,
+            'sample_rate_khz': sample_rate_khz,
+            'year': release_date[:4] if len(release_date) >= 4 else "",
+            'release_date': release_date,
+            'album': album_name_raw,
+            'album_clean': clean_string_logic(album_name_raw),
+            'release': determine_release_type(track_info, album_info),
+            'artist_initials': _get_initials(album_artist_raw),
+        })
+        if t_tags:
+            data.update({
+                'track_number': getattr(t_tags, 'track_number', 0),
+                'total_tracks': getattr(t_tags, 'total_tracks', 0),
+                'disc_number': getattr(t_tags, 'disc_number', 0),
+                'total_discs': getattr(t_tags, 'total_discs', 0),
+            })
+    if album_info:
+        r_year = str(album_info.release_year) if album_info.release_year else ""
+        data.update({
+            'album': album_info.name,
+            'album_clean': clean_string_logic(album_info.name),
+            'album_artist': album_info.artist,
+            'year': r_year[:4] if len(r_year) >= 4 else r_year,
+        })
+    if extra_tags: data.update(extra_tags)
+    return data
+
+
+# ============================================================
+# CLASE DOWNLOADER
+# ============================================================
 
 class Downloader:
     def __init__(self, settings, module_controls, oprinter, path, use_ansi_colors=True):
@@ -164,2253 +370,1073 @@ class Downloader:
         self.service = None
         self.service_name = None
         self.download_mode = None
-        self.third_party_modules = None
-        self.temp_dir = None  # Will be set by core.py
         self.indent_number = 0
         self.module_list = module_controls['module_list']
         self.module_settings = module_controls['module_settings']
         self.loaded_modules = module_controls['loaded_modules']
         self.load_module = module_controls['module_loader']
-        self.full_settings = None  # Will be set by core.py
+        self.full_settings = None
         self.use_ansi_colors = use_ansi_colors
-
         self.print = self.oprinter.oprint
         self.set_indent_number = self.oprinter.set_indent_number
+        self.third_party_modules = {}
 
-    def _get_spotify_pause_seconds(self):
-        """Get the Spotify pause duration from settings, with fallback to default"""
+        # --- DB INIT ---
+        self.db_path = os.path.join(os.getcwd(), 'archive.db')
+        self.db_lock = threading.Lock() 
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self._init_db()
+
+    def _init_db(self):
         try:
-            if hasattr(self, 'full_settings') and self.full_settings and 'modules' in self.full_settings and 'spotify' in self.full_settings['modules']:
-                return int(self.full_settings['modules']['spotify'].get('download_pause_seconds', 30))
-        except (KeyError, ValueError, TypeError):
-            pass
-        return 30  # Default fallback
+            with self.db_lock:
+                self.conn.execute('''CREATE TABLE IF NOT EXISTS downloads (
+                                                id TEXT PRIMARY KEY,
+                                                artist TEXT,
+                                                title TEXT,
+                                                album TEXT,
+                                                quality TEXT,
+                                                filename TEXT,
+                                                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                                            )''')
+                self.conn.commit()
+        except Exception as e:
+            logging.error(f"Failed to initialize database: {e}")
+
+    def _check_db(self, track_id):
+        try:
+            with self.db_lock:
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT id, filename FROM downloads WHERE id = ?", (str(track_id),))
+                row = cursor.fetchone()
+                if row is None:
+                    return False
+                filename = row[1]
+                if filename and not os.path.exists(filename):
+                    self.conn.execute("DELETE FROM downloads WHERE id = ?", (str(track_id),))
+                    self.conn.commit()
+                    return False
+                return True
+        except Exception:
+            return False
+
+    def _add_to_db(self, track_info, filename):
+        try:
+            artist = track_info.artists[0] if track_info.artists else "Unknown"
+            title = track_info.name
+            album = getattr(track_info, 'album', "Unknown")
+            if hasattr(track_info, 'tags') and track_info.tags:
+                album = getattr(track_info.tags, 'album', album)
+
+            quality = "Unknown"
+            if hasattr(track_info, 'codec') and track_info.codec:
+                quality = str(track_info.codec.name)
+
+            with self.db_lock:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO downloads (id, artist, title, album, quality, filename) VALUES (?, ?, ?, ?, ?, ?)",
+                    (str(track_info.id), str(artist), str(title), str(album), quality, str(filename)))
+                self.conn.commit()
+        except Exception as e:
+            logging.error(f"Error adding to DB: {e}")
 
     def _get_status_symbols(self):
-        """Get platform-appropriate status symbols with universal colors"""
-        # ANSI color codes that work across Windows, macOS, and Linux
-        GREEN = '\033[92m'    # Green for success
-        YELLOW = '\033[33m'   # Golden yellow for skip/warning (closer to #CCA700)
-        RED = '\033[91m'      # Red for error
-        GRAY = '\033[90m'     # Gray for status text
-        RESET = '\033[0m'     # Reset to default color
-        
+        GREEN, YELLOW, RED, GRAY, RESET = '\033[92m', '\033[33m', '\033[91m', '\033[90m', '\033[0m'
         if not self.use_ansi_colors:
-            return {
-                'success': '✓',
-                'skip': '▶',
-                'error': '✗',
-                'warning': '⚠',
-                'gray_text': '',
-                'yellow_text': '',
-                'red_text': '',
-                'reset': ''
-            }
-        
-        # Use ASCII symbols for Windows Command Prompt compatibility
-        if platform.system() == 'Windows':
-            return {
-                'success': f'{GREEN}+{RESET}',      # Green plus sign for success
-                'skip': f'{YELLOW}>{RESET}',        # Yellow greater than for skip/already exists
-                'error': f'{RED}x{RESET}',          # Red lowercase x for error/failed
-                'warning': f'{YELLOW}!{RESET}',     # Yellow exclamation for warning/rate limited
-                'gray_text': GRAY,                  # Gray for general status text
-                'yellow_text': YELLOW,              # Yellow for "(already exists)" text
-                'red_text': RED,                    # Red for "(failed)" text
-                'reset': RESET
-            }
-        else:
-            # Use Unicode symbols for Unix/macOS terminals (better Unicode support)
-            return {
-                'success': f'{GREEN}✓{RESET}',      # Green check mark
-                'skip': f'{YELLOW}▶{RESET}',        # Yellow play button
-                'error': f'{RED}✗{RESET}',          # Red ballot X for error/failed
-                'warning': f'{YELLOW}⚠{RESET}',     # Yellow warning sign
-                'gray_text': GRAY,                  # Gray for general status text
-                'yellow_text': YELLOW,              # Yellow for "(already exists)" text
-                'red_text': RED,                    # Red for "(failed)" text
-                'reset': RESET
-            }
+            return {'success': '+', 'skip': '>', 'error': 'x', 'warning': '!', 'red_text': '', 'yellow_text': '', 'reset': ''}
+        return {'success': f'{GREEN}+{RESET}', 'skip': f'{YELLOW}>{RESET}', 'error': f'{RED}x{RESET}',
+                'warning': f'{YELLOW}!{RESET}', 'yellow_text': YELLOW, 'red_text': RED, 'reset': RESET}
 
     def create_temp_filename(self):
-        """Create a temporary filename in the temp directory"""
-        if not self.temp_dir:
-            # If temp_dir is not set, create it in the current directory
-            self.temp_dir = os.path.join(os.getcwd(), 'temp')
-        os.makedirs(self.temp_dir, exist_ok=True)
-        return os.path.join(self.temp_dir, str(uuid.uuid4()))
+        temp_dir = os.path.abspath(os.path.join(os.getcwd(), 'temp'))
+        os.makedirs(temp_dir, exist_ok=True)
+        return os.path.join(temp_dir, str(uuid.uuid4()))
+
+    _AUDIO_EXTENSIONS = ('.flac', '.m4a', '.mp3', '.ogg', '.opus', '.wav', '.aiff', '.mp4')
+
+    # _normalize_for_compare defined at module level below
+
+    def _track_file_exists(self, loc: str) -> Optional[str]:
+        """Return the existing file path if a track already exists at this location
+        with any audio extension — catches FLAC files when loc is .m4a and vice versa.
+        Also matches files that differ only in diacritics (accents)."""
+        if os.path.exists(loc):
+            return loc
+        base = os.path.splitext(loc)[0]
+        clean_base = base.lstrip('\\\\?\\') if base.startswith('\\\\?\\') else base
+        prefix = '\\\\?\\' if base.startswith('\\\\?\\') else ''
+
+        # Exact extension match first
+        for ext in self._AUDIO_EXTENSIONS:
+            candidate = prefix + clean_base + ext
+            if os.path.exists(candidate):
+                return candidate
+
+        # Fuzzy match: scan sibling files in the parent directory, ignoring diacritics
+        parent = os.path.dirname(clean_base)
+        target_name_norm = _normalize_for_compare(os.path.basename(clean_base))
+        try:
+            for fname in os.listdir(parent) if os.path.isdir(parent) else []:
+                fbase, fext = os.path.splitext(fname)
+                if fext.lower() in self._AUDIO_EXTENSIONS:
+                    if _normalize_for_compare(fbase) == target_name_norm:
+                        return prefix + os.path.join(parent, fname)
+        except Exception:
+            pass
+        return None
+
+    def _get_lyrics(self, track_id, track_info) -> Optional[LyricsInfo]:
+        # 1. Check third party lyrics module
+        lyrics_module_name = self.third_party_modules.get(ModuleModes.lyrics)
+        
+        if lyrics_module_name:
+            self.print(f'Searching for lyrics on {lyrics_module_name}...', drop_level=1)
+            # Use third party module
+            try:
+                # Search for the track on the lyrics service
+                results = self.search_by_tags(lyrics_module_name, track_info)
+                if results:
+                    # Use the first result
+                    lyrics_id = results[0].result_id
+                    lyrics = self.loaded_modules[lyrics_module_name].get_track_lyrics(lyrics_id)
+                    if lyrics:
+                         self.print('Lyrics downloaded!', drop_level=1)
+                         return lyrics
+                self.print('No lyrics found on external provider.', drop_level=1)
+            except Exception as e:
+                self.print(f'Failed to get lyrics from {lyrics_module_name}: {e}', drop_level=1)
+        
+        # 2. Check if current service supports lyrics
+        elif ModuleModes.lyrics in self.module_settings[self.service_name].module_supported_modes:
+            try:
+                kwargs = getattr(track_info, 'lyrics_extra_kwargs', {}) or {}
+                lyrics = self.service.get_track_lyrics(track_id, **kwargs)
+                if lyrics and (lyrics.embedded or lyrics.synced):
+                     self.print('Lyrics downloaded!', drop_level=1)
+                     return lyrics
+            except Exception as e:
+                 self.print(f'Failed to get lyrics from {self.service_name}: {e}', drop_level=1)
+        
+        return None
 
     def search_by_tags(self, module_name, track_info: TrackInfo):
-        return self.loaded_modules[module_name].search(DownloadTypeEnum.track, f'{track_info.name} {" ".join(track_info.artists)}', track_info=track_info)
+        return self.loaded_modules[module_name].search(DownloadTypeEnum.track,
+                                                       f'{track_info.name} {" ".join(track_info.artists)}',
+                                                       track_info=track_info)
 
     def _concurrent_download_tracks(self, track_list, download_args_list, concurrent_downloads, performance_summary_indent=0):
-        """Helper method to download tracks concurrently using asyncio + aiohttp"""
         if concurrent_downloads <= 1:
-            # Fallback to sequential download if concurrent_downloads is 1 or less
-            self.print("Using sequential downloads (sync)")
             results = []
-            for i, (track_info, args) in enumerate(zip(track_list, download_args_list)):
+            for i, args in enumerate(download_args_list):
                 try:
-                    result = self.download_track(**args)
-                    results.append((i, result, None))
+                    res = self.download_track(**args)
+                    results.append((i, res, None))
                 except Exception as e:
                     results.append((i, None, e))
             return results
-        
-        # Use asyncio + aiohttp for concurrent downloads
-        import asyncio
-        import time
-        from utils.utils import create_aiohttp_session, download_file_async
-        
-        # Store original print method
-        original_print = self.print
+
+        from utils.utils import create_aiohttp_session
         total_tracks = len(track_list)
         results = [None] * total_tracks
-        
-        # Performance tracking
-        start_time = time.time()
-        total_bytes_downloaded = 0
-        download_times = []
-        concurrent_active = 0
-        max_concurrent_seen = 0
-        
+
         async def download_worker_async(session, index, args):
-            """Async worker function to download a single track - OPTIMIZED VERSION"""
-            nonlocal concurrent_active, max_concurrent_seen, total_bytes_downloaded
-            
-            # Track concurrency
-            concurrent_active += 1
-            max_concurrent_seen = max(max_concurrent_seen, concurrent_active)
-            
-            track_start_time = time.time()
-            bytes_downloaded = 0
-            
+            track_name = f"Track {args.get('track_id', 'Unknown')}" 
             try:
-                # Get track info ONCE and pass it to the download function
                 track_id = args['track_id']
-                track_name = f"Track {track_id}"
+                loop = asyncio.get_event_loop()
+                if await loop.run_in_executor(None, self._check_db, track_id):
+                    return (index, f"ID: {track_id}", "SKIPPED", "ALREADY_IN_DB", None)
                 
-                # Get track info and download info (API calls) - DO THIS ONCE PER TRACK IN THREAD POOL
-                try:
-                    quality_tier = QualityEnum[self.global_settings['general']['download_quality'].upper()]
-                    codec_options = CodecOptions(
-                        spatial_codecs = self.global_settings['codecs']['spatial_codecs'],
-                        proprietary_codecs = self.global_settings['codecs']['proprietary_codecs'],
-                    )
-                    
-                    # CRITICAL FIX: Move API calls to thread pool to avoid blocking event loop
-                    loop = asyncio.get_event_loop()
-                    
-                    # SINGLE API CALL: Get track info once - IN THREAD POOL
-                    # Create a wrapper function to handle the extra_kwargs properly
-                    def get_track_info_wrapper():
-                        return self.service.get_track_info(track_id, quality_tier, codec_options, **args.get('extra_kwargs', {}))
-                    
-                    track_info = await loop.run_in_executor(None, get_track_info_wrapper)
-                    track_name = f"{', '.join(track_info.artists)} - {track_info.name}"
-                    
-                    # Check if file already exists BEFORE getting download info (for temp file modules like Deezer)
-                    if track_info:
-                        track_location = self._create_track_location(args.get('album_location', ''), track_info)
-                        if await loop.run_in_executor(None, os.path.isfile, track_location):
-                            return (index, track_name, "SKIPPED", None, None, 0, 0)
-                    
-                    # SINGLE API CALL: Get download info once - IN THREAD POOL
-                    def get_download_info_wrapper():
-                        # Check if track_info has download_extra_kwargs (like Qobuz, TIDAL, Deezer)
-                        if hasattr(track_info, 'download_extra_kwargs') and track_info.download_extra_kwargs:
-                            return self.service.get_track_download(**track_info.download_extra_kwargs)
-                        else:
-                            # Try the full signature first (for modules that support it)
-                            try:
-                                return self.service.get_track_download(track_id, quality_tier, codec_options, **args.get('extra_kwargs', {}))
-                            except TypeError:
-                                # Fallback for modules with simpler signatures
-                                return self.service.get_track_download(track_id, quality_tier)
-                                
-                    download_info = await loop.run_in_executor(None, get_download_info_wrapper)
-                    
-                except Exception as e:
-                    error_msg = str(e)
-                    track_name = track_id
-                    return (index, track_name, f"Could not get track/download info: {error_msg}", None, Exception(f"Could not get track/download info for {track_id}: {error_msg}"), 0, 0)
-
-                # Pass both track_info and download_info to avoid double API calls
-                result = await self._download_track_async(
-                    session, 
-                    track_info=track_info, 
-                    download_info=download_info,
-                    **args, 
-                    verbose=False
-                )
-
-                track_duration = time.time() - track_start_time
-
-                # Handle the return format from _download_track_async
-                if isinstance(result, tuple):
-                    # New format: (file_location, bytes_downloaded)
-                    file_location, bytes_downloaded = result
-                    if file_location is None:
-                        # Track already existed or failed
-                        if bytes_downloaded == 0:
-                            return (index, track_name, "ERROR", None, Exception("Download failed"), 0, track_duration)
-                        else:
-                            return (index, track_name, "ERROR", None, Exception("Download failed"), 0, track_duration)
-                    else:
-                        # Successfully downloaded
-                        return (index, track_name, None, file_location, None, bytes_downloaded, track_duration)
-                else:
-                    # Old format compatibility - estimate download size
-                    if result is None:
-                        # Track download failed - report as error
-                        return (index, track_name, "ERROR", None, Exception("Download failed"), 0, track_duration)
-                    elif result == "ALREADY_EXISTS":
-                        # Track already existed - report as skipped
-                        return (index, track_name, "SKIPPED", None, None, 0, track_duration)
-                    elif result == "RATE_LIMITED":
-                        # Rate limited - report as rate limited
-                        return (index, track_name, "RATE_LIMITED", "RATE_LIMITED", None, 0, track_duration)
-                    elif isinstance(result, str) and result not in ["ALREADY_EXISTS", "RATE_LIMITED"]:
-                        # Specific error messages - pass them through as status
-                        return (index, track_name, result, None, Exception(result), 0, track_duration)
-                    else:
-                        # Successfully downloaded - estimate 8MB
-                        bytes_downloaded = 8 * 1024 * 1024  # 8MB estimate
-                        return (index, track_name, None, result, None, bytes_downloaded, track_duration)
-
-            except Exception as e:
-                track_duration = time.time() - track_start_time
-                return (index, f"Track {args.get('track_id', 'Unknown')}", e, None, e, 0, track_duration)
-            finally:
-                concurrent_active -= 1
-        
-        async def run_concurrent_downloads():
-            """Main async function to coordinate downloads"""
-            nonlocal total_bytes_downloaded
-            
-            # Disable progress bars globally if the setting is disabled
-            from utils.utils import set_progress_bars_enabled
-            progress_bar_setting = self.global_settings['general'].get('progress_bar', False)
-            set_progress_bars_enabled(progress_bar_setting)
-            
-            async with create_aiohttp_session() as session:
-                # Create semaphore to limit concurrent downloads
-                semaphore = asyncio.Semaphore(concurrent_downloads)
-                
-                async def bounded_download(index, args):
-                    async with semaphore:
-                        return await download_worker_async(session, index, args)
-                
-                # Create tasks for all downloads
-                tasks = [bounded_download(i, args) for i, args in enumerate(download_args_list)]
-                
-                # Progress tracking
-                symbols = self._get_status_symbols()
-                completed_count = 0
-                total_digits = len(str(total_tracks))
-                
-                # Process downloads as they complete (OUT OF ORDER!)
-                results_temp = []
-                
-                for coro in asyncio.as_completed(tasks):
-                    try:
-                        result = await coro
-                        index, track_name, status, download_result, error, bytes_dl, duration = result
-                        
-                        completed_count += 1
-                        total_bytes_downloaded += bytes_dl
-                        if duration > 0:
-                            download_times.append(duration)
-                        
-                        # Display progress with sequential numbering for user-friendly tracking
-                        track_number = completed_count  # Use sequential numbering (1-based)
-                        
-                        if status == "SKIPPED":
-                            self.print(f"{track_number:0{total_digits}d}/{total_tracks} {symbols['skip']} {track_name} {symbols['yellow_text']}(already exists){symbols['reset']}", drop_level=performance_summary_indent)
-                        elif status == "RATE_LIMITED":
-                            self.print(f"{track_number:0{total_digits}d}/{total_tracks} {symbols['warning']} {track_name} (rate limited)", drop_level=performance_summary_indent)
-                        elif status is not None:
-                            # Error case
-                            if isinstance(status, str) and status.startswith("Could not get track info: "):
-                                error_msg = status.replace("Could not get track info: ", "")
-                                simplified_error = simplify_error_message(error_msg)
-                                self.print(f"{track_number:0{total_digits}d}/{total_tracks} {symbols['error']} Track {track_name}: {simplified_error} {symbols['red_text']}(failed){symbols['reset']}", drop_level=performance_summary_indent)
-                            else:
-                                simplified_error = simplify_error_message(str(status))
-                                self.print(f"{track_number:0{total_digits}d}/{total_tracks} {symbols['error']} {track_name}: {simplified_error} {symbols['red_text']}(failed){symbols['reset']}", drop_level=performance_summary_indent)
-                        else:
-                            # Success
-                            self.print(f"{track_number:0{total_digits}d}/{total_tracks} {symbols['success']} {track_name}", drop_level=performance_summary_indent)
-                        
-                        # Flush output to ensure immediate display in GUI
-                        import sys
-                        if hasattr(sys.stdout, 'flush'):
-                            sys.stdout.flush()
-                        
-                        # Store result for final processing
-                        results_temp.append((index, download_result, error))
-                        
-                    except Exception as e:
-                        completed_count += 1
-                        self.print(f"???/{total_tracks} {symbols['error']} Track (unknown): {simplify_error_message(str(e))} {symbols['red_text']}(failed){symbols['reset']}", drop_level=performance_summary_indent)
-                        # Flush output to ensure immediate display in GUI
-                        import sys
-                        if hasattr(sys.stdout, 'flush'):
-                            sys.stdout.flush()
-                        results_temp.append((len(results_temp), None, e))
-                
-                return results_temp
-        
-        # Run the async downloads with Windows compatibility
-        try:
-            import platform
-            
-            self.print(f"Using {concurrent_downloads} concurrent downloads for {total_tracks} tracks", drop_level=performance_summary_indent)
-            
-            if platform.system() == 'Windows':
-                # For Windows, set the event loop policy to avoid SelectorEventLoop issues
-                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-            if hasattr(asyncio, 'run'):
-                # Python 3.7+
-                results_temp = asyncio.run(run_concurrent_downloads())
-            else:
-                # Python 3.6 compatibility
-                if platform.system() == 'Windows':
-                    loop = asyncio.ProactorEventLoop()
-                else:
-                    loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    results_temp = loop.run_until_complete(run_concurrent_downloads())
-                finally:
-                    loop.close()
-                    
-        except Exception as e:
-            original_print(f"❌ Error in async downloads: {e}", drop_level=1)
-            original_print("🔄 Falling back to sync downloads")
-            # Fallback to sequential downloads
-            results = []
-            for i, (track_info, args) in enumerate(zip(track_list, download_args_list)):
-                try:
-                    result = self.download_track(**args)
-                    results.append((i, result, None))
-                except Exception as e:
-                    results.append((i, None, e))
-            return results
-        
-        # Performance summary
-        total_time = time.time() - start_time
-        if total_time > 0:
-            avg_concurrent = len(download_times) / total_time if download_times else 0
-            total_mb = total_bytes_downloaded / (1024 * 1024)
-            overall_speed_mbps = (total_mb / total_time) * 8 if total_time > 0 else 0
-            avg_track_time = sum(download_times) / len(download_times) if download_times else 0
-            
-            # Format time as minutes:seconds
-            minutes = int(total_time // 60)
-            seconds = total_time % 60
-            if minutes > 0:
-                time_str = f"{minutes}m {seconds:.1f}s"
-            else:
-                time_str = f"{seconds:.1f}s"
-            
-            # Show performance summary in order: Download speed, Download time
-            # Only show speed metrics if data was actually downloaded
-            if total_mb > 0:
-                original_print(f"Download speed: {overall_speed_mbps:.0f} Mbps", drop_level=performance_summary_indent)
-                original_print(f"Download time: {time_str}", drop_level=performance_summary_indent)
-            else:
-                # Don't assume tracks already existed - they might have failed
-                original_print(f"Download time: {time_str}", drop_level=performance_summary_indent)
-        
-        # Convert results to expected format
-        for index, download_result, error in results_temp:
-            if index < len(results):
-                results[index] = (index, download_result, error)
-        
-        # Count actual results for final summary
-        actual_downloaded = sum(1 for r in results if r and r[2] is None and r[1] is not None)  # Newly downloaded
-        actual_already_existed = sum(1 for r in results if r and r[2] is None and r[1] is None)  # Already existed
-        actual_failed = sum(1 for r in results if r and r[2] is not None)  # Failed with error
-        
-        # Show final summary only when there are failures
-        if actual_failed > 0:
-            # Check if most failures are SoundCloud FFmpeg-related
-            ffmpeg_errors = sum(1 for r in results if r and r[2] is not None and 
-                              isinstance(r[2], Exception) and 
-                              'FFmpeg required for HLS streams' in str(r[2]))
-            
-            if actual_downloaded > 0 and actual_already_existed > 0:
-                original_print(f"Summary: {actual_downloaded} downloaded, {actual_already_existed} already existed, {actual_failed} failed.", drop_level=performance_summary_indent)
-            elif actual_downloaded > 0:
-                original_print(f"Summary: {actual_downloaded} downloaded, {actual_failed} failed.", drop_level=performance_summary_indent)
-            elif actual_already_existed > 0:
-                original_print(f"Summary: {actual_already_existed} already existed, {actual_failed} failed.", drop_level=performance_summary_indent)
-            else:
-                original_print(f"Summary: {actual_failed} failed.", drop_level=performance_summary_indent)
-            
-            # Add helpful FFmpeg message if many SoundCloud HLS errors occurred
-            if ffmpeg_errors > 0 and ffmpeg_errors >= actual_failed * 0.8:  # 80% or more are FFmpeg errors
-                original_print("", drop_level=performance_summary_indent)  # Blank line
-                original_print("NOTE: Most failures are due to missing FFmpeg.", drop_level=performance_summary_indent)
-                original_print("SoundCloud requires FFmpeg for HLS stream processing.", drop_level=performance_summary_indent)
-                original_print("Please install FFmpeg or configure it in Settings > Global > Advanced.", drop_level=performance_summary_indent)
-        
-        return results
-
-
-    def _add_track_m3u_playlist(self, m3u_playlist: str, track_info: TrackInfo, track_location: str):
-        if self.global_settings['playlist']['extended_m3u']:
-            with open(m3u_playlist, 'a', encoding='utf-8') as f:
-                # if no duration exists default to -1
-                duration = track_info.duration if track_info.duration else -1
-                # write the extended track header
-                f.write(f'#EXTINF:{duration}, {track_info.artists[0]} - {track_info.name}\n')
-
-        with open(m3u_playlist, 'a', encoding='utf-8') as f:
-            if self.global_settings['playlist']['paths_m3u'] == "absolute":
-                # add the absolute paths to the playlist
-                f.write(f'{os.path.abspath(track_location)}\n')
-            else:
-                # add the relative paths to the playlist by subtracting the track_location with the m3u_path
-                f.write(f'{os.path.relpath(track_location, os.path.dirname(m3u_playlist))}\n')
-
-            # add an extra new line to the extended format
-            f.write('\n') if self.global_settings['playlist']['extended_m3u'] else None
-
-    def download_playlist(self, playlist_id, custom_module=None, extra_kwargs=None):
-        import time
-        playlist_start_time = time.time()  # Track total playlist download time
-        
-        self.set_indent_number(1)
-
-        service_name_lower = ""
-        if hasattr(self, 'service_name') and self.service_name:
-            service_name_lower = self.service_name.lower()
-
-        # Prepare kwargs for get_playlist_info, making a copy to modify
-        kwargs_for_playlist_info = {}
-        if extra_kwargs:
-            kwargs_for_playlist_info.update(extra_kwargs)
-
-        if service_name_lower in ['beatport', 'beatsource']:
-            if 'data' in kwargs_for_playlist_info:
-                logging.debug(f"Removing 'data' from extra_kwargs for {self.service_name}.get_playlist_info as it is unexpected.")
-                kwargs_for_playlist_info.pop('data', None)
-
-        playlist_info: PlaylistInfo = self.service.get_playlist_info(playlist_id, **kwargs_for_playlist_info)
-        self.print(f'=== Downloading playlist {playlist_info.name} ({playlist_id}) ===', drop_level=1)
-        self.print(f'Playlist creator: {playlist_info.creator}' + (f' ({playlist_info.creator_id})' if playlist_info.creator_id else ''))
-        if playlist_info.release_year: self.print(f'Playlist creation year: {playlist_info.release_year}')
-        if playlist_info.duration: self.print(f'Duration: {beauty_format_seconds(playlist_info.duration)}')
-        number_of_tracks = len(playlist_info.tracks)
-        self.print(f'Number of tracks: {number_of_tracks!s}')
-        
-        # Sanitize and shorten playlist name for filesystem
-        safe_playlist_name = sanitise_name(playlist_info.name)
-        if len(safe_playlist_name) > 50: # Truncate long names
-            safe_playlist_name = safe_playlist_name[:50]
-
-        playlist_tags = {k: sanitise_name(v) for k, v in asdict(playlist_info).items()}
-        playlist_tags['name'] = safe_playlist_name # Use the safe name for path formatting
-        playlist_tags['explicit'] = ' [E]' if playlist_info.explicit else ''
-        playlist_path_formatted_name = self.global_settings['formatting']['playlist_format'].format(**playlist_tags)
-        playlist_path = os.path.join(self.path, playlist_path_formatted_name)
-        # fix path byte limit
-        playlist_path = fix_byte_limit(playlist_path) + '/'
-        os.makedirs(playlist_path, exist_ok=True)
-        
-        if playlist_info.cover_url:
-            self.print('Downloading playlist cover')
-            download_file(playlist_info.cover_url, f'{playlist_path}cover.{playlist_info.cover_type.name}', artwork_settings=self._get_artwork_settings())
-        
-        colored_platform = get_colored_platform_name(self.module_settings[self.service_name].service_name)
-        self.print(f'Platform: {colored_platform}')
-        
-        if playlist_info.animated_cover_url and self.global_settings['covers']['save_animated_cover']:
-            self.print('Downloading animated playlist cover')
-            download_file(playlist_info.animated_cover_url, playlist_path + 'cover.mp4', enable_progress_bar=self.global_settings['general'].get('progress_bar', False))
-        
-        if playlist_info.description:
-            with open(playlist_path + 'description.txt', 'w', encoding='utf-8') as f: f.write(playlist_info.description)
-
-        m3u_playlist_path = None
-        if self.global_settings['playlist']['save_m3u']:
-            if self.global_settings['playlist']['paths_m3u'] not in {"absolute", "relative"}:
-                raise ValueError(f'Invalid value for paths_m3u: "{self.global_settings["playlist"]["paths_m3u"]}",'
-                                 f' must be either "absolute" or "relative"')
-
-            m3u_playlist_path = os.path.join(playlist_path, f'{safe_playlist_name}.m3u')
-
-            # create empty file
-            with open(m3u_playlist_path, 'w', encoding='utf-8') as f:
-                f.write('')
-
-            # if extended format add the header
-            if self.global_settings['playlist']['extended_m3u']:
-                with open(m3u_playlist_path, 'a', encoding='utf-8') as f:
-                    f.write('#EXTM3U\n\n')
-
-        tracks_errored = set()
-        rate_limited_tracks = [] # Initialize list for deferred tracks
-        if custom_module:
-            supported_modes = self.module_settings[custom_module].module_supported_modes 
-            if ModuleModes.download not in supported_modes and ModuleModes.playlist not in supported_modes:
-                raise Exception(f'Module "{custom_module}" cannot be used to download a playlist') # TODO: replace with ModuleDoesNotSupportAbility
-            self.print(f'Service used for downloading: {self.module_settings[custom_module].service_name}')
-            original_service = str(self.service_name)
-            self.load_module(custom_module)
-            for index, track_id in enumerate(playlist_info.tracks, start=1):
-                self.set_indent_number(2)
-                print()
-                self.print(f'Track {index}/{number_of_tracks}', drop_level=1)
                 quality_tier = QualityEnum[self.global_settings['general']['download_quality'].upper()]
-                codec_options = CodecOptions(
-                    spatial_codecs = self.global_settings['codecs']['spatial_codecs'],
-                    proprietary_codecs = self.global_settings['codecs']['proprietary_codecs'],
-                )
-                track_info: TrackInfo = self.loaded_modules[original_service].get_track_info(track_id, quality_tier, codec_options, **playlist_info.track_extra_kwargs)
+                codec_options = CodecOptions(spatial_codecs=self.global_settings['codecs']['spatial_codecs'], proprietary_codecs=self.global_settings['codecs']['proprietary_codecs'])
                 
-                self.service = self.loaded_modules[custom_module]
-                self.service_name = custom_module
-                results = self.search_by_tags(custom_module, track_info)
-                track_id_new = results[0].result_id if len(results) else None
-                
-                if track_id_new:
-                    self.download_track(track_id_new, album_location=playlist_path, track_index=index, number_of_tracks=number_of_tracks, indent_level=2, m3u_playlist=m3u_playlist_path, extra_kwargs=results[0].extra_kwargs)
-                else:
-                    tracks_errored.add(f'{track_info.name} - {track_info.artists[0]}')
-                    if ModuleModes.download in self.module_settings[original_service].module_supported_modes:
-                        self.service = self.loaded_modules[original_service]
-                        self.service_name = original_service
-                        self.print(f'Track {track_info.name} not found, using the original service as a fallback', drop_level=1)
-                        self.download_track(track_id, album_location=playlist_path, track_index=index, number_of_tracks=number_of_tracks, indent_level=2, m3u_playlist=m3u_playlist_path, extra_kwargs=playlist_info.track_extra_kwargs)
-                    else:
-                        self.print(f'Track {track_info.name} not found, skipping')
-        else:
-            # Get concurrent downloads setting
-            concurrent_downloads = self.global_settings['general'].get('concurrent_downloads', 1)
-            
-            # Force sequential downloads for specific modules or when concurrent_downloads is 1
-            service_name_lower = ""
-            if hasattr(self, 'service_name') and self.service_name:
-                service_name_lower = self.service_name.lower()
-            
-            # Check if sequential downloads should be forced
-            force_sequential = False
-            sequential_reason = ""
-            
-            if concurrent_downloads == 1:
-                force_sequential = True
-                sequential_reason = "concurrent_downloads setting is 1"
-            elif service_name_lower == 'spotify':
-                force_sequential = True
-                sequential_reason = "Spotify (rate limiting protection)"
-            elif service_name_lower == 'applemusic':
-                force_sequential = True
-                sequential_reason = "Apple Music"
-            
-            if force_sequential:
-                concurrent_downloads = 1
-                print()  # Add blank line before sequential downloads message
-                self.print(f"Using sequential downloads for {sequential_reason}")
-            
-            if concurrent_downloads > 1 and len(playlist_info.tracks) > 1:
-                # Prepare download arguments for all tracks
-                download_args_list = []
-                for index, track_id_or_info in enumerate(playlist_info.tracks, start=1):
-                    actual_track_id_str_for_download = track_id_or_info.id if isinstance(track_id_or_info, TrackInfo) else str(track_id_or_info)
-                    
-                    download_args = {
-                        'track_id': actual_track_id_str_for_download,
-                        'album_location': playlist_path,
-                        'track_index': index,
-                        'number_of_tracks': number_of_tracks,
-                        'indent_level': 1,
-                        'm3u_playlist': m3u_playlist_path,
-                        'extra_kwargs': playlist_info.track_extra_kwargs
-                    }
-                    download_args_list.append(download_args)
-                
-                # Download tracks concurrently
-                results = self._concurrent_download_tracks(playlist_info.tracks, download_args_list, concurrent_downloads, performance_summary_indent=0)
-                
-                # Process results - only collect rate-limited tracks for retry
-                # (Errors are already reported by concurrent download progress monitor)
-                for index, (original_index, result, error) in enumerate(results):
-                    if error and result == "RATE_LIMITED":
-                        actual_track_id_str_for_download = download_args_list[original_index]['track_id']
-                        rate_limited_tracks.append({
-                            'id': actual_track_id_str_for_download,
-                            'extra_kwargs': playlist_info.track_extra_kwargs,
-                            'original_index': original_index + 1
-                        })
-                    elif result == "RATE_LIMITED":
-                        actual_track_id_str_for_download = download_args_list[original_index]['track_id']
-                        rate_limited_tracks.append({
-                            'id': actual_track_id_str_for_download,
-                            'extra_kwargs': playlist_info.track_extra_kwargs,
-                            'original_index': original_index + 1
-                        })
-            else:
-                # Fallback to sequential downloads
-                for index, track_id_or_info in enumerate(playlist_info.tracks, start=1):
-                    self.set_indent_number(2)
-                    print() # Add spacing between track attempts
-                    # Only show "Pass 1" for Spotify (which has retry passes)
-                    pass_indicator = " (Pass 1)" if service_name_lower == 'spotify' else ""
-                    self.print(f'Track {index}/{number_of_tracks}{pass_indicator}', drop_level=1)
-                    
-                    # Determine the actual track ID string to use for download_track
-                    actual_track_id_str_for_download = track_id_or_info.id if isinstance(track_id_or_info, TrackInfo) else str(track_id_or_info)
-                    
-                    download_result = self.download_track(
-                        actual_track_id_str_for_download,
-                        album_location=playlist_path,
-                        track_index=index,
-                        number_of_tracks=number_of_tracks,
-                        indent_level=1,
-                        m3u_playlist=m3u_playlist_path,
-                        extra_kwargs=playlist_info.track_extra_kwargs
-                    )
-                    
-                    # Add pause between downloads for Spotify to prevent rate limiting
-                    # Only pause if track was actually downloaded (not skipped) and not the last track
-                    if (service_name_lower == 'spotify' and index < number_of_tracks and 
-                        download_result is not None and download_result != "RATE_LIMITED"):
-                        pause_seconds = self._get_spotify_pause_seconds()
-                        self.print(f'Pausing {pause_seconds} seconds to prevent rate limiting...', drop_level=1)
-                        time.sleep(pause_seconds)
-                    
-                    if download_result == "RATE_LIMITED":
-                        logging.info(f"Deferring track {actual_track_id_str_for_download} due to rate limit.")
-                        rate_limited_tracks.append({
-                            'id': actual_track_id_str_for_download, # Store the string ID
-                            'extra_kwargs': playlist_info.track_extra_kwargs,
-                            'original_index': index
-                        })
-                    elif m3u_playlist_path: # Add to M3U only if download didn't fail/get deferred
-                        # Need to get track_info again or ensure download_track provides location
-                        # This part needs refinement - how to get track_location if download succeeds?
-                        # For now, assume download_track handles its own M3U addition upon success if needed.
-                        pass
+                track_info = await loop.run_in_executor(None, lambda: self.service.get_track_info(track_id, quality_tier, codec_options, **args.get('extra_kwargs', {})))
 
-        # --- Second Pass for Rate-Limited Tracks --- 
-        if rate_limited_tracks:
-            self.set_indent_number(1)
-            print() # Spacing
-            if service_name_lower == 'applemusic':
-                self.print(f"--- Retrying {len(rate_limited_tracks)} failed tracks ---", drop_level=1)
-                self.print("Using sequential downloads for Apple Music retries", drop_level=1)
-            else:
-                self.print(f"--- Retrying {len(rate_limited_tracks)} rate-limited tracks ---", drop_level=1)
-            for i, retry_item in enumerate(rate_limited_tracks):
-                self.set_indent_number(2)
-                print() # Spacing
-                self.print(f'Track {retry_item["original_index"]}/{number_of_tracks} (Retry Pass)', drop_level=1)
-                # retry_item['id'] is already a string ID
-                self.download_track(
-                    retry_item['id'],
-                    album_location=playlist_path,
-                    track_index=retry_item["original_index"],
-                    number_of_tracks=number_of_tracks,
-                    indent_level=1,
-                    m3u_playlist=m3u_playlist_path, # Pass M3U path again
-                    extra_kwargs=retry_item['extra_kwargs']
-                )
-                # Add pause between retry tracks (except for the last one)
-                if i < len(rate_limited_tracks) - 1:
-                    print()
-                    if service_name_lower == 'applemusic':
-                        self.print("Pausing 2 seconds before retry...", drop_level=1)
-                        time.sleep(2)
-                    else:
-                        self.print("Pausing 30 seconds to prevent rate limiting...", drop_level=1)
-                        time.sleep(30)
-                # Note: M3U handling for retried tracks still needs consideration
-        else:
-            # Only show rate limiting message for Spotify (where it's relevant)
-            if service_name_lower == 'spotify':
-                print()  # Add blank line before message
-                self.print("No tracks were deferred due to rate limiting.")
-                print()  # Add blank line after message
+                if track_info and getattr(track_info, 'error', None):
+                    return (index, f"Track {track_id}", "ERROR", track_info.error, None)
 
-        # --- Final Summary ---
-        self.set_indent_number(1)
-        
-        symbols = self._get_status_symbols()
-        self.print(f'=== {symbols["success"]} Playlist completed ===', drop_level=1)
-        # Add 2 empty lines after playlist completion for visual separation
-        print()
-        print()
-        if tracks_errored: logging.debug('Permanently failed tracks (non-rate-limit): ' + ', '.join(tracks_errored))
+                if track_info:
+                    track_name = f"{', '.join(track_info.artists)} - {track_info.name}"
+                    forced_discs = args.get('forced_total_discs')
+                    if forced_discs: track_info.tags.total_discs = forced_discs
+                    
+                    custom_fmt = args.get('custom_filename_format')
+                    extra_data = args.get('extra_template_data')
+                    loc = self._create_track_location(args.get('album_location', ''), track_info, custom_format=custom_fmt, extra_template_data=extra_data, forced_total_discs=forced_discs)
+
+                    existing_loc = await loop.run_in_executor(None, self._track_file_exists, loc)
+                    if existing_loc:
+                        loc = existing_loc
+                        lrc_path = os.path.splitext(loc)[0] + '.lrc'
+                        if not await loop.run_in_executor(None, os.path.exists, lrc_path):
+                             lyrics_info = await loop.run_in_executor(None, self._get_lyrics, track_id, track_info)
+                             if lyrics_info and lyrics_info.synced:
+                                 try:
+                                     self.print(f'Saving missing synced lyrics to {os.path.basename(lrc_path)}...', drop_level=1)
+                                     with open(lrc_path, 'w', encoding='utf-8') as f:
+                                         f.write(lyrics_info.synced)
+                                 except Exception as e:
+                                     self.print(f'Failed to save synced lyrics: {e}', drop_level=1)
+
+                        await loop.run_in_executor(None, self._add_to_db, track_info, loc)
+                        return (index, track_name, "SKIPPED", None, None)
+
+                # --- LÓGICA DE REINTENTO (Restaurada) ---
+                download_info = None
+                
+                if hasattr(track_info, 'download_extra_kwargs') and track_info.download_extra_kwargs:
+                     try:
+                         download_info = await loop.run_in_executor(None, lambda: self.service.get_track_download(**track_info.download_extra_kwargs))
+                     except Exception:
+                         download_info = None
+
+                if not download_info:
+                    download_kwargs = args.get('extra_kwargs', {}).copy()
+                    if 'data' in download_kwargs: download_kwargs.pop('data')
+
+                    try:
+                        download_info = await loop.run_in_executor(None, lambda: self.service.get_track_download(track_id, quality_tier, codec_options=codec_options, **download_kwargs))
+                    except TypeError:
+                        try:
+                            download_info = await loop.run_in_executor(None, lambda: self.service.get_track_download(track_id, quality_tier, **download_kwargs))
+                        except TypeError:
+                            download_info = await loop.run_in_executor(None, lambda: self.service.get_track_download(track_id, quality_tier))
+                
+                res = await self._download_track_async(session, track_info=track_info, download_info=download_info, **args, verbose=False)
+                
+                if isinstance(res, tuple) and res[0]:
+                    await loop.run_in_executor(None, self._add_to_db, track_info, res[0])
+                    return (index, track_name, None, res[0], None)
+                
+                if res and isinstance(res, tuple) and res[0] is None and res[1] == "INVALID_URL":
+                     return (index, track_name, "ERROR", None, Exception(f"Invalid Stream URL (ID returned): {res[2]}"))
+                
+                if res and isinstance(res, tuple) and res[0] is None and res[1] == "VIDEO_DISABLED":
+                     return (index, track_name, "SKIPPED", None, Exception("Video download disabled in settings"))
+
+                return (index, track_name, "ERROR", None, Exception("Download returned None"))
+            except Exception as e:
+                error_msg = str(e)
+                if error_msg.isdigit():
+                    error_msg = f"Track unavailable on server (Content Removed/Blocked). ID: {error_msg}"
+                    return (index, track_name, "ERROR", None, Exception(error_msg))
+                return (index, track_name, "ERROR", None, e)
+
+        async def run_concurrent():
+            async with create_aiohttp_session() as session:
+                semaphore = asyncio.Semaphore(concurrent_downloads)
+                async def bounded_download(i, a):
+                    async with semaphore: return await download_worker_async(session, i, a)
+                tasks = [bounded_download(i, a) for i, a in enumerate(download_args_list)]
+                symbols = self._get_status_symbols()
+                
+                # --- FIX: USO CORRECTO DE TQDM.TQDM ---
+                iterator = asyncio.as_completed(tasks)
+                if self.global_settings["general"].get("progress_bar", False) and tqdm_progress is not None:
+                    # Usamos tqdm_progress() explícitamente porque importamos 'import tqdm'
+                    iterator = tqdm_progress(iterator, total=total_tracks, unit='tr', leave=False)
+                
+                completed = 0
+                for coro in iterator:
+                    index, name, status, dl_res, error = await coro
+                    completed += 1
+                    
+                    if status == "ERROR":
+                        status_str = symbols['error']
+                        error_msg = str(error) if error else "Unknown error"
+                        msg = f"{completed}/{total_tracks} {status_str} {name}: {symbols['red_text']}{error_msg}{symbols['reset']}"
+                        if self.global_settings["general"].get("progress_bar", False) and tqdm_progress is not None:
+                            tqdm_progress.write(msg)
+                        else:
+                            self.print(msg, drop_level=performance_summary_indent)
+                            
+                    elif status == "SKIPPED":
+                        msg_suffix = "(already exists)"
+                        if error and str(error) == "Video download disabled in settings":
+                             msg_suffix = "(video disabled)"
+                        
+                        msg = f"{completed}/{total_tracks} {symbols['skip']} {name} {symbols['yellow_text']}{msg_suffix}{symbols['reset']}"
+                        if self.global_settings["general"].get("progress_bar", False) and tqdm_progress is not None:
+                            tqdm_progress.write(msg)
+                        else:
+                            self.print(msg, drop_level=performance_summary_indent)
+                    else:
+                        msg = f"{completed}/{total_tracks} {symbols['success']} {name}"
+                        if self.global_settings["general"].get("progress_bar", False) and tqdm_progress is not None:
+                            tqdm_progress.write(msg)
+                        else:
+                            self.print(msg, drop_level=performance_summary_indent)
+                        
+                    results[index] = (index, dl_res, error)
+            return results
+
+        return asyncio.run(run_concurrent())
 
     @staticmethod
-    def _get_artist_initials_from_name(album_info: AlbumInfo) -> str:
-        # Remove "the" from the inital string
-        initial = album_info.artist.lower()
-        if album_info.artist.lower().startswith('the'):
-            initial = initial.replace('the ', '')[0].upper()
+    def _get_artist_initials_from_name(name: str) -> str:
+        if not name: return '#'
+        ch = name.strip()[0].upper()
+        decomposed = unicodedata.normalize('NFD', ch)
+        base = ''.join(c for c in decomposed if unicodedata.category(c) != 'Mn').upper()
+        return base if ('A' <= base <= 'Z') else '#'
 
-        # Unicode fix
-        initial = unicodedata.normalize('NFKD', initial[0]).encode('ascii', 'ignore').decode('utf-8')
-
-        # Make the initial upper if it's alpha
-        initial = initial.upper() if initial.isalpha() else '#'
-
-        return initial
-
-    def _create_album_location(self, path: str, album_id: str, album_info: AlbumInfo) -> str:
-        # Clean up album tags and add special explicit and additional formats
-        album_tags = {k: sanitise_name(v) for k, v in asdict(album_info).items()}
-        album_tags['id'] = str(album_id)
-        album_tags['quality'] = f' [{album_info.quality}]' if album_info.quality else ''
-        album_tags['explicit'] = ' [E]' if album_info.explicit else ''
-        album_tags['artist_initials'] = self._get_artist_initials_from_name(album_info)
-
-        # album_path = path + self.global_settings['formatting']['album_format'].format(**album_tags) # OLD
-        album_path_formatted_name = self.global_settings['formatting']['album_format'].format(**album_tags)
-        album_path = os.path.join(path, album_path_formatted_name)
-        # fix path byte limit
-        album_path = fix_byte_limit(album_path) + '/'
-        os.makedirs(album_path, exist_ok=True)
-
-        return album_path
-
-    def _create_track_location(self, album_location: str, track_info: TrackInfo) -> str:
-        """Create the full file path for a track"""
-        # Clean up track tags and add special formats
-        track_tags = {k: sanitise_name(v) for k, v in asdict(track_info).items()}
-        track_tags['explicit'] = ' [E]' if track_info.explicit else ''
+    def _create_track_location(self, album_location: str, track_info: TrackInfo, custom_format: str = None, extra_template_data: dict = None, forced_total_discs: int = None) -> str:
+        data = prepare_template_data(track_info=track_info, extra_tags=extra_template_data)
         
-        # Add commonly used format variables
-        track_tags['artist'] = ', '.join([sanitise_name(artist) for artist in track_info.artists]) if track_info.artists else ''
-        track_tags['album_artist'] = sanitise_name(track_info.tags.album_artist) if track_info.tags.album_artist else track_tags['artist']
+        # --- VIDEO PATH LOGIC ---
+        is_video = track_info.codec in [CodecEnum.H264, CodecEnum.H265]
+        video_path_setting = self.global_settings['general'].get('video_download_path')
         
-        # Add commonly used tag fields from track_info.tags
-        track_tags['isrc'] = sanitise_name(track_info.tags.isrc) if track_info.tags.isrc else ''
-        track_tags['upc'] = sanitise_name(track_info.tags.upc) if track_info.tags.upc else ''
-        track_tags['composer'] = sanitise_name(track_info.tags.composer) if track_info.tags.composer else ''
-        track_tags['label'] = sanitise_name(track_info.tags.label) if track_info.tags.label else ''
-        track_tags['release_date'] = track_info.tags.release_date if track_info.tags.release_date else ''
-        track_tags['genres'] = ', '.join(track_info.tags.genres) if track_info.tags.genres else ''
+        video_format_string = None
+        if is_video and video_path_setting:
+            if '{' in video_path_setting:
+                video_format_string = video_path_setting
+                base_path = ""
+            else:
+                base_path = video_path_setting
+            # Treat as single to use single_full_path_format (or video_format_string)
+            album_location = None
+        else:
+            base_path = album_location if album_location else self.path
+        # ------------------------
         
-        # Add all documented format variables from GUI with default values
-        track_tags['track_number'] = str(track_info.tags.track_number) if track_info.tags.track_number else ''
-        track_tags['total_tracks'] = str(track_info.tags.total_tracks) if track_info.tags.total_tracks else ''
-        track_tags['disc_number'] = str(track_info.tags.disc_number) if track_info.tags.disc_number else ''
-        track_tags['total_discs'] = str(track_info.tags.total_discs) if track_info.tags.total_discs else ''
-        track_tags['quality'] = track_info.codec.name if track_info.codec else ''
-        track_tags['artist_initials'] = self._get_artist_initials_from_name(AlbumInfo(name='', artist=track_tags['artist'], tracks=[], release_year=0))
+        # --- ZFILL LOGIC ---
+        if self.global_settings['formatting'].get('enable_zfill', False):
+            try:
+                total = int(data.get('total_tracks', 0))
+                pad_len = len(str(total)) if total > 9 else 2
+                
+                if 'track_number' in data and data['track_number']:
+                    data['track_number'] = str(data['track_number']).zfill(pad_len)
+                if 'disc_number' in data and data['disc_number']:
+                    data['disc_number'] = str(data['disc_number']).zfill(2)
+            except Exception:
+                pass
+        # -------------------
         
-        # Handle track/disc number formatting with zero-fill if enabled
-        if self.global_settings['formatting']['enable_zfill']:
-            if track_info.tags.track_number and track_info.tags.total_tracks:
-                total_digits = len(str(track_info.tags.total_tracks))
-                track_tags['track_number'] = str(track_info.tags.track_number).zfill(total_digits)
-            if track_info.tags.disc_number and track_info.tags.total_discs:
-                total_digits = len(str(track_info.tags.total_discs))
-                track_tags['disc_number'] = str(track_info.tags.disc_number).zfill(total_digits)
-        
-        # Get the appropriate format string
-        # Better detection for single track downloads
-        is_single_track_download = (
-            album_location == self.path or  # Original condition (CLI and proper single tracks)
-            (hasattr(self, 'download_mode') and self.download_mode is DownloadTypeEnum.track)  # Track download mode
-        )
-        
-        if is_single_track_download:
+        if custom_format:
+            format_string = custom_format
+        elif video_format_string:
+            format_string = video_format_string
+        elif (not album_location) or (album_location == self.path):
             format_string = self.global_settings['formatting']['single_full_path_format']
-        else:  # Track in album/playlist
+        else:
             format_string = self.global_settings['formatting']['track_filename_format']
         
-        # Format the filename
-        track_filename = format_string.format(**track_tags)
+        temp_artist = data.get('artist', 'Unknown')
+        data['artist_initials'] = self._get_artist_initials_from_name(temp_artist)
+
+        # Use forced_total_discs if provided, otherwise use metadata
+        total_discs = forced_total_discs if forced_total_discs is not None else int(data.get('total_discs') or 0)
+        disc_num = int(data.get('disc_number') or 1)
         
-        # Add file extension based on codec
-        codec_extensions = {
+        # FALLBACK: If disc_number > 1 but total_discs <= 1, assume multi-disc album
+        if disc_num > 1 and total_discs <= 1:
+            total_discs = disc_num  # At least disc_num discs exist
+        
+        for pat in ['Disc {disc_number}/', 'Disk {disc_number}/', 'CD {disc_number}/']:
+            format_string = format_string.replace(pat, '')
+        format_string = format_string.lstrip('/')
+        
+        # Create Disc folder if this is a multi-disc album
+        if total_discs > 1 and not custom_format:
+            format_string = f"Disc {disc_num}/{format_string}"
+            
+        filename_rel = format_template_advanced(format_string, data)
+        ext = {
             CodecEnum.FLAC: '.flac',
             CodecEnum.MP3: '.mp3',
             CodecEnum.AAC: '.m4a',
             CodecEnum.ALAC: '.m4a',
-            CodecEnum.OPUS: '.opus',
-            CodecEnum.VORBIS: '.ogg',
-            CodecEnum.WAV: '.wav',
-            CodecEnum.AIFF: '.aiff',
-            CodecEnum.AC4: '.ac4',
-            CodecEnum.AC3: '.ac3',
-            CodecEnum.EAC3: '.eac3'
-        }
-        extension = codec_extensions.get(track_info.codec, '.flac')  # Default to .flac
-        track_filename += extension
+            CodecEnum.H264: '.mp4',
+            CodecEnum.H265: '.mp4'
+        }.get(track_info.codec, '.flac')
+        if not filename_rel.lower().endswith(ext): filename_rel += ext
         
-        # Combine with album location
-        track_location = os.path.join(album_location, track_filename)
-        
-        # Fix byte limit
-        track_location = fix_byte_limit(track_location)
-        
+        if platform.system() == 'Windows' and _DRIVE_RE.match(filename_rel.split('/')[0]):
+            track_location = os.path.abspath(filename_rel)
+        else:
+            track_location = os.path.join(base_path, filename_rel)
+
+        if platform.system() == 'Windows':
+            track_location = os.path.abspath(track_location)
+            if not track_location.startswith('\\\\?\\'): track_location = '\\\\?\\' + track_location
+
+        # Fuzzy folder match: if a sibling folder exists with same normalized name, use it
+        # This prevents duplicate folders differing only in diacritics
+        track_location = self._resolve_fuzzy_folder(track_location)
+
         return track_location
 
-    def _download_album_files(self, album_path: str, album_info: AlbumInfo):
-        if album_info.cover_url and self.global_settings['covers']['save_external']:
-            download_file(album_info.cover_url, f'{album_path}cover.{album_info.cover_type.name}', artwork_settings=self._get_artwork_settings())
+    @staticmethod
+    def _find_fuzzy_folder(parent_dir: str, folder_name: str) -> str:
+        """Return an existing subfolder of parent_dir whose name matches folder_name
+        when diacritics are ignored. Returns folder_name unchanged if none found."""
+        norm = _normalize_for_compare(folder_name)
+        try:
+            if os.path.isdir(parent_dir):
+                for entry in os.listdir(parent_dir):
+                    if entry != folder_name and os.path.isdir(os.path.join(parent_dir, entry)):
+                        if _normalize_for_compare(entry) == norm:
+                            return entry
+        except Exception:
+            pass
+        return folder_name
 
-        if album_info.animated_cover_url and self.global_settings['covers']['save_animated_cover']:
-            self.print('Downloading animated album cover')
-            download_file(album_info.animated_cover_url, album_path + 'cover.mp4', enable_progress_bar=self.global_settings['general'].get('progress_bar', True))
+    def _resolve_fuzzy_folder(self, loc: str, is_dir: bool = False) -> str:
+        """Rewrite loc so that every folder component uses any existing
+        fuzzy-matching folder name instead of creating a new one.
+        Set is_dir=True when loc is a directory path (all parts are folders)."""
+        prefix = '\\\\?\\' if loc.startswith('\\\\?\\') else ''
+        clean_loc = loc[len(prefix):]
 
-        if album_info.description:
-            with open(album_path + 'description.txt', 'w', encoding='utf-8') as f:
-                f.write(album_info.description)  # Also add support for this with singles maybe?
+        parts = [p for p in clean_loc.replace('\\', '/').split('/') if p]
+        if not parts:
+            return loc
+
+        # Build resolved path — handle Windows drive letter (e.g. 'Z:')
+        if _DRIVE_RE.match(parts[0]):
+            resolved = parts[0] + '\\'
+            parts = parts[1:]
+        else:
+            resolved = os.sep
+
+        if is_dir:
+            # All parts are folders — fuzzy-match every component
+            for part in parts:
+                actual = self._find_fuzzy_folder(resolved, part)
+                resolved = os.path.join(resolved, actual)
+        else:
+            # Last part is the filename — match all folder parts, keep filename
+            for part in parts[:-1]:
+                actual = self._find_fuzzy_folder(resolved, part)
+                resolved = os.path.join(resolved, actual)
+            resolved = os.path.join(resolved, parts[-1]) if parts else resolved
+
+        return prefix + resolved
+
+    def _create_album_location(self, path: str, album_id: str, album_info: AlbumInfo) -> str:
+        if album_info.release_date and len(album_info.release_date) >= 10:
+            full_release_date = album_info.release_date[:10]
+        else:
+            full_release_date = str(album_info.release_year) if album_info.release_year else ""
+
+        release_type = determine_release_type(album_info=album_info)
+        data = {
+            'artist': album_info.artist,
+            'album_artist': album_info.artist,
+            'main_artist': album_info.artist,
+            'name': album_info.name,
+            'album': album_info.name,
+            'album_clean': clean_string_logic(album_info.name),
+            'release_date': full_release_date,
+            'year': str(full_release_date)[:4] if len(str(full_release_date)) >= 4 else "",
+            'release': release_type,
+            'explicit': Explicit(getattr(album_info, 'explicit', False)),
+            'artist_initials': self._get_artist_initials_from_name(album_info.artist)
+        }
+
+        format_string = self.global_settings['formatting']['album_format']
+        format_string = format_string.replace('[{release}]', '{release}')
+        format_string = format_string.replace('[{quality}]', '{quality}')
+        format_string = format_string.replace('[{explicit}]', '{explicit}')
+        try:
+            album_path_formatted_name = format_template_advanced(format_string, data)
+        except Exception as e:
+            logging.error(f"Error formatting album path: {e}")
+            relative_path = f"{sanitise_name(data['artist'])}/{sanitise_name(data['name'])}"
+            album_path_formatted_name = relative_path
+
+        album_path = os.path.join(path, album_path_formatted_name)
+        try:
+            album_path = fix_byte_limit(album_path) + '/'
+        except ValueError:
+            album_path = album_path + '/'
+
+        album_path = self._resolve_fuzzy_folder(album_path.rstrip('/'), is_dir=True) + '/'
+        os.makedirs(album_path, exist_ok=True)
+        return album_path
+
+    def _create_album_location_from_track(self, track_info: TrackInfo) -> str:
+        t_tags = getattr(track_info, 'tags', None)
+        album_name = 'Unknown Album'
+        album_artist = 'Unknown Artist'
+        release_date = ''
+        if t_tags:
+            album_name = getattr(t_tags, 'album', '') or getattr(t_tags, 'album_name', '') or 'Unknown Album'
+            album_artist = getattr(t_tags, 'album_artist', '')
+            release_date = getattr(t_tags, 'release_date', '')
+            if release_date and len(release_date) > 10:
+                release_date = release_date[:10]
+        if not album_artist and track_info.artists:
+            album_artist = str(track_info.artists[0]) if isinstance(track_info.artists, list) else str(
+                track_info.artists)
+
+        release_type = determine_release_type(track_info=track_info)
+        data = {
+            'artist': album_artist,
+            'main_artist': album_artist,
+            'name': album_name,
+            'album': album_name,
+            'album_clean': clean_string_logic(album_name),
+            'release_date': release_date,
+            'year': release_date[:4] if len(release_date) >= 4 else "",
+            'release': release_type,
+            'explicit': Explicit(getattr(track_info, 'explicit', False)),
+            'artist_initials': self._get_artist_initials_from_name(album_artist)
+        }
+        format_string = self.global_settings['formatting']['album_format']
+        format_string = format_string.replace('[{release}]', '{release}')
+        format_string = format_string.replace('[{quality}]', '{quality}')
+        format_string = format_string.replace('[{explicit}]', '{explicit}')
+        try:
+            relative_path = format_template_advanced(format_string, data)
+        except Exception as e:
+            relative_path = f"{sanitise_name(album_artist)}/{sanitise_name(album_name)}"
+        album_path = os.path.join(self.path, relative_path)
+        try:
+            album_path = fix_byte_limit(album_path) + '/'
+        except ValueError:
+            album_path = album_path + '/'
+        album_path = self._resolve_fuzzy_folder(album_path.rstrip('/'), is_dir=True) + '/'
+        os.makedirs(album_path, exist_ok=True)
+        return album_path
 
     def download_album(self, album_id, artist_name='', path=None, indent_level=1, extra_kwargs=None):
-        # Set indent
         self.set_indent_number(indent_level)
-        d_print = self.oprinter.oprint
-        symbols = self._get_status_symbols()
-
-        # Get album info - use indent level 1 to match album details
-        self.set_indent_number(1)
-        self.print(f'Fetching data. Please wait...')
+        self.print(f'Fetching album data...')
         album_info: AlbumInfo = self.service.get_album_info(album_id, **(extra_kwargs or {}))
-
-        if not album_info:
-            logging.warning(f"Could not retrieve album info for {album_id} from {self.service_name}. Skipping album.")
-            return []
+        if not album_info: return []
         
+        # --- PRINTS RESTAURADOS ---
+        self.print(f'=== Downloading album {album_info.name} ({album_info.id}) ===', drop_level=1)
+        self.print(f'Artist: {album_info.artist} ({album_info.artist_id})')
+        if album_info.release_year: self.print(f'Year: {album_info.release_year}')
+        if album_info.duration: self.print(f'Duration: {beauty_format_seconds(album_info.duration)}')
         number_of_tracks = len(album_info.tracks)
-        path = self.path if not path else path
-
-        if number_of_tracks > 1 or self.global_settings['formatting']['force_album_format']:
-            # Creates the album_location folders
-            album_path = self._create_album_location(path, album_id, album_info)
+        self.print(f'Number of tracks: {number_of_tracks!s}')
+        colored_platform = get_colored_platform_name(self.module_settings[self.service_name].service_name)
+        self.print(f'Platform: {colored_platform}')
+        # BETTER DETECTION: Get track info for first few tracks to detect discs
+        detected_total_discs = 1
+        try:
+            if album_info.tracks and len(album_info.tracks) > 0:
+                # Sample up to first 5 tracks to detect disc structure
+                quality_tier = QualityEnum[self.global_settings['general']['download_quality'].upper()]
+                codec_options = CodecOptions(
+                    spatial_codecs=self.global_settings['codecs']['spatial_codecs'],
+                    proprietary_codecs=self.global_settings['codecs']['proprietary_codecs']
+                )
+                # Smart sampling: first 3 and last 2 tracks to catch multi-disc
+                sample_indices = []
+                if len(album_info.tracks) <= 5:
+                    sample_indices = list(range(len(album_info.tracks)))
+                else:
+                    # Sample first 3 and last 2
+                    sample_indices = [0, 1, 2, len(album_info.tracks) - 2, len(album_info.tracks) - 1]
+                
+                disc_numbers = []
+                for i in sample_indices:
+                    track_item = album_info.tracks[i]
+                    track_id = track_item.id if hasattr(track_item, 'id') else track_item
+                    try:
+                        track_info_sample = self.service.get_track_info(track_id, quality_tier, codec_options, **(album_info.track_extra_kwargs or {}))
+                        if track_info_sample and hasattr(track_info_sample, 'tags') and track_info_sample.tags:
+                            disc_num = getattr(track_info_sample.tags, 'disc_number', 1)
+                            total_disc = getattr(track_info_sample.tags, 'total_discs', 0)
+                            if disc_num: disc_numbers.append(disc_num)
+                            if total_disc > detected_total_discs:
+                                detected_total_discs = total_disc
+                    except:
+                        pass
+                
+                # If we found any disc numbers, use the max
+                if disc_numbers:
+                    max_disc_from_sample = max(disc_numbers)
+                    detected_total_discs = max(detected_total_discs, max_disc_from_sample)
+        except Exception as e:
+            logging.debug(f"Could not detect disc structure: {e}")
         
-            if self.download_mode is DownloadTypeEnum.album:
-                self.set_indent_number(1)
-                self.print(f'=== Downloading album {album_info.name} ({album_id}) ===', drop_level=1)
-            elif self.download_mode is DownloadTypeEnum.artist:
-                self.set_indent_number(1)
-                self.print(f'=== Downloading album {album_info.name} ({album_id}) ===', drop_level=1)
-            self.print(f'Artist: {album_info.artist} ({album_info.artist_id})')
-            if album_info.release_year: self.print(f'Year: {album_info.release_year}')
-            if album_info.duration: self.print(f'Duration: {beauty_format_seconds(album_info.duration)}')
-            self.print(f'Number of tracks: {number_of_tracks!s}')
-            colored_platform = get_colored_platform_name(self.module_settings[self.service_name].service_name)
-            self.print(f'Platform: {colored_platform}')
+        album_path = self._create_album_location(path if path else self.path, album_id, album_info)
+        
+        concurrent_downloads = self.global_settings['general'].get('concurrent_downloads', 1)
+        download_args_list = []
+        for index, track_item in enumerate(album_info.tracks, start=1):
+            t_id = track_item.id if hasattr(track_item, 'id') else track_item
+            download_args_list.append({
+                'track_id': t_id, 'album_location': album_path, 'track_index': index,
+                'number_of_tracks': number_of_tracks, 'indent_level': 1,
+                'extra_kwargs': album_info.track_extra_kwargs,
+                'forced_total_discs': detected_total_discs
+            })
+        # Pre-flight: if album comes from a non-primary storefront, test availability
+        # via a lightweight webplayback check to avoid 18x "unavailable" errors
+        album_storefront = (album_info.track_extra_kwargs or {}).get('storefront', 'us')
+        primary_sf = getattr(self.service, '_primary_storefront', 'us')
+        if album_storefront.lower() not in ('us', primary_sf.lower()):
+            first_id = album_info.tracks[0] if album_info.tracks else None
+            if first_id:
+                try:
+                    available = self.service.check_track_available(str(first_id))
+                    if not available:
+                        self.print(f'Album not streamable in your region (storefront: {album_storefront}). Skipping.', drop_level=1)
+                        return []
+                except Exception:
+                    pass  # If check fails, try anyway
 
-            if album_info.booklet_url and not os.path.exists(album_path + 'Booklet.pdf'):
-                self.print('Downloading booklet')
-                download_file(album_info.booklet_url, album_path + 'Booklet.pdf')
-            
-            cover_temp_location = download_to_temp(album_info.all_track_cover_jpg_url) if album_info.all_track_cover_jpg_url else ''
-
-            # Download booklet, animated album cover and album cover if present
-            self._download_album_files(album_path, album_info)
-
-            # Get concurrent downloads setting
-            concurrent_downloads = self.global_settings['general'].get('concurrent_downloads', 1)
-            
-            # Force sequential downloads for specific modules or when concurrent_downloads is 1
-            service_name_lower = ""
-            if hasattr(self, 'service_name') and self.service_name:
-                service_name_lower = self.service_name.lower()
-            
-            # Check if sequential downloads should be forced
-            force_sequential = False
-            sequential_reason = ""
-            
-            if concurrent_downloads == 1:
-                force_sequential = True
-                sequential_reason = "concurrent_downloads setting is 1"
-            elif service_name_lower == 'spotify':
-                force_sequential = True
-                sequential_reason = "Spotify (rate limiting protection)"
-            elif service_name_lower == 'applemusic':
-                force_sequential = True
-                sequential_reason = "Apple Music"
-            
-            if force_sequential:
-                concurrent_downloads = 1
-                self.print(f"Using sequential downloads for {sequential_reason}")
-            
-            if concurrent_downloads > 1 and number_of_tracks > 1:
-                # Prepare download arguments for all tracks
-                download_args_list = []
-                for index, track_item in enumerate(album_info.tracks, start=1):
-                    track_id_to_download = track_item.id if hasattr(track_item, 'id') else track_item
-                    
-                    # For artist downloads, check if we're processing album tracks (indent_level > 1) or individual tracks
-                    # For regular album downloads, use indent level 1 (8 spaces) for track content
-                    if self.download_mode is DownloadTypeEnum.artist:
-                        # If indent_level > 1, we're processing album tracks within artist download, use level 1 (8 spaces)
-                        # If indent_level == 1, we're processing individual artist tracks, use level 0 (no indent)
-                        track_content_indent = 1 if indent_level > 1 else 0
-                    else:
-                        track_content_indent = 1
-                    download_args = {
-                        'track_id': track_id_to_download,
-                        'album_location': album_path,
-                        'track_index': index,
-                        'number_of_tracks': number_of_tracks,
-                        'main_artist': artist_name,
-                        'cover_temp_location': cover_temp_location,
-                        'indent_level': track_content_indent,
-                        'extra_kwargs': album_info.track_extra_kwargs
-                    }
-                    download_args_list.append(download_args)
-                
-                # Download tracks concurrently
-                results = self._concurrent_download_tracks(album_info.tracks, download_args_list, concurrent_downloads, performance_summary_indent=0)
-                
-                # Process results and collect rate-limited tracks
-                # (Errors are already reported by concurrent download progress monitor)
-                rate_limited_tracks = []
-                for index, (original_index, result, error) in enumerate(results):
-                    if error and result == "RATE_LIMITED":
-                        track_item = album_info.tracks[original_index]
-                        track_id_to_download = track_item.id if hasattr(track_item, 'id') else track_item
-                        rate_limited_tracks.append({
-                            'id': track_id_to_download,
-                            'extra_kwargs': album_info.track_extra_kwargs,
-                            'original_index': original_index + 1,
-                            'track_item': track_item
-                        })
-                    elif result == "RATE_LIMITED":
-                        track_item = album_info.tracks[original_index]
-                        track_id_to_download = track_item.id if hasattr(track_item, 'id') else track_item
-                        rate_limited_tracks.append({
-                            'id': track_id_to_download,
-                            'extra_kwargs': album_info.track_extra_kwargs,
-                            'original_index': original_index + 1,
-                            'track_item': track_item
-                        })
-                
-                # Retry rate-limited tracks for Spotify and Apple Music
-                if rate_limited_tracks and service_name_lower in ['spotify', 'applemusic']:
-                    self.set_indent_number(indent_level + 1)
-                    print()  # Add spacing before retry section
-                    if service_name_lower == 'applemusic':
-                        self.print(f'{len(rate_limited_tracks)} tracks failed with temporary errors. Retrying...', drop_level=1)
-                        self.print("Using sequential downloads for Apple Music retries", drop_level=1)
-                    else:
-                        self.print(f'{len(rate_limited_tracks)} tracks deferred due to rate limiting. Retrying...', drop_level=1)
-                    
-                    for i, retry_item in enumerate(rate_limited_tracks):
-                        # For artist downloads, keep track headers at level 2; for regular albums, use level 1
-                        track_indent_level = 2 if self.download_mode is DownloadTypeEnum.artist else 1
-                        self.set_indent_number(track_indent_level)
-                        print()  # Spacing
-                        # Track headers should be indented (8 spaces) in regular album downloads, no drop for artist downloads
-                        drop_level_for_retry_track = 1 if self.download_mode is DownloadTypeEnum.artist else 0
-                        self.print(f'Track {retry_item["original_index"]}/{number_of_tracks} (Retry Pass)', drop_level=drop_level_for_retry_track)
-                        # For artist downloads, check if we're processing album tracks (indent_level > 1) or individual tracks  
-                        # For regular album downloads, use indent level 1 (8 spaces) for track content
-                        if self.download_mode is DownloadTypeEnum.artist:
-                            # If indent_level > 1, we're processing album tracks within artist download, use level 1 (8 spaces)
-                            # If indent_level == 1, we're processing individual artist tracks, use level 0 (no indent)
-                            track_content_indent = 1 if indent_level > 1 else 0
-                        else:
-                            track_content_indent = 1
-                        self.download_track(
-                            retry_item['id'],
-                            album_location=album_path,
-                            track_index=retry_item["original_index"],
-                            number_of_tracks=number_of_tracks,
-                            main_artist=artist_name,
-                            cover_temp_location=cover_temp_location,
-                            indent_level=track_content_indent,
-                            extra_kwargs=retry_item['extra_kwargs']
-                        )
-                        # Add pause between retry tracks (except for the last one)
-                        if i < len(rate_limited_tracks) - 1:
-                            print()
-                            if service_name_lower == 'applemusic':
-                                self.print("Pausing 2 seconds before retry...", drop_level=1)
-                                time.sleep(2)
-                            else:
-                                self.print("Pausing 30 seconds to prevent rate limiting...", drop_level=1)
-                                time.sleep(30)
-                else:
-                    # Only show rate limiting message for Spotify (where it's relevant)
-                    if service_name_lower == 'spotify':
-                        # Force rate limiting message to have exactly 8 spaces indentation
-                        current_indent = self.indent_number
-                        self.set_indent_number(1)
-                        self.print("No tracks were deferred due to rate limiting.")
-                        self.set_indent_number(current_indent)
-                        print()  # Add blank line after message
-            else:
-                # Fallback to sequential downloads
-                rate_limited_tracks = []  # Initialize list for deferred tracks
-                
-                for index, track_item in enumerate(album_info.tracks, start=1):
-                    # For artist downloads, keep track headers at level 2; for regular albums, use level 1
-                    track_indent_level = 2 if self.download_mode is DownloadTypeEnum.artist else 1
-                    self.set_indent_number(track_indent_level)
-                    # Track headers should be indented (8 spaces) in regular album downloads, no drop for artist downloads
-                    drop_level_for_track = 1 if self.download_mode is DownloadTypeEnum.artist else 0
-                    # Only show "Pass 1" for Spotify (which has retry passes)
-                    pass_indicator = " (Pass 1)" if service_name_lower == 'spotify' else ""
-                    self.print(f'Track {index}/{number_of_tracks}{pass_indicator}', drop_level=drop_level_for_track)
-                    track_id_to_download = track_item.id if hasattr(track_item, 'id') else track_item # Check for .id attribute
-                    # For artist downloads, check if we're processing album tracks (indent_level > 1) or individual tracks
-                    # For regular album downloads, use indent level 1 (8 spaces) for track content
-                    if self.download_mode is DownloadTypeEnum.artist:
-                        # If indent_level > 1, we're processing album tracks within artist download, use level 1 (8 spaces)
-                        # If indent_level == 1, we're processing individual artist tracks, use level 0 (no indent)
-                        track_content_indent = 1 if indent_level > 1 else 0
-                    else:
-                        track_content_indent = 1
-                    download_result = self.download_track(track_id_to_download, album_location=album_path, track_index=index, number_of_tracks=number_of_tracks, main_artist=artist_name, cover_temp_location=cover_temp_location, indent_level=track_content_indent, extra_kwargs=album_info.track_extra_kwargs)
-                    
-                    # Add pause between downloads for Spotify to prevent rate limiting
-                    # Only pause if track was actually downloaded (not skipped) and not the last track
-                    if (service_name_lower == 'spotify' and index < number_of_tracks and 
-                        download_result is not None and download_result != "RATE_LIMITED"):
-                        pause_seconds = self._get_spotify_pause_seconds()
-                        self.print(f'Pausing {pause_seconds} seconds to prevent rate limiting...', drop_level=1)
-                        time.sleep(pause_seconds)
-                        print()  # Add blank line after pause message for consistent spacing with playlists
-                    
-                    # Collect rate-limited tracks for retry
-                    if download_result == "RATE_LIMITED":
-                        logging.info(f"Deferring album track {track_id_to_download} due to rate limit.")
-                        rate_limited_tracks.append({
-                            'id': track_id_to_download,
-                            'extra_kwargs': album_info.track_extra_kwargs,
-                            'original_index': index,
-                            'track_item': track_item
-                        })
-                
-                # Retry rate-limited tracks for Spotify and Apple Music
-                if rate_limited_tracks and service_name_lower in ['spotify', 'applemusic']:
-                    self.set_indent_number(indent_level + 1)
-                    print()  # Add spacing before retry section
-                    if service_name_lower == 'applemusic':
-                        self.print(f'{len(rate_limited_tracks)} tracks failed with temporary errors. Retrying...', drop_level=1)
-                        self.print("Using sequential downloads for Apple Music retries", drop_level=1)
-                    else:
-                        self.print(f'{len(rate_limited_tracks)} tracks deferred due to rate limiting. Retrying...', drop_level=1)
-                    
-                    for i, retry_item in enumerate(rate_limited_tracks):
-                        # For artist downloads, keep track headers at level 2; for regular albums, use level 1
-                        track_indent_level = 2 if self.download_mode is DownloadTypeEnum.artist else 1
-                        self.set_indent_number(track_indent_level)
-                        print()  # Spacing
-                        # Track headers should be indented (8 spaces) in regular album downloads, no drop for artist downloads
-                        drop_level_for_retry_track_seq = 1 if self.download_mode is DownloadTypeEnum.artist else 0
-                        self.print(f'Track {retry_item["original_index"]}/{number_of_tracks} (Retry Pass)', drop_level=drop_level_for_retry_track_seq)
-                        # For artist downloads, check if we're processing album tracks (indent_level > 1) or individual tracks
-                        # For regular album downloads, use indent level 1 (8 spaces) for track content
-                        if self.download_mode is DownloadTypeEnum.artist:
-                            # If indent_level > 1, we're processing album tracks within artist download, use level 1 (8 spaces)
-                            # If indent_level == 1, we're processing individual artist tracks, use level 0 (no indent)
-                            track_content_indent = 1 if indent_level > 1 else 0
-                        else:
-                            track_content_indent = 1
-                        self.download_track(
-                            retry_item['id'],
-                            album_location=album_path,
-                            track_index=retry_item["original_index"],
-                            number_of_tracks=number_of_tracks,
-                            main_artist=artist_name,
-                            cover_temp_location=cover_temp_location,
-                            indent_level=track_content_indent,
-                            extra_kwargs=retry_item['extra_kwargs']
-                        )
-                        # Add pause between retry tracks (except for the last one)
-                        if i < len(rate_limited_tracks) - 1:
-                            print()
-                            if service_name_lower == 'applemusic':
-                                self.print("Pausing 2 seconds before retry...", drop_level=1)
-                                time.sleep(2)
-                            else:
-                                self.print("Pausing 30 seconds to prevent rate limiting...", drop_level=1)
-                                time.sleep(30)
-                else:
-                    # Only show rate limiting message for Spotify (where it's relevant)
-                    if service_name_lower == 'spotify':
-                        # Force rate limiting message to have exactly 8 spaces indentation
-                        current_indent = self.indent_number
-                        self.set_indent_number(1)
-                        self.print("No tracks were deferred due to rate limiting.")
-                        self.set_indent_number(current_indent)
-                        print()  # Add blank line after message
-
-            # For artist downloads, align album completion with album start message
-            if self.download_mode is DownloadTypeEnum.artist:
-                self.set_indent_number(1)  # Same as album start for artist downloads
-            else:
-                self.set_indent_number(indent_level)
-            symbols = self._get_status_symbols()
-            self.print(f'=== {symbols["success"]} Album completed ===', drop_level=1)
-            # Add 2 empty lines after album completion for visual separation
-            print()
-            print()
-            if cover_temp_location: silentremove(cover_temp_location)
-        elif number_of_tracks == 1:
-            # Single-track albums go directly to track download without album header or completion message
-            single_track_item = album_info.tracks[0]
-            track_id_to_download = single_track_item.id if hasattr(single_track_item, 'id') else single_track_item # Check for .id attribute
-            self.download_track(track_id_to_download, album_location=path, number_of_tracks=1, main_artist=artist_name, indent_level=indent_level, extra_kwargs=album_info.track_extra_kwargs)
-
+        self._concurrent_download_tracks(album_info.tracks, download_args_list, concurrent_downloads, performance_summary_indent=0)
         return album_info.tracks
 
-    def download_artist(self, artist_id, extra_kwargs=None):        
-        # Start with a copy of extra_kwargs if provided, or an empty dict
-        prepared_kwargs = {} 
-        if extra_kwargs:
-            prepared_kwargs.update(extra_kwargs)
+    def download_artist(self, artist_id, extra_kwargs=None):
+        self.set_indent_number(1)
+        
+        fetch_credited_albums = False
+        if 'artist_downloading' in self.global_settings and 'return_credited_albums' in self.global_settings['artist_downloading']:
+            fetch_credited_albums = self.global_settings['artist_downloading']['return_credited_albums']
 
+        artist_info: ArtistInfo = self.service.get_artist_info(artist_id, fetch_credited_albums, **(extra_kwargs or {}))
+        
+        if not artist_info: 
+            self.print("Failed to retrieve artist info.")
+            return
+
+        initial = self._get_artist_initials_from_name(artist_info.name)
+        
+        # --- FIX: CARPETAS DUPLICADAS EN ARTISTA ---
+        # NO construimos una ruta manual aquí (artist_path).
+        # Usamos self.path (la raíz) y dejamos que download_album construya la estructura
+        # basada en 'album_format' de settings.json ({artist_initials}/{artist}/...)
+        
+        # PERO: Calculamos artist_path solo para los tracks sueltos más abajo
+        artist_path = os.path.join(self.path, initial, sanitise_name(artist_info.name)) + '/'
+        
+        self.print(f'=== Artist: {artist_info.name} ===')
+        for index, album_item in enumerate(artist_info.albums, start=1):
+            self.print(f'Album {index}/{len(artist_info.albums)}')
+            album_id = album_item.id if hasattr(album_item, 'id') else str(album_item)
+            
+            # Pasamos self.path en lugar de artist_path para evitar duplicidad en ALBUMES
+            self.download_album(album_id, artist_name=artist_info.name, path=self.path, indent_level=2, extra_kwargs=artist_info.album_extra_kwargs)
+
+        # --- TRACKS SUELTOS (SINGLES) ---
+        # Aquí sí usamos artist_path para que queden en la carpeta del artista y no en la raíz
+        self.set_indent_number(2)
+        skip_tracks = self.global_settings['artist_downloading']['separate_tracks_skip_downloaded']
+        # NOTA: En versiones antiguas del script, artist_info.tracks podía contener tracks sueltos.
+        # Si existen, los procesamos también pasando self.path para que usen la estructura correcta.
+        if artist_info.tracks:
+             # Aquí podríamos implementar la descarga de tracks sueltos si fuera necesario
+             pass
+
+    async def _download_track_async(self, session, track_id=None, track_info=None, download_info=None, album_location='', custom_filename_format=None, extra_template_data=None, **kwargs):
+        from utils.utils import download_file_async
+        if not track_info or not download_info: return None
+        
+        # --- VIDEO SWITCH LOGIC ---
+        is_video = track_info.codec in [CodecEnum.H264, CodecEnum.H265]
+        download_videos_enabled = self.global_settings['general'].get('download_videos', True)
+        
+        if is_video and not download_videos_enabled:
+             # Devolvemos un estado "SKIPPED" pero indicando que fue por configuración
+             # Como esta función retorna (final_loc, bytes_downloaded) o None,
+             # retornar None aquí hará que _concurrent_download_tracks lo trate como error genérico.
+             # Para manejarlo bien, podríamos lanzar una excepción controlada o simplemente return None
+             # y dejar que el llamador lo ignore.
+             # Sin embargo, la mejor forma de integrarlo es lanzar una excepción específica
+             # para que el reporte final diga "Video disabled".
+             return None, "VIDEO_DISABLED"
+        # --------------------------
+
+        forced_discs = kwargs.get('forced_total_discs')
+        loc = self._create_track_location(album_location, track_info, custom_format=custom_filename_format, extra_template_data=extra_template_data, forced_total_discs=forced_discs)
+        os.makedirs(os.path.dirname(loc), exist_ok=True)
+        if download_info.download_type is DownloadEnum.URL:
+            final_loc, _ = await download_file_async(session, download_info.file_url, loc, headers=download_info.file_url_headers)
+        else:
+            final_loc = shutil.move(download_info.temp_file_path, loc)
+        
+        if final_loc:
+            # Artwork
+            artwork_path = ''
+            if track_info.cover_url and self.global_settings['covers']['embed_cover']:
+                try:
+                    artwork_path = self.create_temp_filename()
+                    art_res = await download_file_async(session, track_info.cover_url, artwork_path, 
+                                                      artwork_settings=self._get_artwork_settings(), enable_progress_bar=False)
+                    if isinstance(art_res, tuple): artwork_path = art_res[0]
+                    else: artwork_path = art_res
+                except: artwork_path = ''
+
+            # Convert
+            loop = asyncio.get_event_loop()
+            conversion_result = await loop.run_in_executor(None, self._convert_file_if_needed, final_loc, track_info, lambda x: None)
+            converted_loc, old_loc, old_container = conversion_result
+            if converted_loc and converted_loc != final_loc:
+                 final_loc = converted_loc
+
+            # Detect Container
+            file_extension = os.path.splitext(final_loc)[1].lower()
+            container_map = {
+                '.flac': ContainerEnum.flac, '.mp3': ContainerEnum.mp3,
+                '.m4a': ContainerEnum.m4a, '.opus': ContainerEnum.opus,
+                '.ogg': ContainerEnum.ogg, '.wav': ContainerEnum.wav,
+                '.aiff': ContainerEnum.aiff, '.mp4': ContainerEnum.mp4
+            }
+            container = container_map.get(file_extension, ContainerEnum.flac)
+            
+            # Tag
+            # Calculate LRC path before getting lyrics to check if it exists
+            lrc_path = os.path.splitext(final_loc)[0] + '.lrc'
+            lrc_exists = os.path.exists(lrc_path)
+            
+            if lrc_exists:
+                 self.print(f'LRC file already exists: {os.path.basename(lrc_path)}. Skipping lyric download.', drop_level=1)
+                 lyrics_info = None
+            else:
+                 lyrics_info = self._get_lyrics(track_id, track_info)
+            
+            lyrics = (lyrics_info.embedded if lyrics_info else None) or ""
+            
+            # Save synced lyrics to .lrc file
+            if lyrics_info and lyrics_info.synced and not lrc_exists:
+                try:
+                    self.print(f'Saving synced lyrics to {os.path.basename(lrc_path)}...', drop_level=1)
+                    with open(lrc_path, 'w', encoding='utf-8') as f:
+                        f.write(lyrics_info.synced)
+                except Exception as e:
+                    self.print(f'Failed to save synced lyrics: {e}', drop_level=1)
+            elif lyrics_info and lyrics_info.embedded:
+                 self.print('Only unsynced lyrics available. Embedding in file...', drop_level=1)
+
+            if not is_video:
+                if lyrics:
+                    self.print('Embedding lyrics into audio file...', drop_level=1)
+                await loop.run_in_executor(None, tag_file, final_loc, artwork_path if os.path.exists(artwork_path) else None, track_info, [], lyrics, container)
+
+            if artwork_path and os.path.exists(artwork_path): os.remove(artwork_path)
+            return (final_loc, 0)
+        return None
+
+    def download_track(self, track_id, album_location='', track_index=0, number_of_tracks=0, indent_level=1, extra_kwargs={}, forced_total_discs=None, custom_filename_format=None, extra_template_data=None, verbose=True, m3u_playlist=None, **_):
+        self.set_indent_number(indent_level)
+        if self._check_db(track_id): return "SKIPPED"
+        quality_tier = QualityEnum[self.global_settings['general']['download_quality'].upper()]
+        codec_options = CodecOptions(spatial_codecs=self.global_settings['codecs']['spatial_codecs'], proprietary_codecs=self.global_settings['codecs']['proprietary_codecs'])
+        track_info = self.service.get_track_info(track_id, quality_tier, codec_options, **extra_kwargs)
+        if forced_total_discs: track_info.tags.total_discs = forced_total_discs
+        is_video = track_info.codec in [CodecEnum.H264, CodecEnum.H265]
+        if getattr(track_info, 'error', None):
+            self.print(f'Error getting track info: {track_info.error}', drop_level=1)
+            return None
+        loc = self._create_track_location(album_location, track_info, custom_format=custom_filename_format, extra_template_data=extra_template_data, forced_total_discs=forced_total_discs)
+        existing_loc = self._track_file_exists(loc)
+        if existing_loc:
+            loc = existing_loc
+            lrc_path = os.path.splitext(loc)[0] + '.lrc'
+            
+            if not os.path.exists(lrc_path):
+                 self.print(f'Track exists but LRC missing. Checking for lyrics...', drop_level=1)
+                 lyrics_info = self._get_lyrics(track_id, track_info)
+                 if lyrics_info and lyrics_info.synced:
+                     try:
+                        self.print(f'Saving synced lyrics to {os.path.basename(lrc_path)}...', drop_level=1)
+                        with open(lrc_path, 'w', encoding='utf-8') as f:
+                            f.write(lyrics_info.synced)
+                     except Exception as e:
+                        self.print(f'Failed to save synced lyrics: {e}', drop_level=1)
+            
+            self._add_to_db(track_info, loc)
+            return "SKIPPED"
+        
+        # --- LÓGICA DE REINTENTO (Sincrona) ---
+        download_info = None
+        if hasattr(track_info, 'download_extra_kwargs') and track_info.download_extra_kwargs:
+             try:
+                 download_info = self.service.get_track_download(**track_info.download_extra_kwargs)
+             except Exception:
+                 download_info = None
+
+        if not download_info:
+            download_kwargs = extra_kwargs.copy()
+            if 'data' in download_kwargs: download_kwargs.pop('data')
+
+            try:
+                download_info = self.service.get_track_download(track_id, quality_tier, codec_options=codec_options, **download_kwargs)
+            except TypeError:
+                try:
+                    download_info = self.service.get_track_download(track_id, quality_tier, **download_kwargs)
+                except TypeError:
+                    download_info = self.service.get_track_download(track_id, quality_tier)
+        # -----------------------------------------------
+
+        os.makedirs(os.path.dirname(loc), exist_ok=True)
+        final_loc = download_file(download_info.file_url, loc, headers=download_info.file_url_headers) if download_info.download_type is DownloadEnum.URL else shutil.move(download_info.temp_file_path, loc)
+        
+        if final_loc:
+            # Artwork
+            artwork_path = ''
+            if track_info.cover_url and self.global_settings['covers']['embed_cover']:
+                artwork_path = self.create_temp_filename()
+                download_file(track_info.cover_url, artwork_path, artwork_settings=self._get_artwork_settings(), enable_progress_bar=False)
+
+            # Convert
+            conversion_result = self._convert_file_if_needed(final_loc, track_info, lambda x: None)
+            converted_loc, old_loc, old_container = conversion_result
+            if converted_loc and converted_loc != final_loc:
+                 final_loc = converted_loc
+
+            # Detect Container
+            file_extension = os.path.splitext(final_loc)[1].lower()
+            container_map = {
+                '.flac': ContainerEnum.flac, '.mp3': ContainerEnum.mp3,
+                '.m4a': ContainerEnum.m4a, '.opus': ContainerEnum.opus,
+                '.ogg': ContainerEnum.ogg, '.wav': ContainerEnum.wav,
+                '.aiff': ContainerEnum.aiff
+            }
+            container = container_map.get(file_extension, ContainerEnum.flac)
+            # Tag
+            # Calculate LRC path before getting lyrics to check if it exists
+            lrc_path = os.path.splitext(final_loc)[0] + '.lrc'
+            lrc_exists = os.path.exists(lrc_path)
+            
+            if lrc_exists:
+                 self.print(f'LRC file already exists: {os.path.basename(lrc_path)}. Skipping lyric download.', drop_level=1)
+                 lyrics_info = None
+            else:
+                 lyrics_info = self._get_lyrics(track_id, track_info)
+
+            lyrics = ""
+            if lyrics_info:
+                lyrics = lyrics_info.synced or lyrics_info.embedded or ""
+            
+            # Save synced lyrics to .lrc file
+            if lyrics_info and lyrics_info.synced and not lrc_exists:
+                try:
+                    self.print(f'Saving synced lyrics to {os.path.basename(lrc_path)}...', drop_level=1)
+                    with open(lrc_path, 'w', encoding='utf-8') as f:
+                        f.write(lyrics_info.synced)
+                except Exception as e:
+                    self.print(f'Failed to save synced lyrics: {e}', drop_level=1)
+            elif lyrics_info and lyrics_info.embedded:
+                 self.print('Only unsynced lyrics available. Embedding in file...', drop_level=1)
+
+            if not is_video:
+                if lyrics:
+                    self.print('Embedding lyrics into audio file...', drop_level=1)
+                tag_file(final_loc, artwork_path if os.path.exists(artwork_path) else None, track_info, [], lyrics, container)
+
+            if artwork_path and os.path.exists(artwork_path): os.remove(artwork_path)
+            self._add_to_db(track_info, final_loc)
+            return final_loc
+        return None
+
+    def download_playlist(self, playlist_id, custom_module=None, extra_kwargs=None):
+        import time
+        self.set_indent_number(1)
         service_name_lower = ""
         if hasattr(self, 'service_name') and self.service_name:
             service_name_lower = self.service_name.lower()
-
-        # Specific kwarg handling for Beatport/Beatsource for the 'data' key
+        kwargs_for_playlist_info = {}
+        if extra_kwargs: kwargs_for_playlist_info.update(extra_kwargs)
         if service_name_lower in ['beatport', 'beatsource']:
-            if 'data' in prepared_kwargs:
-                logging.debug(f"Popping 'data' kwarg for {self.service_name}.get_artist_info as it is unexpected.")
-                prepared_kwargs.pop('data', None)
+            if 'data' in kwargs_for_playlist_info:
+                kwargs_for_playlist_info.pop('data', None)
 
-        # Determine the value for fetching credited albums from global settings        
-        fetch_credited_albums_value = False
-        if (
-            'artist_downloading' in self.global_settings and
-            isinstance(self.global_settings['artist_downloading'], dict) and
-            'return_credited_albums' in self.global_settings['artist_downloading']
-        ):
-            fetch_credited_albums_value = self.global_settings['artist_downloading']['return_credited_albums']
+        playlist_info: PlaylistInfo = self.service.get_playlist_info(playlist_id, **kwargs_for_playlist_info)
 
-        # Call get_artist_info based on service-specific signature requirements
-        try:
-            if service_name_lower in ['deezer', 'qobuz', 'soundcloud', 'tidal', 'beatport', 'beatsource']:
-                # These services require 'get_credited_albums' (the boolean value) as the second positional argument.            
-                artist_info: ArtistInfo = self.service.get_artist_info(artist_id, fetch_credited_albums_value, **prepared_kwargs)
-            elif service_name_lower == 'spotify':
-                # Spotify handles 'return_credited_albums' as a keyword argument.
-                prepared_kwargs['return_credited_albums'] = fetch_credited_albums_value
-                artist_info: ArtistInfo = self.service.get_artist_info(artist_id, **prepared_kwargs)
+        self.print(f'=== Downloading playlist {playlist_info.name} ({playlist_id}) ===', drop_level=1)
+        self.print(f'Playlist creator: {playlist_info.creator}' + (
+            f' ({playlist_info.creator_id})' if playlist_info.creator_id else ''))
+        if playlist_info.release_year: self.print(f'Playlist creation year: {playlist_info.release_year}')
+        if playlist_info.duration: self.print(f'Duration: {beauty_format_seconds(playlist_info.duration)}')
+        number_of_tracks = len(playlist_info.tracks)
+        self.print(f'Number of tracks: {number_of_tracks!s}')
+        safe_playlist_name = sanitise_name(playlist_info.name)
+        if len(safe_playlist_name) > 50: safe_playlist_name = safe_playlist_name[:50]
+
+        # --- "HACK" PARA USAR CONFIGURACIÓN DE PLAYLISTS DESDE SETTINGS.JSON ---
+        # Leemos el campo 'playlist_format' que no se borra.
+        # Si tiene '|||', es que el usuario quiere separar Carpeta ||| Archivo.
+        
+        raw_playlist_format = self.global_settings['formatting']['playlist_format']
+        PLAYLIST_TRACK_STRUCTURE_LOCAL = PLAYLIST_TRACK_STRUCTURE # Usar variable global por defecto
+        use_default_playlist_folder = True
+
+        if "|||" in raw_playlist_format:
+            # El usuario configuró: "E:/{name} ||| {artists} - {title}..."
+            parts = raw_playlist_format.split("|||")
+            if len(parts) >= 2:
+                folder_format = parts[0].strip()
+                file_format = parts[1].strip()
+                
+                # Combinamos para crear la ruta completa del archivo
+                PLAYLIST_TRACK_STRUCTURE_LOCAL = f"{folder_format}/{file_format}"
+                
+                # Si es una ruta absoluta en Windows (E:/...), desactivamos la carpeta por defecto del programa
+                if platform.system() == 'Windows' and _DRIVE_RE.match(folder_format.split('/')[0]):
+                    use_default_playlist_folder = False
+                
+                # Sobrescribimos temporalmente el formato de playlist para que use solo la parte de la carpeta
+                # (para crear M3U y portada en el lugar correcto)
+                self.global_settings['formatting']['playlist_format'] = folder_format
+        
+        elif PLAYLIST_TRACK_STRUCTURE_LOCAL and platform.system() == 'Windows' and _DRIVE_RE.match(PLAYLIST_TRACK_STRUCTURE_LOCAL.split('/')[0]):
+             # Si no hay ||| pero hay una variable global con ruta absoluta, también desactivamos carpeta default
+             use_default_playlist_folder = False
+        # ------------------------------------------------------------------------
+
+        extra_template_data = {'name': safe_playlist_name, 'playlist_name': safe_playlist_name}
+
+        m3u_playlist_path = None
+        
+        if use_default_playlist_folder or (PLAYLIST_TRACK_STRUCTURE_LOCAL and not use_default_playlist_folder):
+            # Calculamos la ruta de la carpeta de la playlist (sea por defecto o personalizada E:/)
+            playlist_tags = {k: sanitise_name(v) for k, v in asdict(playlist_info).items()}
+            playlist_tags['name'] = safe_playlist_name
+            playlist_tags['explicit'] = Explicit(playlist_info.explicit)
+
+            format_string = self.global_settings['formatting']['playlist_format']
+            format_string = format_string.replace('[{explicit}]', '{explicit}')
+            playlist_path_formatted_name = format_string.format(**playlist_tags)
+
+            if use_default_playlist_folder:
+                playlist_path = os.path.join(self.path, playlist_path_formatted_name)
             else:
-                # For any other unhandled services.
-                # Assume they don't need 'get_credited_albums' positionally or as a specific keyword.
-                # This branch may need refinement if other services show different signature needs.
-                artist_info: ArtistInfo = self.service.get_artist_info(artist_id, **prepared_kwargs)
-        except Exception as e:
-            self.print(f"Failed to retrieve artist info for ID {artist_id}: {e}", drop_level=1)
-            symbols = self._get_status_symbols()
-            self.print(f"=== {symbols['error']} Artist failed ===", drop_level=1)
-            return
+                # Si es ruta absoluta personalizada
+                playlist_path = playlist_path_formatted_name
 
-        # Check if artist_info is None (some services may return None instead of raising an exception)
-        if artist_info is None:
-            self.print(f"Failed to retrieve artist info for ID {artist_id}: Service returned None", drop_level=1)
-            symbols = self._get_status_symbols()
-            self.print(f"=== {symbols['error']} Artist failed ===", drop_level=1)
-            return
+            playlist_path = fix_byte_limit(playlist_path) + '/'
+            os.makedirs(playlist_path, exist_ok=True)
 
-        artist_name = artist_info.name
+            # Playlist cover download disabled
+            # if playlist_info.cover_url:
+            #     self.print('Downloading playlist cover')
+            #     download_file(playlist_info.cover_url, f'{playlist_path}cover.{playlist_info.cover_type.name}',
+            #                   artwork_settings=self._get_artwork_settings())
 
-        self.set_indent_number(1)
+            if playlist_info.description:
+                with open(playlist_path + 'description.txt', 'w', encoding='utf-8') as f: f.write(playlist_info.description)
 
-        number_of_albums = len(artist_info.albums)
-        number_of_tracks = len(artist_info.tracks)
+            if self.global_settings['playlist']['save_m3u']:
+                m3u_playlist_path = os.path.join(playlist_path, f'{safe_playlist_name}.m3u')
+                with open(m3u_playlist_path, 'w', encoding='utf-8') as f: f.write('')
+                if self.global_settings['playlist']['extended_m3u']:
+                    with open(m3u_playlist_path, 'a', encoding='utf-8') as f: f.write('#EXTM3U\n\n')
+        else:
+            playlist_path = "" 
 
-        self.print(f'=== Downloading artist {artist_name} ({artist_id}) ===', drop_level=1)
-        if number_of_albums: self.print(f'Number of albums: {number_of_albums!s}')
-        if number_of_tracks: self.print(f'Number of tracks: {number_of_tracks!s}')
         colored_platform = get_colored_platform_name(self.module_settings[self.service_name].service_name)
         self.print(f'Platform: {colored_platform}')
-        artist_path = os.path.join(self.path, sanitise_name(artist_name)) + '/'
-        
-        # Create the artist directory if it doesn't exist
-        os.makedirs(artist_path, exist_ok=True)
 
-        tracks_downloaded = []
-        for index, album_item in enumerate(artist_info.albums, start=1):
-            # Ensure consistent indentation for Album headers (8 spaces)
+        concurrent_downloads = self.global_settings['general'].get('concurrent_downloads', 1)
+        if service_name_lower == 'spotify': concurrent_downloads = 1
+        elif service_name_lower == 'applemusic': concurrent_downloads = 1
+
+        download_args_list = []
+        for index, track_id_or_info in enumerate(playlist_info.tracks, start=1):
+            actual_track_id_str_for_download = track_id_or_info.id if isinstance(track_id_or_info, TrackInfo) else str(track_id_or_info)
+            download_args = {
+                'track_id': actual_track_id_str_for_download, 
+                'album_location': playlist_path if use_default_playlist_folder else '', 
+                'track_index': index, 
+                'number_of_tracks': number_of_tracks, 
+                'indent_level': 1,
+                'm3u_playlist': m3u_playlist_path,
+                'extra_kwargs': playlist_info.track_extra_kwargs,
+                'custom_filename_format': PLAYLIST_TRACK_STRUCTURE_LOCAL,
+                'extra_template_data': extra_template_data
+            }
+            download_args_list.append(download_args)
+
+        results = self._concurrent_download_tracks(playlist_info.tracks, download_args_list,
+                                                   concurrent_downloads, performance_summary_indent=0)
+        
+        rate_limited_tracks = []
+        for index, (original_index, result, error) in enumerate(results):
+            if error and result == "RATE_LIMITED":
+                actual_track_id_str_for_download = download_args_list[original_index]['track_id']
+                rate_limited_tracks.append(
+                    {'id': actual_track_id_str_for_download, 'extra_kwargs': playlist_info.track_extra_kwargs,
+                     'original_index': original_index + 1})
+            elif result == "RATE_LIMITED":
+                actual_track_id_str_for_download = download_args_list[original_index]['track_id']
+                rate_limited_tracks.append(
+                    {'id': actual_track_id_str_for_download, 'extra_kwargs': playlist_info.track_extra_kwargs,
+                     'original_index': original_index + 1})
+
+        if rate_limited_tracks:
             self.set_indent_number(1)
-            self.print(f'Album {index}/{number_of_albums}')
-
-            album_id_to_process = None
-            # Check if album_item is a string (like for Tidal)
-            if isinstance(album_item, str):
-                album_id_to_process = album_item
-            # Check if album_item is a dictionary with an 'id' key (like for Spotify)
-            elif isinstance(album_item, dict) and 'id' in album_item and isinstance(album_item['id'], str):
-                album_id_to_process = album_item['id']
-            # Check if album_item is an object with an 'id' attribute (more generic)
-            elif hasattr(album_item, 'id') and isinstance(getattr(album_item, 'id', None), str):
-                 album_id_to_process = album_item.id # type: ignore
-            else:
-                self.print(f"Skipping unrecognized album item in artist_info.albums: {album_item}")
-                continue
-            
-            tracks_downloaded += self.download_album(
-                album_id_to_process, # This is now guaranteed to be a string ID
-                artist_name=artist_name,
-                path=artist_path,
-                indent_level=2,
-                extra_kwargs=artist_info.album_extra_kwargs # General extra_kwargs from artist level
-            )
-
-        self.set_indent_number(2)
-        skip_tracks = self.global_settings['artist_downloading']['separate_tracks_skip_downloaded']
-        tracks_to_download = [i for i in artist_info.tracks if (i not in tracks_downloaded and skip_tracks) or not skip_tracks]
-        number_of_tracks_new = len(tracks_to_download)
-        
-        if number_of_tracks_new > 0:
-            
-            # Get concurrent downloads setting
-            concurrent_downloads = self.global_settings['general'].get('concurrent_downloads', 1)
-            
-            # Force sequential downloads for Spotify due to rate limiting
-            # Limit Apple Music to 3 concurrent downloads for I/O stability
-            service_name_lower = ""
-            if hasattr(self, 'service_name') and self.service_name:
-                service_name_lower = self.service_name.lower()
-            
-            if service_name_lower == 'spotify':
-                concurrent_downloads = 1
-                print()  # Add blank line before sequential downloads message
-                self.print("Using sequential downloads for Spotify (rate limiting protection)", drop_level=1)
-            elif service_name_lower == 'applemusic':
-                concurrent_downloads = 1
-                print()  # Add blank line before sequential downloads message
-                self.print("Using sequential downloads for Apple Music", drop_level=1)
-            
-            if concurrent_downloads > 1 and number_of_tracks_new > 1:
-                
-                # Prepare download arguments for all tracks
-                download_args_list = []
-                for index, track_id in enumerate(tracks_to_download, start=1):
-                    download_args = {
-                        'track_id': track_id,
-                        'album_location': artist_path,
-                        'main_artist': artist_name,
-                        'number_of_tracks': 1,  # Each track is individual for artist downloads
-                        'indent_level': 1,
-                        'extra_kwargs': artist_info.track_extra_kwargs
-                    }
-                    download_args_list.append(download_args)
-                
-                # Download tracks concurrently
-                results = self._concurrent_download_tracks(tracks_to_download, download_args_list, concurrent_downloads, performance_summary_indent=1)
-                
-                # Process results and collect rate-limited tracks
-                # (Errors are already reported by concurrent download progress monitor)
-                rate_limited_tracks = []
-                for index, (original_index, result, error) in enumerate(results):
-                    if error and result == "RATE_LIMITED":
-                        track_id = tracks_to_download[original_index]
-                        rate_limited_tracks.append({
-                            'id': track_id,
-                            'extra_kwargs': artist_info.track_extra_kwargs,
-                            'original_index': original_index + 1
-                        })
-                    elif result == "RATE_LIMITED":
-                        track_id = tracks_to_download[original_index]
-                        rate_limited_tracks.append({
-                            'id': track_id,
-                            'extra_kwargs': artist_info.track_extra_kwargs,
-                            'original_index': original_index + 1
-                        })
-                
-                # Retry rate-limited tracks for Spotify and Apple Music
-                if rate_limited_tracks and service_name_lower in ['spotify', 'applemusic']:
-                    print()  # Add spacing before retry section
-                    self.print(f'{len(rate_limited_tracks)} tracks deferred due to rate limiting. Retrying...', drop_level=1)
-                    
-                    for i, retry_item in enumerate(rate_limited_tracks):
-                        print()  # Spacing
-                        self.print(f'Track {retry_item["original_index"]}/{number_of_tracks_new} (Retry Pass)', drop_level=1)
-                        self.download_track(
-                            retry_item['id'],
-                            album_location=artist_path,
-                            main_artist=artist_name,
-                            number_of_tracks=1,
-                            indent_level=1,
-                            extra_kwargs=retry_item['extra_kwargs']
-                        )
-                        # Add 30-second pause between retry tracks (except for the last one)
-                        if i < len(rate_limited_tracks) - 1:
-                            print()
-                            self.print("Pausing 30 seconds to prevent rate limiting...", drop_level=1)
-                            time.sleep(30)
-                else:
-                    # Only show rate limiting message for Spotify (where it's relevant)
-                    if service_name_lower == 'spotify':
-                        self.print("        No tracks were deferred due to rate limiting.")
-            else:
-                # Fallback to sequential downloads
-                rate_limited_tracks = []  # Initialize list for deferred tracks
-                
-                for index, track_id in enumerate(tracks_to_download, start=1):
-                    print()  # Add blank line before each track in artist downloads
-                    # Only show "Pass 1" for Spotify (which has retry passes)
-                    pass_indicator = " (Pass 1)" if service_name_lower == 'spotify' else ""
-                    self.print(f'Track {index}/{number_of_tracks_new}{pass_indicator}', drop_level=1)
-                    download_result = self.download_track(track_id, album_location=artist_path, main_artist=artist_name, number_of_tracks=1, indent_level=1, extra_kwargs=artist_info.track_extra_kwargs)
-                    
-                    # Add pause between downloads for Spotify to prevent rate limiting
-                    # Only pause if track was actually downloaded (not skipped) and not the last track
-                    if (service_name_lower == 'spotify' and index < number_of_tracks_new and 
-                        download_result is not None and download_result != "RATE_LIMITED"):
-                        pause_seconds = self._get_spotify_pause_seconds()
-                        self.print(f'Pausing {pause_seconds} seconds to prevent rate limiting...', drop_level=1)
-                        time.sleep(pause_seconds)
-                        print()  # Add blank line after pause message for consistent spacing
-                    
-                    # Collect rate-limited tracks for retry
-                    if download_result == "RATE_LIMITED":
-                        logging.info(f"Deferring artist track {track_id} due to rate limit.")
-                        rate_limited_tracks.append({
-                            'id': track_id,
-                            'extra_kwargs': artist_info.track_extra_kwargs,
-                            'original_index': index
-                        })
-                
-                # Retry rate-limited tracks for Spotify
-                if rate_limited_tracks and service_name_lower == 'spotify':
-                    print()  # Add spacing before retry section
-                    self.print(f'{len(rate_limited_tracks)} tracks deferred due to rate limiting. Retrying...', drop_level=1)
-                    
-                    for i, retry_item in enumerate(rate_limited_tracks):
-                        print()  # Spacing
-                        self.print(f'Track {retry_item["original_index"]}/{number_of_tracks_new} (Retry Pass)', drop_level=1)
-                        self.download_track(
-                            retry_item['id'],
-                            album_location=artist_path,
-                            main_artist=artist_name,
-                            number_of_tracks=1,
-                            indent_level=1,
-                            extra_kwargs=retry_item['extra_kwargs']
-                        )
-                        # Add 30-second pause between retry tracks (except for the last one)
-                        if i < len(rate_limited_tracks) - 1:
-                            print()
-                            self.print("Pausing 30 seconds to prevent rate limiting...", drop_level=1)
-                            time.sleep(30)
-                else:
-                    # Only show rate limiting message for Spotify (where it's relevant)
-                    if service_name_lower == 'spotify':
-                        print()  # Add blank line before message
-                        self.print("        No tracks were deferred due to rate limiting.")
-                        # Don't add blank line after message - let track completion handle spacing
+            print()
+            self.print(f"--- Retrying {len(rate_limited_tracks)} rate-limited tracks ---", drop_level=1)
+            for i, retry_item in enumerate(rate_limited_tracks):
+                self.set_indent_number(2)
+                print()
+                self.print(f'Track {retry_item["original_index"]}/{number_of_tracks} (Retry Pass)', drop_level=1)
+                self.download_track(retry_item['id'], album_location=playlist_path if use_default_playlist_folder else '',
+                                    track_index=retry_item["original_index"], number_of_tracks=number_of_tracks,
+                                    indent_level=1, m3u_playlist=m3u_playlist_path,
+                                    extra_kwargs=retry_item['extra_kwargs'],
+                                    custom_filename_format=PLAYLIST_TRACK_STRUCTURE_LOCAL,
+                                    extra_template_data=extra_template_data)
+                if i < len(rate_limited_tracks) - 1:
+                    print()
+                    self.print("Pausing 30 seconds to prevent rate limiting...", drop_level=1)
+                    time.sleep(30)
 
         self.set_indent_number(1)
-        tracks_skipped = number_of_tracks - number_of_tracks_new
-        if tracks_skipped > 0: self.print(f'Tracks skipped: {tracks_skipped!s}', drop_level=1)
         symbols = self._get_status_symbols()
-        self.print(f'=== {symbols["success"]} Artist completed ===', drop_level=1)
-        # Add 2 empty lines after artist completion for visual separation
+        self.print(f'=== {symbols["success"]} Playlist completed ===', drop_level=1)
         print()
         print()
-
-    async def _download_track_async(self, session, track_id=None, track_info=None, download_info=None, album_location='', main_artist='', track_index=0, number_of_tracks=0, cover_temp_location='', indent_level=1, m3u_playlist=None, extra_kwargs={}, verbose=True):
-        """Async version of download_track for use with concurrent downloads - OPTIMIZED VERSION"""
-        import os
-        import shutil
-        from utils.utils import download_file_async
-        from utils.models import QualityEnum, CodecOptions, DownloadEnum, ContainerEnum, CodecEnum
-        from orpheus.tagging import tag_file
-        import asyncio
-        
-        # If track_info and download_info are not provided, fetch them (fallback for compatibility)
-        if track_info is None or download_info is None:
-            if track_id is None:
-                return None
-                
-            # Get event loop for async file operations
-            loop = asyncio.get_event_loop()
-                
-            # Check if track already exists
-            if album_location == '' and await loop.run_in_executor(None, os.path.isfile, track_id):
-                return None
-                
-            # Get track info and download info (fallback - should not be used in optimized path)
-            try:
-                quality_tier = QualityEnum[self.global_settings['general']['download_quality'].upper()]
-                codec_options = CodecOptions(
-                    spatial_codecs = self.global_settings['codecs']['spatial_codecs'],
-                    proprietary_codecs = self.global_settings['codecs']['proprietary_codecs'],
-                )
-                
-                # Move fallback API calls to thread pool too
-                loop = asyncio.get_event_loop()
-                
-                def get_track_info_fallback():
-                    return self.service.get_track_info(track_id, quality_tier, codec_options, **extra_kwargs)
-                
-                def get_download_info_fallback(track_info_for_download):
-                    # Check if track_info has download_extra_kwargs (like Qobuz, TIDAL)
-                    if hasattr(track_info_for_download, 'download_extra_kwargs') and track_info_for_download.download_extra_kwargs:
-                        return self.service.get_track_download(**track_info_for_download.download_extra_kwargs)
-                    else:
-                        # Try the full signature first (for modules that support it)
-                        try:
-                            return self.service.get_track_download(track_id, quality_tier, codec_options, **extra_kwargs)
-                        except TypeError:
-                            # Fallback for modules with simpler signatures
-                            return self.service.get_track_download(track_id, quality_tier)
-                
-                # First get track info
-                track_info = await loop.run_in_executor(None, get_track_info_fallback)
-                
-                # Check if file already exists BEFORE getting download info (for temp file modules like Deezer)
-                if track_info:
-                    track_location = self._create_track_location(album_location, track_info)
-                    if await loop.run_in_executor(None, os.path.isfile, track_location):
-                        return "ALREADY_EXISTS"
-                
-                # Then get download info using the track_info
-                download_info = await loop.run_in_executor(None, get_download_info_fallback, track_info)
-            except Exception as e:
-                return None
-                
-        if not track_info or not download_info:
-            return None
-            
-        # Extract track_id from track_info if not provided
-        if track_id is None:
-            track_id = track_info.id
-            
-        # Check if track already exists (for backward compatibility) - use thread pool for file checks
-        loop = asyncio.get_event_loop()
-        if album_location == '' and await loop.run_in_executor(None, os.path.isfile, track_id):
-            return "ALREADY_EXISTS"
-            
-        # Create track location
-        track_location = self._create_track_location(album_location, track_info)
-        
-        # Check if file already exists - use thread pool for file checks
-        if await loop.run_in_executor(None, os.path.isfile, track_location):
-            return "ALREADY_EXISTS"
-            
-        # Download the audio file
-        try:
-            if download_info.download_type is DownloadEnum.URL:
-                result_tuple = await download_file_async(
-                    session,
-                    download_info.file_url,
-                    track_location,
-                    headers=download_info.file_url_headers,
-                    enable_progress_bar=False,  # Disable progress bar for concurrent downloads
-                    indent_level=0
-                )
-                # Extract file location and bytes downloaded
-                if isinstance(result_tuple, tuple):
-                    final_location, bytes_downloaded = result_tuple
-                else:
-                    # Fallback for old return format
-                    final_location = result_tuple
-                    bytes_downloaded = 0
-            else:
-                # For non-URL downloads, fall back to synchronous method using thread pool
-                loop = asyncio.get_event_loop()
-                final_location = await loop.run_in_executor(None, shutil.move, download_info.temp_file_path, track_location)
-                # Get file size for non-URL downloads using thread pool
-                try:
-                    bytes_downloaded = await loop.run_in_executor(None, os.path.getsize, final_location)
-                except OSError:
-                    bytes_downloaded = 0
-        except Exception as e:
-            return None
-            
-        if not final_location:
-            return None
-            
-        # Validate file size to catch corrupted downloads - use thread pool for file operations
-        try:
-            loop = asyncio.get_event_loop()
-            file_size = await loop.run_in_executor(None, os.path.getsize, final_location)
-            min_file_size = 100 * 1024  # 100KB threshold
-            
-            if file_size < min_file_size:
-                try:
-                    await loop.run_in_executor(None, os.remove, final_location)
-                except:
-                    pass
-                return None
-        except OSError:
-            pass  # Continue if size check fails
-            
-        # Download artwork asynchronously only if needed (for embedding or external saving)
-        artwork_path = ''
-        needs_artwork = (self.global_settings['covers']['embed_cover'] or 
-                        self.global_settings['covers']['save_external'])
-        
-        if track_info.cover_url and needs_artwork:
-            try:
-                artwork_path = self.create_temp_filename()
-                artwork_result = await download_file_async(
-                    session,
-                    track_info.cover_url, 
-                    artwork_path, 
-                    artwork_settings=self._get_artwork_settings(),
-                    enable_progress_bar=False,
-                    indent_level=0
-                )
-                # Handle new return format for artwork download
-                if isinstance(artwork_result, tuple):
-                    artwork_path, _ = artwork_result  # We don't need bytes for artwork
-                else:
-                    artwork_path = artwork_result
-            except Exception:
-                artwork_path = ''  # Continue without artwork if download fails
-        
-        # Do conversion BEFORE tagging (like old version) - run in thread pool
-        loop = asyncio.get_event_loop()
-        conversion_result = await loop.run_in_executor(
-            None,
-            self._convert_file_if_needed,
-            final_location,
-            track_info,
-            lambda msg: None  # Dummy print function for async context
-        )
-        converted_location, old_track_location, old_container = conversion_result
-        if converted_location and converted_location != final_location:
-            final_location = converted_location
-                
-        # Tag file using thread pool to avoid blocking async event loop (after conversion)
-        try:
-            # Determine container from actual file extension (after potential conversion)
-            file_extension = os.path.splitext(final_location)[1].lower()
-            container_map = {
-                '.flac': ContainerEnum.flac,
-                '.mp3': ContainerEnum.mp3,
-                '.m4a': ContainerEnum.m4a,
-                '.opus': ContainerEnum.opus,
-                '.ogg': ContainerEnum.ogg,
-                '.wav': ContainerEnum.wav,
-                '.aiff': ContainerEnum.aiff,
-                '.ac4': ContainerEnum.ac4,
-                '.ac3': ContainerEnum.ac3,
-                '.eac3': ContainerEnum.eac3
-            }
-            container = container_map.get(file_extension, ContainerEnum.flac)
-            
-            
-            # Get embedded lyrics if available
-            embedded_lyrics = getattr(track_info, 'lyrics', None) or ''
-            
-            # Get credits list (empty for now)
-            credits_list = []
-            
-            # Check if container supports tagging
-            tagging_supported_containers = [ContainerEnum.flac, ContainerEnum.mp3, ContainerEnum.m4a, ContainerEnum.ogg]
-            
-            if container in tagging_supported_containers:
-                # Tag the converted file - only pass artwork_path if embed_cover is enabled
-                embed_artwork_path = artwork_path if self.global_settings['covers']['embed_cover'] else None
-                tag_file(final_location, embed_artwork_path, track_info, credits_list, embedded_lyrics, container)
-            else:
-                pass  # Skip tagging for unsupported containers like WAV
-            
-            # Also tag the original file if it was kept (matching old version exactly)
-            if old_track_location and old_container:
-                if old_container in tagging_supported_containers:
-                    embed_artwork_path = artwork_path if self.global_settings['covers']['embed_cover'] else None
-                    tag_file(old_track_location, embed_artwork_path, track_info, credits_list, embedded_lyrics, old_container)
-                else:
-                    pass  # Skip tagging for unsupported containers
-            
-            # Run m3u playlist addition in thread pool too if needed
-            if m3u_playlist:
-                await loop.run_in_executor(
-                    None,
-                    self._add_track_m3u_playlist,
-                    m3u_playlist,
-                    track_info,
-                    final_location
-                )
-                
-            # Clean up temporary artwork file
-            if artwork_path and os.path.exists(artwork_path):
-                try:
-                    os.remove(artwork_path)
-                except OSError:
-                    pass  # Ignore cleanup errors
-            
-            # Return tuple with file location and bytes downloaded
-            return (final_location, bytes_downloaded)
-        except Exception:
-            # Clean up temporary artwork file even on failure
-            if artwork_path and os.path.exists(artwork_path):
-                try:
-                    os.remove(artwork_path)
-                except OSError:
-                    pass  # Ignore cleanup errors
-            
-            return None  # Return None to indicate failure
-
-    def download_track(self, track_id, album_location='', main_artist='', track_index=0, number_of_tracks=0, cover_temp_location='', indent_level=1, m3u_playlist=None, extra_kwargs={}, verbose=True):
-        self.set_indent_number(indent_level)
-        # Aliasing for convenience.
-        d_print = self.oprinter.oprint
-        symbols = self._get_status_symbols()
-        track_info: TrackInfo = None
-        download_info: TrackDownloadInfo = None
-        temp_filename = None
-
-        # Removed: blank line before single track downloads - only add blank line after completion
-
-        # Use a dummy print function when not verbose
-        d_print = self.print if verbose else lambda *args, **kwargs: None
-        
-        # Helper function to return with consistent blank line
-        def return_with_blank_line(value):
-            # Add blank line after track completion if we're in a multi-track context (album/artist/playlist)
-            # Add 2 blank lines for standalone track downloads and single-track albums
-            is_standalone_track_download = (hasattr(self, 'download_mode') and 
-                                          self.download_mode is DownloadTypeEnum.track and
-                                          track_index == 0 and number_of_tracks == 0)
-            is_single_track_album = (hasattr(self, 'download_mode') and 
-                                   self.download_mode is DownloadTypeEnum.album and 
-                                   number_of_tracks == 1)
-            is_artist_download = (hasattr(self, 'download_mode') and 
-                                self.download_mode is DownloadTypeEnum.artist)
-            is_individual_track_in_artist = (is_artist_download and number_of_tracks == 1)
-            is_multi_track_download = (hasattr(self, 'download_mode') and 
-                                     self.download_mode is DownloadTypeEnum.track and
-                                     number_of_tracks > 1)
-            is_playlist_download = (hasattr(self, 'download_mode') and 
-                                  self.download_mode is DownloadTypeEnum.playlist)
-            
-            if verbose:
-                if (is_standalone_track_download or is_single_track_album or 
-                    is_individual_track_in_artist or is_multi_track_download):
-                    # Standalone track, single-track album, individual track in artist download, 
-                    # or track in multi-track download: add 2 blank lines for better visual separation
-                    print()
-                    print()
-                elif number_of_tracks > 1:
-                    if is_playlist_download:
-                        # Playlist downloads: add only 1 blank line since playlist logic already adds 1
-                        print()
-                    else:
-                        # Album downloads: add 2 blank lines for better visual separation
-                        print()
-                        print()
-            return value
-
-        quality_tier = QualityEnum[self.global_settings['general']['download_quality'].upper()]
-        codec_options = CodecOptions(
-            spatial_codecs=self.global_settings['codecs']['spatial_codecs'],
-            proprietary_codecs=self.global_settings['codecs']['proprietary_codecs'],
-        )
-
-        # Get track info
-        try:
-            track_info: TrackInfo = self.service.get_track_info(track_id, quality_tier, codec_options, **extra_kwargs)
-        except Exception as e:
-            self.print(f'Could not get track info for {track_id}: {e}')
-            symbols = self._get_status_symbols()
-            d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-            if isinstance(e, SpotifyRateLimitDetectedError):
-                return return_with_blank_line("RATE_LIMITED")
-            return return_with_blank_line(None)
-
-        # For single track downloads, use no indentation for headers but keep indentation for details
-        # For multi-track contexts (albums, playlists, artists), use drop_level=1 to align with "Track X/Y" line
-        # For single-track albums within artist downloads, use drop_level to remove all indentation
-        header_drop_level = 1
-        details_indent_adjustment = 0
-
-        # Check if this is a standalone single track download (not part of an album)
-        is_standalone_track = (hasattr(self, 'download_mode') and self.download_mode is DownloadTypeEnum.track)
-
-        if number_of_tracks == 1 and not is_standalone_track:
-            # This is a single-track album within artist/album downloads, so remove all indentation for track header
-            # and ensure track details have exactly 1 level of indentation (8 spaces)
-            header_drop_level = indent_level  # Drop back to level 0 (no indentation)
-            details_indent_adjustment = 1 - indent_level  # Ensure exactly 1 level of indentation for details
-            # Debug: Force 1 level of indentation for single-track album details
-            if indent_level == 0:
-                details_indent_adjustment = 1  # Force 1 level if starting from 0
-        elif is_standalone_track:
-            # This is a standalone single track download - use no indentation for header but add indentation for details
-            header_drop_level = indent_level  # Drop back to level 0 (no indentation) for header
-            details_indent_adjustment = 1 - indent_level  # Ensure exactly 1 level of indentation for details
-        elif number_of_tracks > 1:
-            # This is a multi-track context (album/artist/playlist) - ensure track details have exactly 1 level of indentation
-            details_indent_adjustment = 1 - indent_level  # Adjust to get exactly 1 level of indentation
-
-        d_print(f'=== Downloading track {track_info.name} ({track_id}) ===', drop_level=header_drop_level)
-
-        # Temporarily adjust indent level for track details in single-track albums
-        if details_indent_adjustment != 0:
-            self.set_indent_number(indent_level + details_indent_adjustment)
-        
-        # Format and display track information in a user-friendly way
-        # Artists with IDs
-        if track_info.artists:
-            artists_display = ', '.join(track_info.artists)
-            if track_info.artist_id:
-                d_print(f'Artists: {artists_display} ({track_info.artist_id})')
-            else:
-                d_print(f'Artists: {artists_display}')
-        
-        # Release year
-        if track_info.release_year:
-            d_print(f'Release year: {track_info.release_year}')
-        
-        # Duration in formatted time
-        if track_info.duration:
-            formatted_duration = beauty_format_seconds(track_info.duration)
-            d_print(f'Duration: {formatted_duration}')
-        
-        # Platform/Service name
-        if self.service_name and hasattr(self.module_settings[self.service_name], 'service_name'):
-            colored_platform = get_colored_platform_name(self.module_settings[self.service_name].service_name)
-            d_print(f'Platform: {colored_platform}')
-        
-        # Codec with combined quality information
-        codec_info = []
-        if track_info.codec:
-            codec_name = track_info.codec.name if hasattr(track_info.codec, 'name') else str(track_info.codec).replace('CodecEnum.', '')
-
-            # Special handling for Spotify - show expected values based on quality setting
-            if self.service_name.lower() == 'spotify':
-                codec_info.append('Codec: VORBIS')
-
-                # Determine bitrate based on quality setting
-                quality_setting = self.global_settings['general']['download_quality'].lower()
-                if quality_setting in ['lossless', 'hifi', 'high']:
-                    codec_info.append('bitrate: 320kbps')
-                else:  # low quality
-                    codec_info.append('bitrate: 160kbps')
-
-                # Standard values for Spotify
-                codec_info.append('bit depth: 16bit')
-                codec_info.append('sample rate: 44100kHz')
-            else:
-                # For other services, use actual track info
-                codec_info.append(f'Codec: {codec_name}')
-
-                if track_info.bitrate:
-                    codec_info.append(f'bitrate: {track_info.bitrate}kbps')
-                if track_info.bit_depth:
-                    codec_info.append(f'bit depth: {track_info.bit_depth}bit')
-                if track_info.sample_rate:
-                    codec_info.append(f'sample rate: {track_info.sample_rate}kHz')
-
-            d_print(', '.join(codec_info))
-
-        # Add track number to tags if it exists
-        if track_index: track_info.tags.track_number = track_index
-        if number_of_tracks: track_info.tags.total_tracks = number_of_tracks
-
-        # Create track location
-        if not album_location:
-            # For single track downloads, use the base path
-            album_location = self.path
-        track_location = self._create_track_location(album_location, track_info)
-
-
-        if os.path.exists(track_location):
-            d_print(f'Track file already exists')
-            
-            # Restore original indent level if it was adjusted before printing completion message
-            if details_indent_adjustment != 0:
-                self.set_indent_number(indent_level)
-            
-            symbols = self._get_status_symbols()
-            d_print(f'=== {symbols["skip"]} Track skipped ===', drop_level=header_drop_level)
-
-            return return_with_blank_line("SKIPPED")
-
-
-        # Download lyrics
-        if self.global_settings['lyrics']['save_synced_lyrics'] and hasattr(track_info, 'lyrics') and track_info.lyrics:
-            d_print('Downloading lyrics')
-            with open(f'{os.path.splitext(track_location)[0]}.lrc', 'w', encoding='utf-8') as f:
-                f.write(track_info.lyrics)
-
-        # Download audio
-        try:
-            # Check if track_info has download_extra_kwargs (like TIDAL)
-            if hasattr(track_info, 'download_extra_kwargs') and track_info.download_extra_kwargs:
-                download_info: TrackDownloadInfo = self.service.get_track_download(**track_info.download_extra_kwargs)
-            else:
-                # Try the full signature first (for modules that support it)
-                download_info: TrackDownloadInfo = self.service.get_track_download(track_id, quality_tier, codec_options, **extra_kwargs)
-        except SpotifyRateLimitDetectedError as e:
-            d_print(f'Rate limit detected for {track_id}')
-            symbols = self._get_status_symbols()
-            d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-            # Restore original indent level if it was adjusted
-            if details_indent_adjustment != 0:
-                self.set_indent_number(indent_level)
-            return return_with_blank_line("RATE_LIMITED")
-        except Exception as e:
-            # Check for Apple Music errors that should be retried
-            error_str = str(e)
-            if (self.service_name.lower() == 'applemusic' and
-                (('failureType":"5002"' in error_str or '"failureType": "5002"' in error_str) or
-                 ('status code 404' in error_str and 'Resource Not Found' in error_str))):
-                if 'status code 404' in error_str:
-                    d_print(f'Apple Music error: Track not found (404)')
-                    # Return specific error message for Apple Music 404 (track unavailable)
-                    symbols = self._get_status_symbols()
-                    d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-                    # Restore original indent level if it was adjusted
-                    if details_indent_adjustment != 0:
-                        self.set_indent_number(indent_level)
-                    return return_with_blank_line("This song is unavailable.")
-                else:
-                    d_print(f'Apple Music temporary error (5002)')
-                    symbols = self._get_status_symbols()
-                    d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-                    # Restore original indent level if it was adjusted
-                    if details_indent_adjustment != 0:
-                        self.set_indent_number(indent_level)
-                    return return_with_blank_line("RATE_LIMITED")  # Reuse the rate limit retry mechanism
-            # Check for rate limit in error message as a fallback
-            elif "Rate limit suspected" in error_str:
-                d_print(f'Rate limit detected for {track_id} (message-based detection)')
-                symbols = self._get_status_symbols()
-                d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-                # Restore original indent level if it was adjusted
-                if details_indent_adjustment != 0:
-                    self.set_indent_number(indent_level)
-                return return_with_blank_line("RATE_LIMITED")
-            # If it's a TypeError, try the fallback approach
-            if isinstance(e, TypeError):
-                # Fallback for modules with simpler signatures
-                # Most get_track_download methods only accept track_id and quality_tier
-                try:
-                    download_info: TrackDownloadInfo = self.service.get_track_download(track_id, quality_tier)
-                except SpotifyRateLimitDetectedError as fallback_e:
-                    d_print(f'Rate limit detected for {track_id}')
-                    symbols = self._get_status_symbols()
-                    d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-                    # Restore original indent level if it was adjusted
-                    if details_indent_adjustment != 0:
-                        self.set_indent_number(indent_level)
-                    return return_with_blank_line("RATE_LIMITED")
-                except Exception as fallback_e:
-                    # Check if this is a rate limit error even in the fallback
-                    if isinstance(fallback_e, SpotifyRateLimitDetectedError):
-                        d_print(f'Rate limit detected for {track_id}')
-                        symbols = self._get_status_symbols()
-                        d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-                        # Restore original indent level if it was adjusted
-                        if details_indent_adjustment != 0:
-                            self.set_indent_number(indent_level)
-                        return return_with_blank_line("RATE_LIMITED")
-                    # Check for Apple Music errors that should be retried
-                    fallback_error_str = str(fallback_e)
-                    if (self.service_name.lower() == 'applemusic' and
-                        (('failureType":"5002"' in fallback_error_str or '"failureType": "5002"' in fallback_error_str) or
-                         ('status code 404' in fallback_error_str and 'Resource Not Found' in fallback_error_str))):
-                        if 'status code 404' in fallback_error_str:
-                            d_print(f'Apple Music error: Track not found (404)')
-                            # Return specific error message for Apple Music 404 (track unavailable)
-                            symbols = self._get_status_symbols()
-                            d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-                            # Restore original indent level if it was adjusted
-                            if details_indent_adjustment != 0:
-                                self.set_indent_number(indent_level)
-                            return return_with_blank_line("This song is unavailable.")
-                        else:
-                            d_print(f'Apple Music temporary error (5002)')
-                            symbols = self._get_status_symbols()
-                            d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-                            # Restore original indent level if it was adjusted
-                            if details_indent_adjustment != 0:
-                                self.set_indent_number(indent_level)
-                            return return_with_blank_line("RATE_LIMITED")  # Reuse the rate limit retry mechanism
-                    # Also check for rate limit in error message as a fallback
-                    elif "Rate limit suspected" in fallback_error_str:
-                        d_print(f'Rate limit detected for {track_id} (message-based detection)')
-                        symbols = self._get_status_symbols()
-                        d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-                        # Restore original indent level if it was adjusted
-                        if details_indent_adjustment != 0:
-                            self.set_indent_number(indent_level)
-                        return return_with_blank_line("RATE_LIMITED")
-                    # Extract a concise error message
-                    error_msg = str(fallback_e)
-                    if 'status code 404' in error_msg:
-                        d_print(f'Track not found (404)')
-                        # Return specific error message for 404 (track unavailable)
-                        symbols = self._get_status_symbols()
-                        d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-                        # Restore original indent level if it was adjusted
-                        if details_indent_adjustment != 0:
-                            self.set_indent_number(indent_level)
-                        return return_with_blank_line("This song is unavailable.")
-                    elif 'status code' in error_msg:
-                        # Extract just the status code
-                        import re
-                        status_match = re.search(r'status code (\d+)', error_msg)
-                        if status_match:
-                            d_print(f'Request failed (status {status_match.group(1)})')
-                        else:
-                            d_print(f'Request failed')
-                    else:
-                        simplified_error = simplify_error_message(error_msg)
-                        d_print(f'Download failed: {simplified_error}')
-                    symbols = self._get_status_symbols()
-                    d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-                    # Restore original indent level if it was adjusted
-                    if details_indent_adjustment != 0:
-                        self.set_indent_number(indent_level)
-                    return return_with_blank_line(None)
-            else:
-                # For non-TypeError exceptions, extract concise error message
-                error_msg = str(e)
-                if 'status code 404' in error_msg:
-                    d_print(f'Track not found (404)')
-                    # Return specific error message for 404 (track unavailable)
-                    symbols = self._get_status_symbols()
-                    d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-                    # Restore original indent level if it was adjusted
-                    if details_indent_adjustment != 0:
-                        self.set_indent_number(indent_level)
-                    return return_with_blank_line("This song is unavailable.")
-                elif 'status code' in error_msg:
-                    # Extract just the status code
-                    import re
-                    status_match = re.search(r'status code (\d+)', error_msg)
-                    if status_match:
-                        d_print(f'Request failed (status {status_match.group(1)})')
-                    else:
-                        d_print(f'Request failed')
-                else:
-                    simplified_error = simplify_error_message(error_msg)
-                    d_print(f'Download failed: {simplified_error}')
-                symbols = self._get_status_symbols()
-                d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-                # Restore original indent level if it was adjusted
-                if details_indent_adjustment != 0:
-                    self.set_indent_number(indent_level)
-                return return_with_blank_line(None)
-        if not download_info:
-            d_print(f'No download info available')
-            symbols = self._get_status_symbols()
-            d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-            # Restore original indent level if it was adjusted
-            if details_indent_adjustment != 0:
-                self.set_indent_number(indent_level)
-            return return_with_blank_line(None)
-        
-        d_print('Downloading audio...')
-        try:
-            final_location = download_file(
-                download_info.file_url,
-                track_location,
-                headers=download_info.file_url_headers,
-                enable_progress_bar=self.global_settings['general'].get('progress_bar', False) and verbose,
-                indent_level=self.indent_number
-            ) if download_info.download_type is DownloadEnum.URL else shutil.move(download_info.temp_file_path, track_location)
-            
-            
-        except Exception as download_e:
-            d_print(f'Download failed with exception: {download_e}')
-            symbols = self._get_status_symbols()
-            d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-            # Restore original indent level if it was adjusted
-            if details_indent_adjustment != 0:
-                self.set_indent_number(indent_level)
-            return return_with_blank_line(None)
-
-        if not final_location:
-            d_print(f'Failed to download track {track_id}')
-            symbols = self._get_status_symbols()
-            d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-            # Restore original indent level if it was adjusted
-            if details_indent_adjustment != 0:
-                self.set_indent_number(indent_level)
-            return return_with_blank_line(None)
-
-        # Validate file size to catch corrupted downloads (fixed 100KB threshold)
-        try:
-            file_size = os.path.getsize(final_location)
-            min_file_size = 100 * 1024  # 100KB threshold
-
-            if file_size < min_file_size:
-                d_print(f'Downloaded file is suspiciously small ({file_size:,} bytes, expected >{min_file_size:,} bytes)')
-                d_print(f'File likely corrupted at source - removing incomplete download')
-
-                # Remove the corrupted file
-                try:
-                    os.remove(final_location)
-                except:
-                    pass
-
-                # Restore original indent level if it was adjusted before printing completion message
-                if details_indent_adjustment != 0:
-                    self.set_indent_number(indent_level)
-
-                symbols = self._get_status_symbols()
-                d_print(f'=== {symbols["error"]} Track failed (corrupted source) ===', drop_level=header_drop_level)
-                return return_with_blank_line(None)
-
-        except OSError as e:
-            d_print(f'Could not check file size: {e}')
-            # Continue with download process even if size check fails
-
-        # Download artwork only if needed (for embedding or external saving)
-        artwork_path = ''
-        needs_artwork = (self.global_settings['covers']['embed_cover'] or 
-                        self.global_settings['covers']['save_external'])
-        
-        if track_info.cover_url and needs_artwork:
-            d_print('Downloading artwork...')
-            artwork_path = self.create_temp_filename()
-            download_file(track_info.cover_url, artwork_path, artwork_settings=self._get_artwork_settings(), indent_level=self.indent_number)
-
-        # Do conversion BEFORE tagging (like old version)
-        conversion_result = self._convert_file_if_needed(final_location, track_info, d_print)
-        converted_location, old_track_location, old_container = conversion_result
-        if converted_location and converted_location != final_location:
-            final_location = converted_location
-
-        # Tag file (after conversion so artwork gets embedded in converted file)
-        d_print('Tagging file...')
-
-        try:
-            # Determine container from actual file extension (after potential conversion)
-            file_extension = os.path.splitext(final_location)[1].lower()
-            container_map = {
-                '.flac': ContainerEnum.flac,
-                '.mp3': ContainerEnum.mp3,
-                '.m4a': ContainerEnum.m4a,
-                '.opus': ContainerEnum.opus,
-                '.ogg': ContainerEnum.ogg,
-                '.wav': ContainerEnum.wav,
-                '.aiff': ContainerEnum.aiff,
-                '.ac4': ContainerEnum.ac4,
-                '.ac3': ContainerEnum.ac3,
-                '.eac3': ContainerEnum.eac3
-            }
-            container = container_map.get(file_extension, ContainerEnum.flac)
-            
-            
-            # Get embedded lyrics if available
-            embedded_lyrics = getattr(track_info, 'lyrics', None) or ''
-            
-            # Get credits list (empty for now)
-            credits_list = []
-            
-            # Check if container supports tagging
-            tagging_supported_containers = [ContainerEnum.flac, ContainerEnum.mp3, ContainerEnum.m4a, ContainerEnum.ogg]
-            
-            if container in tagging_supported_containers:
-                # Tag the converted file - only pass artwork_path if embed_cover is enabled
-                embed_artwork_path = artwork_path if self.global_settings['covers']['embed_cover'] else None
-                tag_file(final_location, embed_artwork_path, track_info, credits_list, embedded_lyrics, container)
-            else:
-                pass  # Skip tagging for unsupported containers like WAV
-            
-            # Also tag the original file if it was kept (matching old version exactly)
-            if old_track_location and old_container:
-                if old_container in tagging_supported_containers:
-                    embed_artwork_path = artwork_path if self.global_settings['covers']['embed_cover'] else None
-                    tag_file(old_track_location, embed_artwork_path, track_info, credits_list, embedded_lyrics, old_container)
-                else:
-                    pass  # Skip tagging for unsupported containers
-            
-            if m3u_playlist:
-                self._add_track_m3u_playlist(m3u_playlist, track_info, final_location)
-
-            # Restore original indent level if it was adjusted before printing completion message
-            if details_indent_adjustment != 0:
-                self.set_indent_number(indent_level)
-
-            symbols = self._get_status_symbols()
-            d_print(f'=== {symbols["success"]} Track completed ===', drop_level=header_drop_level)
-
-            # Clean up temporary artwork file
-            if artwork_path and os.path.exists(artwork_path):
-                try:
-                    os.remove(artwork_path)
-                except OSError:
-                    pass  # Ignore cleanup errors
-
-            return return_with_blank_line(final_location)
-        except Exception as e:
-            # If tagging fails, treat it as a failed download for concurrent download tracking
-            d_print(f'Tagging failed: {e}')
-            
-            # Restore original indent level if it was adjusted before printing completion message
-            if details_indent_adjustment != 0:
-                self.set_indent_number(indent_level)
-            
-            symbols = self._get_status_symbols()
-            d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-
-            # Clean up temporary artwork file even on failure
-            if artwork_path and os.path.exists(artwork_path):
-                try:
-                    os.remove(artwork_path)
-                except OSError:
-                    pass  # Ignore cleanup errors
-
-            return return_with_blank_line(None)  # Return None to indicate failure for concurrent download tracking
 
     def _convert_file_if_needed(self, file_path, track_info, d_print):
-        """Convert file based on codec_conversions settings - based on old working version"""
+        """Convert file based on codec_conversions settings"""
         try:
-            # Get conversion settings (matching old version structure)
             try:
                 from utils.models import CodecEnum, codec_data
                 from utils.utils import silentremove
-                conversions = {CodecEnum[k.upper()]: CodecEnum[v.upper()] for k, v in self.global_settings['advanced']['codec_conversions'].items()}
+                conversions = {CodecEnum[k.upper()]: CodecEnum[v.upper()] for k, v in
+                               self.global_settings['advanced']['codec_conversions'].items()}
             except:
                 conversions = {}
-                print('Warning: codec_conversions setting is invalid!')  # Always print this warning
-                return (file_path, None, None)  # Return tuple like old version
-            
-            if not conversions:
-                return (file_path, None, None)  # Return tuple like old version
-            
-            # Use track_info.codec (which is already a CodecEnum) to check for conversions
+                return (file_path, None, None)
+
+            if not conversions: return (file_path, None, None)
             codec = track_info.codec
-            
-            if codec not in conversions:
-                return (file_path, None, None)  # Return tuple like old version
-            
+            if codec not in conversions: return (file_path, None, None)
             new_codec = conversions[codec]
-            if codec == new_codec:
-                return (file_path, None, None)  # No conversion needed
-            
-            # Get codec data for old and new codecs
-            old_codec_data = codec_data[codec]
+            if codec == new_codec: return (file_path, None, None)
+
             new_codec_data = codec_data[new_codec]
-            
-            # Always print conversion status, even when verbose=False
-            print(f'        Converting {old_codec_data.pretty_name} to {new_codec_data.pretty_name}...')
-            
-            # Check for spatial formats (skip conversion)
-            if old_codec_data.spatial or new_codec_data.spatial:
-                print('        Warning: converting spatial formats is not allowed, skipping')
-                return (file_path, None, None)
-            
-            # Check for undesirable conversions (fixed logic but matching old version behavior)
-            enable_undesirable = self.global_settings.get('advanced', {}).get('enable_undesirable_conversions', False)
-            if not old_codec_data.lossless and new_codec_data.lossless and not enable_undesirable:
-                print('        Warning: Undesirable lossy-to-lossless conversion detected, skipping')
-                return (file_path, None, None)
-            # Note: lossy-to-lossy conversions are allowed by default (old version had a bug that made this always allowed)
-            
-            # Warn about undesirable conversions but continue (matching old version)
-            if not old_codec_data.lossless and new_codec_data.lossless:
-                print('        Warning: Undesirable lossy-to-lossless conversion')
-            elif not old_codec_data.lossless and not new_codec_data.lossless:
-                print('        Warning: Undesirable lossy-to-lossy conversion')
-            
-            # Get conversion flags
-            try:
-                conversion_flags = {CodecEnum[k.upper()]:v for k,v in self.global_settings['advanced']['conversion_flags'].items()}
-            except:
-                conversion_flags = {}
-                print('        Warning: conversion_flags setting is invalid, using defaults')
-            
-            conv_flags = conversion_flags[new_codec] if new_codec in conversion_flags else {}
-            
-            # Create temp file and final output path (matching old version exactly)
             temp_track_location = f'{self.create_temp_filename()}.{new_codec_data.container.name}'
             file_path_without_ext = os.path.splitext(file_path)[0]
             new_track_location = f'{file_path_without_ext}.{new_codec_data.container.name}'
-            
 
-            
-            # Build FFmpeg stream (matching old version exactly)
             import ffmpeg
-            from ffmpeg import Error
-            import re
-            import shutil
-            
             stream = ffmpeg.input(file_path, hide_banner=None, y=None)
-            
-            try:
-                # Map codec names to FFmpeg codec names
-                ffmpeg_codec_map = {
-                    'wav': 'pcm_s16le',  # WAV needs PCM codec
-                    'flac': 'flac',
-                    'mp3': 'mp3',
-                    'aac': 'aac',
-                    'vorbis': 'vorbis',
-                    'alac': 'alac',
-                    'opus': 'opus'
-                }
-                ffmpeg_codec = ffmpeg_codec_map.get(new_codec.name.lower(), new_codec.name.lower())
-                
-                # Use the old version's approach: audio codec + ignore video streams
-                stream.output(
-                    temp_track_location,
-                    acodec=ffmpeg_codec,
-                    vn=None,  # Ignore video stream (this is key!)
-                    **conv_flags,
-                    loglevel='error'
-                ).run(capture_stdout=True, capture_stderr=True)
-            except Error as e:
-                error_msg = e.stderr.decode('utf-8')
-                # Handle experimental encoder fallback (from old version)
-                encoder = re.search(r"(?<=non experimental encoder ')[^']+", error_msg)
-                if encoder:
-                    try:
-                        stream.output(
-                            temp_track_location,
-                            acodec=encoder.group(0),
-                            vn=None,  # Ignore video stream here as well
-                            **conv_flags,
-                            loglevel='error'
-                        ).run(capture_stdout=True, capture_stderr=True)
-                    except Error as e2:
-                        raise Exception(f'ffmpeg error converting to {ffmpeg_codec}:\n{e2.stderr.decode("utf-8")}')
-                else:
-                    raise Exception(f'ffmpeg error converting to {ffmpeg_codec}:\n{error_msg}')
-            
-            # Handle file management (matching old version exactly)
-            keep_original = self.global_settings.get('advanced', {}).get('conversion_keep_original', False)
-            old_track_location, old_container = None, None
-            
-            # Remove original if output path is the same (matching old version logic)
-            if file_path == new_track_location:
-                silentremove(file_path)
-                # just needed so it won't get deleted
-                file_path = temp_track_location
-            
-            # Move temp file to final location
-            shutil.move(temp_track_location, new_track_location)
-            silentremove(temp_track_location)
-            
-            # Handle keeping original (matching old version exactly)
-            if keep_original:
-                old_track_location = file_path
-                old_container = codec_data[codec].container  # Original container
-            else:
-                silentremove(file_path)
-            
-            print(f'        ✅ Conversion completed: {new_track_location}')
-            
-            # Return tuple: (new_location, old_location_if_kept, old_container_if_kept)
-            return (new_track_location, old_track_location, old_container)
-            
-        except Exception as e:
-            # Check if it's an FFmpeg-related error and provide user-friendly message
-            error_str = str(e)
-            if any(indicator in error_str.lower() for indicator in [
-                'winerror 2', 'errno 2', 'no such file or directory', 
-                'het systeem kan het opgegeven bestand niet vinden',
-                'file not found', 'ffmpeg', 'executable not found'
-            ]):
-                print(f'        ❌ Conversion error: FFmpeg was not found or is misconfigured. This is required for audio conversion.')
-                print(f'        💡 Solution: Install FFmpeg or set the path in Settings > Global > Advanced > FFmpeg Path')
-            else:
-                print(f'        ❌ Conversion error: {e}')
-            return (file_path, None, None)  # Return tuple like old version
+            stream.output(temp_track_location, acodec=new_codec.name.lower(), vn=None, loglevel='error').run(capture_stdout=True, capture_stderr=True)
 
-    def _get_artwork_settings(self, module_name = None, is_external = False):
+            keep_original = self.global_settings.get('advanced', {}).get('conversion_keep_original', False)
+            old_track_location = file_path if keep_original else None
+            old_container = codec_data[codec].container if keep_original else None
+
+            shutil.move(temp_track_location, new_track_location)
+            if not keep_original: silentremove(file_path)
+
+            return (new_track_location, old_track_location, old_container)
+
+        except Exception as e:
+            return (file_path, None, None)
+
+    def _get_artwork_settings(self, module_name=None, is_external=False):
         if not module_name:
             module_name = self.service_name
         return {
             'should_resize': ModuleFlags.needs_cover_resize in self.module_settings[module_name].flags,
-            'resolution': self.global_settings['covers']['external_resolution'] if is_external else self.global_settings['covers']['main_resolution'],
-            'compression': self.global_settings['covers']['external_compression'] if is_external else self.global_settings['covers']['main_compression'],
+            'resolution': self.global_settings['covers']['external_resolution'] if is_external else
+            self.global_settings['covers']['main_resolution'],
+            'compression': self.global_settings['covers']['external_compression'] if is_external else
+            self.global_settings['covers']['main_compression'],
             'format': self.global_settings['covers']['external_format'] if is_external else 'jpg'
         }

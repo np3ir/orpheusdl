@@ -1,12 +1,19 @@
 import pickle, requests, errno, hashlib, math, os, re, operator, asyncio
 import aiohttp
 import aiofiles
+import platform  # <--- CORRECCIÓN DE IMPORTACIÓN
 from tqdm import tqdm as original_tqdm
 import threading
+from urllib3.util.retry import Retry
+from functools import reduce
+from PIL import Image, ImageChops
+from requests.adapters import HTTPAdapter
+import urllib.parse  # <--- NECESARIO PARA LA FUNCIÓN _is_valid_url
 
 # Global flag for progress bar settings (more reliable than thread-local in async contexts)
 _progress_bars_enabled = True
 _progress_bars_lock = threading.Lock()
+
 
 def tqdm(*args, **kwargs):
     """Custom tqdm wrapper that respects global progress bar settings"""
@@ -17,11 +24,14 @@ def tqdm(*args, **kwargs):
             kwargs['disable'] = True
     return original_tqdm(*args, **kwargs)
 
+
 def set_progress_bars_enabled(enabled):
     """Set whether progress bars should be enabled globally"""
     global _progress_bars_enabled
     with _progress_bars_lock:
         _progress_bars_enabled = enabled
+
+
 from PIL import Image, ImageChops
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -34,25 +44,27 @@ def hash_string(input_str: str, hash_type: str = 'MD5'):
     else:
         raise Exception('Invalid hash type selected')
 
+
 def create_requests_session():
     session_ = requests.Session()
-    retries = Retry(total=10, backoff_factor=0.4, status_forcelist=[429, 500, 502, 503, 504])
+    retries = Retry(total=10, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504])
     session_.mount('http://', HTTPAdapter(max_retries=retries))
     session_.mount('https://', HTTPAdapter(max_retries=retries))
     return session_
 
+
 def create_aiohttp_session():
     """Create an aiohttp session with retry and timeout configuration"""
     timeout = aiohttp.ClientTimeout(total=300, connect=30, sock_read=60)
-    
+
     # Optimized connector settings for better concurrent performance
     connector = aiohttp.TCPConnector(
-        limit=200,           # Increased total connection pool from 100 to 200
-        limit_per_host=50,   # Increased per-host connections from 30 to 50
+        limit=200,  # Increased total connection pool from 100 to 200
+        limit_per_host=50,  # Increased per-host connections from 30 to 50
         enable_cleanup_closed=True,
         use_dns_cache=False  # Disable DNS cache to avoid aiodns issues on Windows
     )
-    
+
     return aiohttp.ClientSession(
         connector=connector,
         timeout=timeout,
@@ -60,26 +72,85 @@ def create_aiohttp_session():
         trust_env=True
     )
 
-sanitise_name = lambda name: re.sub(r'[:]', ' - ', re.sub(r'[\\/*?"<>|$]', '', re.sub(r'[\x00-\x1F\x7F]', '', str(name).strip()))) if name else ''
+
+sanitise_name = lambda name: re.sub(r'[:]', ' - ', re.sub(r'[\\/*?"<>|$]', '', re.sub(r'[\x00-\x1F\x7F]', '',
+                                                                                      str(name).strip()))) if name else ''
 
 
-def fix_byte_limit(path: str, byte_limit=250):
-    # only needs the relative path, the abspath uses already existing folders
-    rel_path = os.path.relpath(path).replace('\\', '/')
+# --- INICIO DE FUNCIÓN QUE ARREGLA EL SLASH FINAL ---
+def _is_valid_url(url: str, type: str) -> bool:
+    import re
 
-    # split path into directory and filename
-    directory, filename = os.path.split(rel_path)
+    # 1. Limpieza de la URL para eliminar parámetros de consulta y fragmentos (ej: ?utm_source=...)
+    parsed_url = urllib.parse.urlparse(url)
+    url = urllib.parse.urlunparse(parsed_url._replace(query='', fragment=''))
 
-    # truncate filename if its byte size exceeds the byte_limit
-    filename_bytes = filename.encode('utf-8')
-    fixed_bytes = filename_bytes[:byte_limit]
-    fixed_filename = fixed_bytes.decode('utf-8', 'ignore')
+    # 2. Definición de la expresión regular
+    # Utilizamos /?$ al final para que el slash sea opcional.
+    regex = ''
+    if type == 'album':
+        regex = r'https?:\/\/(?:www\.|listen\.|m\.)?(?:tidal|spotify|deezer|qobuz|applemusic|bandcamp)\.com\/album\/[0-9a-zA-Z\/-]+\/?$'
+    elif type == 'track':
+        regex = r'https?:\/\/(?:www\.|listen\.|m\.)?(?:tidal|spotify|deezer|qobuz|applemusic|bandcamp)\.com\/track\/[0-9a-zA-Z\/-]+\/?$'
+    elif type == 'playlist':
+        regex = r'https?:\/\/(?:www\.|listen\.|m\.)?(?:tidal|spotify|deezer|qobuz|applemusic|bandcamp)\.com\/playlist\/[0-9a-zA-Z\/-]+\/?$'
+    elif type == 'artist':
+        regex = r'https?:\/\/(?:www\.|listen\.|m\.)?(?:tidal|spotify|deezer|qobuz|applemusic|bandcamp)\.com\/artist\/[0-9a-zA-Z\/-]+\/?$'
 
-    # join the directory and truncated filename together
-    return directory + '/' + fixed_filename
+    if not regex:
+        return False
+
+    return bool(re.match(regex, url, re.IGNORECASE))
+
+
+# --- FIN DE FUNCIÓN QUE ARREGLA EL SLASH FINAL ---
+
+
+def fix_byte_limit(path: str) -> str:
+    # Max bytes allowed for the path after converting to UTF-8 (250 bytes for safety)
+    MAX_PATH_BYTES = 250
+
+    if platform.system() != 'Windows':
+        return path
+
+    path_bytes = path.encode('utf-8')
+
+    if len(path_bytes) > MAX_PATH_BYTES:
+        import os
+
+        # FIX: Evitar el error de ruta C: vs Z:
+
+        # 1. Get directory and base name
+        dirname = os.path.dirname(path)
+        basename = os.path.basename(path)
+
+        # 2. Convert the base name to bytes
+        basename_bytes = basename.encode('utf-8')
+
+        # 3. Calculate available bytes for the filename
+        # -1 accounts for the directory separator (slash/backslash)
+        available_bytes = MAX_PATH_BYTES - len(dirname.encode('utf-8')) - 1
+
+        if available_bytes < 1:
+            # If the directory path itself is too long, we cannot truncate the filename
+            return path
+
+            # 4. Truncate the base name if necessary
+        truncated_basename = basename
+        if len(basename_bytes) > available_bytes:
+            # Truncate to the maximum allowed byte length
+            truncated_basename = basename_bytes[:available_bytes].decode('utf-8', 'ignore')
+
+        # Reconstruct the path using the truncated basename
+        path = os.path.join(dirname, truncated_basename).replace('\\', '/')
+
+    return path
 
 
 r_session = create_requests_session()
+
+
+# ... (El resto de las funciones como download_file_async, etc., deberían seguir abajo)
 
 async def download_file_async(session, url, file_location, headers={}, enable_progress_bar=False, indent_level=0, artwork_settings=None, max_retries=3):
     """Async version of download_file using aiohttp - returns (file_location, bytes_downloaded)"""
@@ -167,6 +238,20 @@ async def download_file_async(session, url, file_location, headers={}, enable_pr
                 return (file_location, bytes_downloaded)
                 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if isinstance(e, aiohttp.ClientResponseError) and e.status == 429:
+                # Special handling for Rate Limiting
+                retry_after = 20
+                # Try to get Retry-After header from response if possible, 
+                # but ClientResponseError doesn't always carry headers easily unless we passed them.
+                # Just wait 10s and retry without counting towards limit? 
+                # For now, just wait longer and continue.
+                print(f"Rate limited (429). Waiting {retry_after}s...")
+                await asyncio.sleep(retry_after)
+                # Decrement attempt to not count this as a failure? 
+                # Cannot modify loop variable 'attempt'.
+                # But we can just continue. If we want infinite retries for 429, we need a while loop.
+                # For now, let's just accept the wait.
+                
             if attempt < max_retries - 1:
                 await asyncio.sleep(2 ** attempt)  # Exponential backoff
                 continue

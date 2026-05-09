@@ -48,6 +48,8 @@ class CodecEnum(Flag):
     EAC3 = auto() # Lossy, spatial, proprietary
     AC4 = auto() # Lossy, spatial, proprietary
     AC3 = auto() # Lossy, spatial, proprietary
+    H264 = auto() # Video
+    H265 = auto() # Video
     NONE = auto()  # No codec
 
 
@@ -98,6 +100,8 @@ codec_data = {
     CodecEnum.MP3:    CodecData(pretty_name='MP3',              container=ContainerEnum.mp3,  lossless=False, spatial=False, proprietary=False),
     CodecEnum.AAC:    CodecData(pretty_name='AAC-LC',           container=ContainerEnum.m4a,  lossless=False, spatial=False, proprietary=False),
     CodecEnum.HEAAC:  CodecData(pretty_name='HE-AAC',           container=ContainerEnum.m4a,  lossless=False, spatial=False, proprietary=True),
+    CodecEnum.H264:   CodecData(pretty_name='H.264',            container=ContainerEnum.mp4,  lossless=False, spatial=False, proprietary=False),
+    CodecEnum.H265:   CodecData(pretty_name='H.265',            container=ContainerEnum.mp4,  lossless=False, spatial=False, proprietary=False),
     CodecEnum.MHA1:   CodecData(pretty_name='MPEG-H 3D Audio',  container=ContainerEnum.m4a,  lossless=False, spatial=True,  proprietary=True),
     CodecEnum.MHM1:   CodecData(pretty_name='MPEG-H 3D Audio',  container=ContainerEnum.mp4,  lossless=False, spatial=True,  proprietary=True),
     CodecEnum.EAC3:   CodecData(pretty_name='Dolby Digital+',   container=ContainerEnum.eac3, lossless=False, spatial=True,  proprietary=True),
@@ -315,6 +319,8 @@ class AlbumInfo:
     all_track_cover_jpg_url: Optional[str] = None
     animated_cover_url: Optional[str] = None
     description: Optional[str] = None
+    type: Optional[str] = None
+    release_date: Optional[str] = None
     track_extra_kwargs: Optional[dict] = field(default_factory=dict)
 
 
