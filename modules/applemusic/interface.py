@@ -563,12 +563,30 @@ class ModuleInterface:
                     rel_names = [a['attributes']['name'] for a in artist_rels if 'attributes' in a and 'name' in a['attributes']]
                     if rel_names:
                         primary_artist_name = rel_names[0]
-                        # If artistName has more artists than the relationship returned, split by ' & '
-                        if len(rel_names) == 1 and ' & ' in artist_name:
+                        # Only split artistName by ' & ' as fallback when relationship returned exactly 1 artist
+                        # AND that single artist is itself a combination (contains ' & ')
+                        # AND the split parts are NOT already in rel_names as separate entries
+                        if len(rel_names) == 1 and ' & ' in artist_name and ' & ' in rel_names[0]:
+                            # rel_names[0] is already 'Zion & Lennox' — don't split further
+                            artists_list = rel_names
+                        elif len(rel_names) == 1 and ' & ' in artist_name and ' & ' not in rel_names[0]:
+                            # rel_names[0] is 'Zion' but artistName is 'Zion & Lennox' — add the rest
                             extra = [n.strip() for n in artist_name.split(' & ') if n.strip() not in rel_names]
                             artists_list = rel_names + extra
                         else:
-                            artists_list = rel_names
+                            # Multiple artists from relationship or no & — use as-is, deduplicate
+                            seen = set()
+                            deduped = []
+                            for n in rel_names:
+                                if n not in seen:
+                                    seen.add(n)
+                                    deduped.append(n)
+                            # Remove artists that are substrings of another artist in the list
+                            final = []
+                            for n in deduped:
+                                if not any(n != other and n.lower() in other.lower() for other in deduped):
+                                    final.append(n)
+                            artists_list = final or deduped
 
             # Extract isSingle from album relationship for correct type detection
             self._track_album_is_single = None

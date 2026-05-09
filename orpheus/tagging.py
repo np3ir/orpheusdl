@@ -3,6 +3,7 @@ import logging
 import os
 import tempfile
 import re
+import unicodedata
 from dataclasses import asdict
 
 from PIL import Image
@@ -19,6 +20,29 @@ from mutagen.oggvorbis import OggVorbisHeaderError
 
 from utils.exceptions import *
 from utils.models import ContainerEnum, TrackInfo
+
+_RE_FEAT = re.compile(
+    r'\s*\(\s*(?:feat|ft|featuring|with|con)\.?\s+.*?\)',
+    re.IGNORECASE
+)
+
+def _clean_title(title: str, artists: list) -> str:
+    """Remove feat. from title if the featured artist is already in the artists list."""
+    if not title:
+        return title
+    # Remove feat. parenthetical if featured artist appears in artist list
+    def _norm(s):
+        d = unicodedata.normalize('NFD', s)
+        return ''.join(c for c in d if unicodedata.category(c) != 'Mn').lower().strip()
+    artists_norm = ' '.join(_norm(a) for a in (artists or []))
+    match = _RE_FEAT.search(title)
+    if match:
+        feat_name = _norm(match.group(0))
+        # Extract just the artist name from the feat. string
+        inner = re.sub(r'^\s*\(\s*(?:feat|ft|featuring|with|con)\.?\s*', '', match.group(0), flags=re.IGNORECASE).rstrip(')')
+        if len(inner.strip()) > 2 and _norm(inner) in artists_norm:
+            title = title.replace(match.group(0), '').strip()
+    return title
 
 # Needed for Windows tagging support
 MP4Tags._padding = 0
@@ -105,15 +129,18 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
         if 'encoder' in tagger.tags:
             del tagger.tags['encoder']
     
-    # Write tags directly without cleaning
-    if titulo_original:
-        tagger['title'] = str(titulo_original)
-    
+    # Title — clean version (same as filename)
+    titulo_clean = _clean_title(titulo_original, artistas_original if isinstance(artistas_original, list) else [artistas_original])
+    if titulo_clean:
+        tagger['title'] = str(titulo_clean)
+
+    # Artist — joined with " / " (same separator as filename)
     if artistas_original:
         if isinstance(artistas_original, list):
-            tagger['artist'] = [str(a) for a in artistas_original if a]
+            artist_str = ' / '.join(str(a) for a in artistas_original if a)
         else:
-            tagger['artist'] = str(artistas_original)
+            artist_str = str(artistas_original)
+        tagger['artist'] = artist_str
     
     if album_original:
         tagger['album'] = str(album_original)
