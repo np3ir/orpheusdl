@@ -1,5 +1,61 @@
 # OrpheusDL — np3ir Fork
 
+## Installation
+
+### Requirements
+- Python 3.10+
+- [ffmpeg](https://ffmpeg.org/download.html) — must be in PATH
+- Git
+
+### Steps
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/np3ir/orpheusdl.git
+cd orpheusdl
+
+# 2. Install Python dependencies
+pip install -r requirements.txt
+
+# 3. Install Apple Music module dependencies
+pip install -r modules/applemusic/gamdl/requirements.txt
+
+# 4. Copy the example settings
+copy config\settings_example.json config\settings.json   # Windows
+# cp config/settings_example.json config/settings.json   # Linux/Mac
+```
+
+### Apple Music — Cookies Setup
+
+1. Log in to [music.apple.com](https://music.apple.com) in your browser
+2. Export cookies using a browser extension (e.g. **Get cookies.txt LOCALLY** for Chrome)
+3. Save the file as `config/cookies.txt`
+4. Cookies expire every ~30 days — re-export when you start getting 401 errors
+
+### Usage
+
+```bash
+# Download an artist (all albums, scans 167 storefronts)
+python orpheus.py https://music.apple.com/us/artist/noah-kahan/328583953
+
+# Download an album
+python orpheus.py https://music.apple.com/us/album/stick-season/1641076676
+
+# Download a playlist (catalog)
+python orpheus.py https://music.apple.com/us/playlist/dale-play/pl.4b364b8b182f4115acbf6deb83bd5222
+
+# Download a personal library playlist
+python orpheus.py https://music.apple.com/library/playlist/p.ldvAJK1coEp23Y
+
+# Works with Tidal and Deezer too
+python orpheus.py https://tidal.com/album/387249452
+python orpheus.py https://www.deezer.com/album/643003011
+```
+
+On Windows you can also use the `orpheus` command if installed via pip or added to PATH.
+
+---
+
 A heavily modified fork of [OrfiDev/OrpheusDL](https://github.com/OrfiDev/OrpheusDL) and [bascurtiz/OrpheusDL](https://github.com/bascurtiz/OrpheusDL) with major improvements to the Apple Music module and cross-platform file organization.
 
 ---
