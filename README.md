@@ -30,20 +30,34 @@ pip install --no-deps --target vendor/librespot git+https://github.com/kokarare1
 python orpheus.py settings refresh
 ```
 
-**4. Install the modules you want to use**
+**4. Install module dependencies**
 
-All modules are already included in this fork. No additional `git clone` needed.
-Just install the module-specific Python dependencies:
+> ℹ️ Unlike the upstream fork, **all modules are already included** in this repo — no `git clone` needed per module.
+> Just install the pip dependencies for the services you want to use:
 
 ```bash
-# Apple Music (required)
+# Apple Music
 pip install -r modules/applemusic/gamdl/requirements.txt
 
-# Spotify (optional)
+# Tidal (no extra deps needed)
+
+# Deezer (no extra deps needed)
+
+# Beatport / Beatsource (no extra deps needed)
+
+# SoundCloud (no extra deps needed)
+
+# Spotify
 pip install -r modules/spotify/requirements.txt
 ```
 
-**5. Configure credentials in `config/settings.json`**
+**5. Run Orpheus to create settings.json**
+
+```bash
+python orpheus.py
+```
+
+**6. Configure credentials in `config/settings.json`**
 
 See the **Module Credentials** section below.
 
