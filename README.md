@@ -9,51 +9,72 @@
 
 ### Steps
 
+**1. Clone and install core dependencies**
+
 ```bash
-# 1. Clone the repo
-git clone https://github.com/np3ir/orpheusdl.git
-cd orpheusdl
-
-# 2. Install core Python dependencies
-pip install -r requirements.txt
-
-# 3. Install dependencies for each module you want to use
-pip install -r modules/applemusic/gamdl/requirements.txt   # Apple Music
-pip install -r modules/tidal/requirements.txt              # Tidal (if exists)
-pip install -r modules/spotify/requirements.txt            # Spotify (if exists)
-
-# 4. Copy the example settings and configure your credentials
-copy config\settings_example.json config\settings.json   # Windows
-# cp config/settings_example.json config/settings.json   # Linux/Mac
+git clone https://github.com/np3ir/orpheusdl && cd orpheusdl
+pip install --upgrade --ignore-installed -r requirements.txt
 ```
 
-### Module Setup
+On macOS use `pip3` and `python3` instead of `pip` / `python`.
 
-All modules are included in the `modules/` directory. Each service requires its own credentials configured in `config/settings.json`.
+**2. Install librespot (required for Spotify)**
+
+```bash
+pip install --no-deps --target vendor/librespot git+https://github.com/kokarare1212/librespot-python
+```
+
+**3. Generate settings.json**
+
+```bash
+python orpheus.py settings refresh
+```
+
+**4. Install the modules you want to use**
+
+All modules are already included in this fork. No additional `git clone` needed.
+Just install the module-specific Python dependencies:
+
+```bash
+# Apple Music (required)
+pip install -r modules/applemusic/gamdl/requirements.txt
+
+# Spotify (optional)
+pip install -r modules/spotify/requirements.txt
+```
+
+**5. Configure credentials in `config/settings.json`**
+
+See the **Module Credentials** section below.
+
+---
+
+### Module Credentials
 
 #### 🍎 Apple Music
-- Requires `config/cookies.txt` — see **Apple Music — Cookies Setup** below
-- No account login required in settings.json (authentication via cookies)
+Authentication is via cookies — no username/password needed.
+1. Log in to [music.apple.com](https://music.apple.com) in your browser
+2. Export cookies using a browser extension (e.g. **Get cookies.txt LOCALLY** for Chrome/Firefox)
+3. Save the file as `config/cookies.txt`
+4. Cookies expire approximately every 30 days — re-export when 401 errors appear
 
 #### 🌊 Tidal
-- Requires a Tidal HiFi (Plus) subscription
-- Run `python orpheus.py` and it will prompt you to authenticate via TV login (browser)
+Requires a Tidal HiFi or HiFi Plus subscription.
+Run `python orpheus.py` once and it will prompt you to authenticate via TV login (open a URL in your browser).
 
 #### 🟠 Deezer
-- Add your ARL token to `settings.json`:
+Get your ARL from the `arl` cookie at [deezer.com](https://www.deezer.com) after logging in, then add it to `settings.json`:
 ```json
 "deezer": {
     "arl": "your_arl_token_here"
 }
 ```
-- Get your ARL from the `arl` cookie at [deezer.com](https://www.deezer.com) after logging in
 
 #### 🟢 Spotify
-- Requires Spotify Premium
-- Authentication handled automatically on first run
+Requires Spotify Premium. Authentication is handled automatically on first run.
 
 #### ☁️ SoundCloud
-- Add your OAuth token to `settings.json`:
+Get your OAuth token from the browser (Network tab → any API request → `Authorization` header), then add it to `settings.json`:
 ```json
 "soundcloud": {
     "web_access_token": "OAuth 2-..."
