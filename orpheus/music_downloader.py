@@ -5,6 +5,7 @@ import unicodedata
 import json
 import uuid
 import time
+import random
 import re
 import platform
 import asyncio
@@ -73,8 +74,8 @@ PLATFORM_COLORS = {
 
 RESET_COLOR = "\033[0m"
 
-MAX_ARTISTS_LEN = 40
-MAX_TITLE_LEN = 50
+MAX_ARTISTS_LEN = 100
+MAX_TITLE_LEN = 150
 ASCII_ONLY = False
 
 _WIN_FORBIDDEN_RE = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
@@ -87,7 +88,14 @@ _RESERVED_NAMES = {
 }
 
 # --- REGEX PARA LIMPIEZA DE TÍTULOS ---
-_RE_ANTI_FEAT = re.compile(r"\s*\((?:f(?:ea)?t\.?|with|starring)\s+(.*?)\)", flags=re.IGNORECASE)
+_RE_ANTI_FEAT_PARENS = re.compile(
+    r"\s*[\(\[]\s*(?:f(?:ea)?t\.?|featuring|with|w/|starring|con|junto a)\s+(.*?)[\)\]]",
+    flags=re.IGNORECASE
+)
+_RE_ANTI_FEAT_DASH = re.compile(
+    r"\s+[-–]\s+(?:f(?:ea)?t\.?|featuring|with|con)\s+(.*)$",
+    flags=re.IGNORECASE
+)
 _RE_NORMALIZE = re.compile(r'[\W_]+')
 
 
@@ -187,13 +195,20 @@ def normalize_text(text: str) -> str:
     return _RE_NORMALIZE.sub('', text).lower()
 
 def clean_track_title_logic(track_title: str, artist_name: str) -> str:
-    match = _RE_ANTI_FEAT.search(track_title)
+    simple_main_artist = normalize_text(artist_name)
+
+    match = _RE_ANTI_FEAT_PARENS.search(track_title)
     if match:
-        feat_artist = match.group(1)
-        simple_feat = normalize_text(feat_artist)
-        simple_main_artist = normalize_text(artist_name)
+        simple_feat = normalize_text(match.group(1))
         if len(simple_feat) > 2 and simple_feat in simple_main_artist:
-            return track_title.replace(match.group(0), "").strip()
+            track_title = track_title.replace(match.group(0), "").strip()
+
+    match = _RE_ANTI_FEAT_DASH.search(track_title)
+    if match:
+        simple_feat = normalize_text(match.group(1))
+        if len(simple_feat) > 2 and simple_feat in simple_main_artist:
+            track_title = track_title[:match.start()].strip()
+
     return track_title
 
 
@@ -739,9 +754,18 @@ class Downloader:
             format_string = format_string.replace(pat, '')
         format_string = format_string.lstrip('/')
         
-        # Create Disc folder if this is a multi-disc album
+        # Create Disc folder if this is a multi-disc album.
+        # Insert before the last path segment (filename) so it works correctly
+        # with both track_filename_format ("{track}. {title}") and
+        # single_full_path_format ("{initials}/{artist}/({year}) {album}/{track}. {title}").
         if total_discs > 1 and not custom_format:
-            format_string = f"Disc {disc_num}/{format_string}"
+            last_slash = format_string.rfind('/')
+            if last_slash >= 0:
+                format_string = (format_string[:last_slash + 1]
+                                 + f"Disc {disc_num}/"
+                                 + format_string[last_slash + 1:])
+            else:
+                format_string = f"Disc {disc_num}/{format_string}"
             
         filename_rel = format_template_advanced(format_string, data)
         ext = {
@@ -1012,22 +1036,21 @@ class Downloader:
         artist_path = os.path.join(self.path, initial, sanitise_name(artist_info.name)) + '/'
         
         self.print(f'=== Artist: {artist_info.name} ===')
+        delay_min = self.global_settings['general'].get('inter_album_delay_min', 0)
+        delay_max = self.global_settings['general'].get('inter_album_delay_max', 0)
+        total_albums = len(artist_info.albums)
         for index, album_item in enumerate(artist_info.albums, start=1):
-            self.print(f'Album {index}/{len(artist_info.albums)}')
+            self.print(f'Album {index}/{total_albums}')
             album_id = album_item.id if hasattr(album_item, 'id') else str(album_item)
-            
+
             # Pasamos self.path en lugar de artist_path para evitar duplicidad en ALBUMES
             self.download_album(album_id, artist_name=artist_info.name, path=self.path, indent_level=2, extra_kwargs=artist_info.album_extra_kwargs)
 
-        # --- TRACKS SUELTOS (SINGLES) ---
-        # Aquí sí usamos artist_path para que queden en la carpeta del artista y no en la raíz
-        self.set_indent_number(2)
-        skip_tracks = self.global_settings['artist_downloading']['separate_tracks_skip_downloaded']
-        # NOTA: En versiones antiguas del script, artist_info.tracks podía contener tracks sueltos.
-        # Si existen, los procesamos también pasando self.path para que usen la estructura correcta.
-        if artist_info.tracks:
-             # Aquí podríamos implementar la descarga de tracks sueltos si fuera necesario
-             pass
+            if index < total_albums and delay_max > 0:
+                delay = random.randint(delay_min, delay_max)
+                self.print(f'  [~] Pausa {delay}s entre álbumes...')
+                time.sleep(delay)
+
 
     async def _download_track_async(self, session, track_id=None, track_info=None, download_info=None, album_location='', custom_filename_format=None, extra_template_data=None, **kwargs):
         from utils.utils import download_file_async

@@ -159,12 +159,18 @@ A heavily modified fork of [OrfiDev/OrpheusDL](https://github.com/OrfiDev/Orpheu
 - **Playlist download fix** — `m3u_playlist` parameter no longer causes silent failures for all tracks
 - **`{album_artist}` in templates** — populated from `Tags.album_artist` field
 - **`artist_initials` from album artist** — folder initials based on album artist, consistent with Tidal behavior
+- **Inter-album delay** — configurable random pause between albums when downloading an artist, controlled via `inter_album_delay_min` / `inter_album_delay_max` in `settings.json`
 
 ---
 
 ## Recommended Settings
 
 ```json
+"general": {
+    "concurrent_downloads": 1,
+    "inter_album_delay_min": 8,
+    "inter_album_delay_max": 20
+},
 "formatting": {
     "album_format": "{artist_initials}/{album_artist}/({year}) {album_clean} {release}",
     "track_filename_format": "{track_number}. {artists} - {title_clean}{explicit}{dolby: [atmos]}",
@@ -174,6 +180,10 @@ A heavily modified fork of [OrfiDev/OrpheusDL](https://github.com/OrfiDev/Orpheu
     "force_album_format": true
 }
 ```
+
+### `inter_album_delay_min` / `inter_album_delay_max`
+
+When downloading an **artist** (which iterates through all their albums), Orpheus will wait a random number of seconds between each album, chosen uniformly from `[inter_album_delay_min, inter_album_delay_max]`. Set both to `0` to disable. Recommended range: 8–20 s.
 
 This mirrors the folder structure used by [tiddl](https://github.com/oskvr37/tiddl) for Tidal downloads, keeping multi-platform collections consistent in a single library.
 

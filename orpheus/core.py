@@ -41,6 +41,8 @@ class Orpheus:
                 "download_quality": "hifi",
                 "search_limit": 10,
                 "concurrent_downloads": 5,
+                "inter_album_delay_min": 0,
+                "inter_album_delay_max": 0,
                 "progress_bar": False
             },
             "artist_downloading":{
@@ -118,7 +120,11 @@ class Orpheus:
         self.session_storage_location = os.path.join(self.data_folder_base, 'loginstorage.bin')
 
         os.makedirs('config', exist_ok=True)
-        self.settings = json.loads(open(self.settings_location, 'r').read()) if os.path.exists(self.settings_location) else {}
+        try:
+            self.settings = json.loads(open(self.settings_location, 'r').read()) if os.path.exists(self.settings_location) else {}
+        except (json.JSONDecodeError, ValueError):
+            print(f'Warning: {self.settings_location} is corrupt or empty, resetting to defaults')
+            self.settings = {}
 
         try:
             if self.settings['global']['advanced']['debug_mode']: 
@@ -386,6 +392,9 @@ class Orpheus:
                 elif 'custom_data' in current_session: current_session.pop('custom_data')
 
         pickle.dump({'advancedmode': advanced_login_mode, 'modules': new_module_sessions}, open(self.session_storage_location, 'wb'))
+        if os.path.exists(self.settings_location):
+            import shutil
+            shutil.copy2(self.settings_location, self.settings_location + '.bak')
         open(self.settings_location, 'w').write(json.dumps(new_settings, indent = 4, sort_keys = False))
 
         if new_setting_detected:
