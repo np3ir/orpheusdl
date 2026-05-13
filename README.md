@@ -181,11 +181,20 @@ A heavily modified fork of [OrfiDev/OrpheusDL](https://github.com/OrfiDev/Orpheu
 }
 ```
 
+The formatting block mirrors the folder structure used by [tiddl](https://github.com/oskvr37/tiddl) for Tidal downloads, keeping multi-platform collections consistent in a single library.
+
+### `concurrent_downloads`
+
+Number of tracks downloaded in parallel within a single album. `1` is the most conservative value — it mimics sequential listening and is the least likely to trigger rate limiting. Higher values increase speed but make the traffic pattern look automated.
+
 ### `inter_album_delay_min` / `inter_album_delay_max`
 
-When downloading an **artist** (which iterates through all their albums), Orpheus will wait a random number of seconds between each album, chosen uniformly from `[inter_album_delay_min, inter_album_delay_max]`. Set both to `0` to disable. Recommended range: 8–20 s.
+When downloading an **artist**, Orpheus iterates through all their albums sequentially. These settings insert a random pause (in seconds, uniform distribution) between each album. Set both to `0` to disable.
 
-This mirrors the folder structure used by [tiddl](https://github.com/oskvr37/tiddl) for Tidal downloads, keeping multi-platform collections consistent in a single library.
+- Default in `core.py`: `0` / `0` (disabled)
+- Recommended for stealth: `8` / `20`
+
+These keys are registered in `default_global_settings` (`orpheus/core.py`) so they survive any settings regeneration — Orpheus will never overwrite them with blanks.
 
 ---
 
