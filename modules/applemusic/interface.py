@@ -21,7 +21,7 @@ GAMDL_AVAILABLE = False
 
 def _lazy_import_gamdl():
     """Lazy import gamdl components to avoid conflicts with GUI patches"""
-    global GAMDL_AVAILABLE, AppleMusicApi, ItunesApi, GamdlSongCodec, GamdlRemuxMode, GamdlDownloadMode, Downloader, DownloaderSong, LEGACY_CODECS, DownloaderSongLegacy
+    global GAMDL_AVAILABLE, AppleMusicApi, ItunesApi, GamdlSongCodec, GamdlRemuxMode, GamdlDownloadMode, Downloader, DownloaderSong, LEGACY_CODECS, DownloaderSongLegacy, DownloaderMusicVideo, MusicVideoCodec
     
     if GAMDL_AVAILABLE:
         return True
@@ -107,7 +107,9 @@ def _lazy_import_gamdl():
         from gamdl.downloader_song import DownloaderSong
         from gamdl.constants import LEGACY_CODECS
         from gamdl.downloader_song_legacy import DownloaderSongLegacy
-        
+        from gamdl.downloader_music_video import DownloaderMusicVideo
+        from gamdl.enums import MusicVideoCodec
+
         GAMDL_AVAILABLE = True
         import logging
         logging.getLogger('gamdl').setLevel(logging.WARNING)
@@ -138,6 +140,8 @@ Downloader = None
 DownloaderSong = None
 LEGACY_CODECS = None
 DownloaderSongLegacy = None
+DownloaderMusicVideo = None
+MusicVideoCodec = None
 
 from utils.models import *
 from utils.utils import create_temp_filename, download_to_temp
@@ -178,7 +182,8 @@ class ModuleInterface:
         self.module_controller = module_controller
         self.settings = settings
         self.gamdl_downloader_song = None
-        self.gamdl_downloader = None # To store the gamdl.Downloader instance
+        self.gamdl_downloader = None
+        self.gamdl_downloader_music_video = None
         self.is_authenticated = False  # Default to not authenticated
         self._using_rich_tagging = False  # Track when we're using gamdl's rich tagging to prevent OrpheusDL overwriting
         self._debug = settings.get('debug', False)  # Add debug setting
@@ -341,12 +346,22 @@ class ModuleInterface:
         if self.gamdl_downloader and not self.gamdl_downloader_song:
             try:
                 self.gamdl_downloader_song = DownloaderSong(
-                    downloader=self.gamdl_downloader, # Pass the correctly initialized Downloader instance
+                    downloader=self.gamdl_downloader,
                     codec=self.song_codec
                 )
             except Exception as e:
                 print(f"[Apple Music Error] Failed to initialize gamdl.downloader_song.DownloaderSong: {e}")
                 self.gamdl_downloader_song = None
+
+        if self.gamdl_downloader and not self.gamdl_downloader_music_video:
+            try:
+                self.gamdl_downloader_music_video = DownloaderMusicVideo(
+                    downloader=self.gamdl_downloader,
+                    codec=MusicVideoCodec.H264,
+                )
+            except Exception as e:
+                print(f"[Apple Music Error] Failed to initialize DownloaderMusicVideo: {e}")
+                self.gamdl_downloader_music_video = None
 
     def custom_url_parse(self, link):
         """Parse Apple Music URLs and determine media type and ID"""
@@ -365,10 +380,13 @@ class ModuleInterface:
             
             media_type = type_mapping.get(url_info['type'], DownloadTypeEnum.track)
             
+            ekw = {'country': url_info['country']}
+            if url_info['type'] == 'music-video':
+                ekw['is_music_video'] = True
             return MediaIdentification(
                 media_type=media_type,
                 media_id=url_info['id'],
-                extra_kwargs={'country': url_info['country']}
+                extra_kwargs=ekw
             )
             
         except Exception as e:
@@ -524,20 +542,39 @@ class ModuleInterface:
             return TrackInfo(name=f"Error: Not Authenticated for {track_id}", error="Not Authenticated", artists=["Unknown Artist"], album="", album_id=None, artist_id=None, duration=0, codec=CodecEnum.AAC, bitrate=0, sample_rate=0, release_year=None, cover_url=None, explicit=False, tags=Tags())
 
         try:
+            is_music_video = kwargs.get('is_music_video', False)
             # Check if we have raw_result from search - use it to avoid extra API call
             if 'raw_result' in kwargs and kwargs['raw_result']:
                 track_api_data = kwargs['raw_result']
+                is_music_video = track_api_data.get('type') == 'music-videos'
                 if self._debug:
                     print(f"[Apple Music Debug] Using raw_result from search for track {track_id}")
             else:
                 # Fetch with artists+albums included to get separated artists and isSingle
                 if data and isinstance(data, dict) and data.get('id') == track_id:
                     track_api_data = data
+                    is_music_video = data.get('type') == 'music-videos'
                 else:
-                    resp = self.apple_music_api.session.get(
-                        f'https://amp-api.music.apple.com/v1/catalog/{self.apple_music_api.storefront.lower()}/songs/{track_id}',
-                        params={'include': 'artists,albums', 'l': self.apple_music_api.language}
-                    )
+                    _sf = self.apple_music_api.storefront.lower()
+                    _force_video = kwargs.get('is_music_video', False)
+                    if _force_video:
+                        resp = self.apple_music_api.session.get(
+                            f'https://amp-api.music.apple.com/v1/catalog/{_sf}/music-videos/{track_id}',
+                            params={'include': 'artists,albums', 'l': self.apple_music_api.language}
+                        )
+                        is_music_video = True
+                    else:
+                        resp = self.apple_music_api.session.get(
+                            f'https://amp-api.music.apple.com/v1/catalog/{_sf}/songs/{track_id}',
+                            params={'include': 'artists,albums', 'l': self.apple_music_api.language}
+                        )
+                        is_music_video = False
+                        if resp.status_code == 404:
+                            resp = self.apple_music_api.session.get(
+                                f'https://amp-api.music.apple.com/v1/catalog/{_sf}/music-videos/{track_id}',
+                                params={'include': 'artists,albums', 'l': self.apple_music_api.language}
+                            )
+                            is_music_video = True
                     resp.raise_for_status()
                     track_api_data = resp.json()['data'][0]
 
@@ -610,13 +647,16 @@ class ModuleInterface:
             release_date_str = attrs.get('releaseDate')
             year = self._extract_year(release_date_str)
 
-            # Codec & Bitrate (these are indicative, actual download format decided by get_track_download)
-            # Assume AAC 256kbps as a common display default. If user selected ALAC, reflect that.
-            display_codec = CodecEnum.AAC
-            display_bitrate = 256
-            if self.song_codec == GamdlSongCodec.ALAC : # self.song_codec is GamdlSongCodec
-                display_codec = CodecEnum.ALAC
-                display_bitrate = 0 # Placeholder for lossless
+            # Codec & Bitrate
+            if is_music_video:
+                display_codec = CodecEnum.H264
+                display_bitrate = None
+            else:
+                display_codec = CodecEnum.AAC
+                display_bitrate = 256
+                if self.song_codec == GamdlSongCodec.ALAC:
+                    display_codec = CodecEnum.ALAC
+                    display_bitrate = 0
             
             # Explicit content
             explicit = attrs.get('contentRating') == 'explicit'
@@ -629,16 +669,22 @@ class ModuleInterface:
                     album_id_from_rels = _rels[0].get('id')
 
             if not album_id_from_rels or not artist_id_from_rels:
-                full_track_data = self.apple_music_api.get_song(track_id)
-                if full_track_data and 'relationships' in full_track_data:
-                    if not album_id_from_rels and 'albums' in full_track_data['relationships']:
-                        _rels = full_track_data['relationships']['albums'].get('data')
-                        if _rels:
-                            album_id_from_rels = _rels[0].get('id')
-                    if not artist_id_from_rels and 'artists' in full_track_data['relationships']:
-                        _rels = full_track_data['relationships']['artists'].get('data')
-                        if _rels:
-                            artist_id_from_rels = _rels[0].get('id')
+                try:
+                    if is_music_video:
+                        full_track_data = self.apple_music_api.get_music_video(track_id, include='albums,artists')
+                    else:
+                        full_track_data = self.apple_music_api.get_song(track_id)
+                    if full_track_data and 'relationships' in full_track_data:
+                        if not album_id_from_rels and 'albums' in full_track_data['relationships']:
+                            _rels = full_track_data['relationships']['albums'].get('data')
+                            if _rels:
+                                album_id_from_rels = _rels[0].get('id')
+                        if not artist_id_from_rels and 'artists' in full_track_data['relationships']:
+                            _rels = full_track_data['relationships']['artists'].get('data')
+                            if _rels:
+                                artist_id_from_rels = _rels[0].get('id')
+                except Exception:
+                    pass
 
             # Fetch album data (cached) to populate total_tracks, total_discs, upc, copyright — same as Tidal
             album_api_data = None
@@ -652,8 +698,17 @@ class ModuleInterface:
 
             album_attrs = (album_api_data or {}).get('attributes', {})
             total_tracks = album_attrs.get('trackCount')
-            # Apple Music API doesn't expose disc count reliably; derive from track's discNumber
-            total_discs = attrs.get('discNumber') if attrs.get('discNumber', 1) > 1 else 1
+            # Derive total_discs from max discNumber across all album tracks (cached with include=tracks).
+            # Using only the current track's discNumber returns 1 for disc-1 tracks, which prevents
+            # Disc 1/ subfolders on multi-disc albums.
+            total_discs = 1
+            if album_id_from_rels and album_id_from_rels in self._album_cache:
+                _album_tracks = (self._album_cache[album_id_from_rels]
+                                 .get('relationships', {}).get('tracks', {}).get('data', []))
+                if _album_tracks:
+                    _disc_nums = [t.get('attributes', {}).get('discNumber', 1)
+                                  for t in _album_tracks if t.get('attributes')]
+                    total_discs = max(_disc_nums) if _disc_nums else 1
             upc = album_attrs.get('upc')
             copyright_str = album_attrs.get('copyright')
             label = album_attrs.get('recordLabel')
@@ -673,11 +728,27 @@ class ModuleInterface:
                 label=label,
                 genres=attrs.get('genreNames', []),
                 composer=attrs.get('composerName'),
+                bpm=int(attrs['tempo']) if attrs.get('tempo') else None,
             )
 
             # Fallback to artistName if relationships didn't provide a list
             if not artists_list:
                 artists_list = [artist_name] if artist_name else ["Unknown Artist"]
+
+            # Apple Music relationships only returns the main billing artist.
+            # Featured artists appear only in the track title as (feat. X).
+            # Extract them here so they appear in the filename and artist tags.
+            _feat_match = re.search(
+                r'[\(\[]\s*(?:feat|ft|fea|featuring|with|con)\.?\s+([^\)\]]+)[\)\]]',
+                name, re.IGNORECASE
+            )
+            if _feat_match:
+                _feat_str = _feat_match.group(1).strip()
+                _feat_names = re.split(r'\s*(?:[&,+]| y | and )\s*', _feat_str)
+                for _fn in _feat_names:
+                    _fn = _fn.strip()
+                    if _fn and not any(_fn.lower() == _a.lower() for _a in artists_list):
+                        artists_list.append(_fn)
 
             # Strip " - Single" etc. from album name to match Tidal behaviour
             final_album_name = self._strip_release_suffix(
@@ -699,7 +770,11 @@ class ModuleInterface:
                 cover_url=cover_url,
                 explicit=explicit,
                 tags=tags_obj,
-                download_extra_kwargs={'api_response': track_api_data, 'source_quality_tier': quality_tier.name}
+                download_extra_kwargs=(
+                    {'track_id': str(track_id), 'quality_tier': quality_tier, 'is_music_video': True, 'country': country}
+                    if is_music_video else
+                    {'api_response': track_api_data, 'source_quality_tier': quality_tier.name}
+                )
             )
 
         except Exception as e:
@@ -868,6 +943,11 @@ class ModuleInterface:
 
         if not self.is_authenticated:
             raise AuthenticationError('"cookies.txt" not found, invalid, or expired.')
+
+        # Route music video downloads to dedicated handler
+        if kwargs.get('is_music_video'):
+            self._initialize_gamdl_components()
+            return self._download_music_video(track_id, indent_spaces)
 
         # Ensure gamdl components are initialized (downloader and downloader_song)
         if not self.gamdl_downloader_song or not self.gamdl_downloader:
@@ -1291,7 +1371,10 @@ class ModuleInterface:
 
             if '"failureType":"2002"' in error_str or "Your session has ended" in error_str:
                 raise DownloadError('"cookies.txt" not found, invalid, or expired.')
-            
+
+            if 'status code 404' in error_str or '"status":"404"' in error_str or '"code":"40400"' in error_str:
+                raise TrackUnavailableError("Track not found in current storefront (404)") from e
+
             # Create a clean, concise error message
             error_msg = str(e)
             if "ConnectionError" in str(type(e)) or "NameResolutionError" in error_msg:
@@ -1344,6 +1427,68 @@ class ModuleInterface:
         except Exception:
             return None
 
+    def _download_music_video(self, track_id: str, indent_spaces: str = "        ") -> Optional[TrackDownloadInfo]:
+        """Download a music video via yt-dlp using the HLS master URL from webplayback.
+        yt-dlp handles AES-128 decryption, stream selection, and video+audio merge automatically
+        — no need for separate Widevine/mp4decrypt flow."""
+        if not self.gamdl_downloader or not self.gamdl_downloader_music_video:
+            raise DownloadError("Apple Music: gamdl music video components not initialized")
+        try:
+            # 1. Webplayback → HLS master URL
+            print(f"{indent_spaces}Fetching video stream info...")
+            with suppress_gamdl_debug():
+                webplayback = self.apple_music_api.get_webplayback(track_id)
+            if not webplayback:
+                raise DownloadError(f"Apple Music: no webplayback for music video {track_id}")
+            stream_url_master = self.gamdl_downloader_music_video.get_stream_url_from_webplayback(webplayback)
+
+            # 2. Download via yt-dlp with explicit video format selection
+            output_path = self.gamdl_downloader.temp_path / f"mv_{track_id}"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            print(f"{indent_spaces}Downloading video...")
+            from yt_dlp import YoutubeDL
+            ffmpeg_loc = getattr(self.gamdl_downloader, 'ffmpeg_path_full', None) or 'ffmpeg'
+            with YoutubeDL({
+                'quiet': not self._debug,
+                'no_warnings': True,
+                'outtmpl': str(output_path) + '.%(ext)s',
+                'format': 'bestvideo+bestaudio/best',
+                'merge_output_format': 'mp4',
+                'fixup': 'never',
+                'allowed_extractors': ['generic'],
+                'noprogress': True,
+                'ffmpeg_location': str(ffmpeg_loc),
+            }) as ydl:
+                ydl.download([stream_url_master])
+
+            # 3. Find the output file (yt-dlp appends the extension)
+            final_path = None
+            for ext in ('.mp4', '.mkv', '.m4v', '.webm'):
+                candidate = output_path.with_suffix(ext)
+                if candidate.exists() and candidate.stat().st_size > 4096:
+                    final_path = candidate
+                    break
+            if not final_path:
+                # Last resort: any file in temp starting with mv_{track_id}
+                for f in output_path.parent.glob(f"mv_{track_id}*"):
+                    if f.stat().st_size > 4096:
+                        final_path = f
+                        break
+            if not final_path:
+                raise DownloadError(f"Apple Music: downloaded video file not found for {track_id}")
+
+            return TrackDownloadInfo(
+                download_type=OrpheusDownloadEnum.TEMP_FILE_PATH,
+                temp_file_path=str(final_path)
+            )
+        except DownloadError:
+            raise
+        except Exception as e:
+            err = str(e)
+            if 'drm' in err.lower() or 'DRM' in err or 'protected' in err.lower():
+                raise TrackUnavailableError(f"Music video is DRM-protected and cannot be downloaded") from e
+            raise DownloadError(f"Apple Music music video download failed: {e}") from e
+
     def get_track_lyrics(self, track_id: str, **kwargs) -> Optional[LyricsInfo]:
         try:
             self._initialize_gamdl_components()
@@ -1384,6 +1529,16 @@ class ModuleInterface:
                 f'https://amp-api.music.apple.com/v1/catalog/{_storefront}/albums/{album_id}',
                 params={'include': 'artists,tracks', 'l': self.apple_music_api.language}
             )
+            # If 404 in current storefront, try 'us' as fallback (and vice versa)
+            if _resp.status_code == 404:
+                _fallback = 'us' if _storefront != 'us' else None
+                if _fallback:
+                    _resp = self.apple_music_api.session.get(
+                        f'https://amp-api.music.apple.com/v1/catalog/{_fallback}/albums/{album_id}',
+                        params={'include': 'artists,tracks', 'l': self.apple_music_api.language}
+                    )
+            if _resp.status_code == 404:
+                return None  # Album not available in any storefront — skip cleanly
             _resp.raise_for_status()
             album_data = _resp.json()['data'][0]
             # Cache for get_track_info reuse
@@ -1538,6 +1693,33 @@ class ModuleInterface:
                 self._storefronts_cache = ['us']
         return self._storefronts_cache
 
+    def _fetch_videos_for_storefront(self, artist_id: str, storefront: str) -> dict:
+        """Fetch standalone music video IDs for an artist in one storefront. Returns {video_id: storefront}."""
+        result = {}
+        try:
+            url = f'https://amp-api.music.apple.com/v1/catalog/{storefront}/artists/{artist_id}/music-videos'
+            params = {'limit': 100, 'l': self.apple_music_api.language}
+            resp = self.apple_music_api.session.get(url, params=params, timeout=10)
+            if resp.status_code != 200:
+                return result
+            data = resp.json()
+            for video in data.get('data', []):
+                result[video['id']] = storefront
+            next_path = data.get('next')
+            while next_path:
+                resp = self.apple_music_api.session.get(
+                    f'https://amp-api.music.apple.com{next_path}', timeout=10
+                )
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+                for video in data.get('data', []):
+                    result.setdefault(video['id'], storefront)
+                next_path = data.get('next')
+        except Exception:
+            pass
+        return result
+
     def _fetch_albums_for_storefront(self, artist_id: str, storefront: str) -> dict:
         """Fetch all album IDs for an artist in one storefront. Returns {album_id: storefront}."""
         result = {}
@@ -1610,7 +1792,7 @@ class ModuleInterface:
             name=artist_name,
             artist_id=artist_id,
             albums=album_ids,
-            album_extra_kwargs={'storefront_map': storefront_map}
+            album_extra_kwargs={'storefront_map': storefront_map},
         )
 
     def _get_cover_url(self, artwork_template):

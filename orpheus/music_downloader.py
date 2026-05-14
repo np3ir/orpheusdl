@@ -599,12 +599,14 @@ class Downloader:
 
                 # --- LÓGICA DE REINTENTO (Restaurada) ---
                 download_info = None
-                
+
                 if hasattr(track_info, 'download_extra_kwargs') and track_info.download_extra_kwargs:
-                     try:
-                         download_info = await loop.run_in_executor(None, lambda: self.service.get_track_download(**track_info.download_extra_kwargs))
-                     except Exception:
-                         download_info = None
+                    try:
+                        download_info = await loop.run_in_executor(None, lambda: self.service.get_track_download(**track_info.download_extra_kwargs))
+                    except DownloadError:
+                        raise
+                    except Exception:
+                        download_info = None
 
                 if not download_info:
                     download_kwargs = args.get('extra_kwargs', {}).copy()
@@ -1175,10 +1177,12 @@ class Downloader:
         # --- LÓGICA DE REINTENTO (Sincrona) ---
         download_info = None
         if hasattr(track_info, 'download_extra_kwargs') and track_info.download_extra_kwargs:
-             try:
-                 download_info = self.service.get_track_download(**track_info.download_extra_kwargs)
-             except Exception:
-                 download_info = None
+            try:
+                download_info = self.service.get_track_download(**track_info.download_extra_kwargs)
+            except DownloadError:
+                raise
+            except Exception:
+                download_info = None
 
         if not download_info:
             download_kwargs = extra_kwargs.copy()
