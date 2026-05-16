@@ -186,7 +186,6 @@ class ModuleInterface:
         self.gamdl_downloader = None
         self.gamdl_downloader_music_video = None
         self.is_authenticated = False  # Default to not authenticated
-        self._using_rich_tagging = False  # Track when we're using gamdl's rich tagging to prevent OrpheusDL overwriting
         self._debug = settings.get('debug', False)  # Add debug setting
         
         if not _lazy_import_gamdl():
@@ -802,145 +801,7 @@ class ModuleInterface:
         if self._debug:
             print(f"[Apple Music Debug] get_track_download called for track_id: {track_id}, quality_tier: {quality_tier.name}")
 
-        # Reset rich tagging flag for each new download
-        self._using_rich_tagging = False
-        
-        # Detect context by examining the kwargs and call stack
-        import inspect
-
-        # Default to single track indentation
-        indent_spaces = "        "  # 8 spaces for single tracks
-
-        try:
-            # Check if we're in an album context by looking for album-specific indicators
-            # This is more reliable than trying to detect artist context
-
-            # Check for album context by looking for multi-track album indicators
-            is_album_context = False
-
-            # First check kwargs for album context
-            if 'extra_kwargs' in kwargs and kwargs['extra_kwargs']:
-                extra_kwargs = kwargs['extra_kwargs']
-                if 'album_id' in extra_kwargs or 'album_name' in extra_kwargs:
-                    is_album_context = True
-
-            # If not found in kwargs, check call stack for album download functions
-            if not is_album_context:
-                stack = inspect.stack()
-                for frame_info in stack:
-                    function_name = frame_info.function
-                    frame_locals = frame_info.frame.f_locals
-
-                    # Look for album download indicators, but be more specific
-                    if function_name == 'download_album':
-                        # Check if this is a multi-track album by looking for track count
-                        if 'album_info' in frame_locals:
-                            album_info = frame_locals['album_info']
-                            if self._debug:
-                                print(f"[Apple Music Debug] Found album_info: {type(album_info)}")
-                                if hasattr(album_info, '__dict__'):
-                                    print(f"[Apple Music Debug] album_info attributes: {list(album_info.__dict__.keys())}")
-                            # Only consider it an album context if it has multiple tracks
-                            # Check for tracks attribute (list of tracks)
-                            if hasattr(album_info, 'tracks') and album_info.tracks and len(album_info.tracks) > 1:
-                                is_album_context = True
-                                if self._debug:
-                                    print(f"[Apple Music Debug] Multi-track album detected: {len(album_info.tracks)} tracks")
-                                break
-                            elif hasattr(album_info, 'tracks'):
-                                if self._debug:
-                                    track_count = len(album_info.tracks) if album_info.tracks else 0
-                                    print(f"[Apple Music Debug] Single-track album detected: {track_count} tracks")
-                            # Fallback: check for track_count attribute
-                            elif hasattr(album_info, 'track_count') and album_info.track_count > 1:
-                                is_album_context = True
-                                if self._debug:
-                                    print(f"[Apple Music Debug] Multi-track album detected (track_count): {album_info.track_count} tracks")
-                                break
-                            elif hasattr(album_info, 'track_count'):
-                                if self._debug:
-                                    print(f"[Apple Music Debug] Single-track album detected (track_count): {album_info.track_count} tracks")
-                        else:
-                            # If we can't determine track count, assume it's an album
-                            is_album_context = True
-                            if self._debug:
-                                print(f"[Apple Music Debug] download_album function found, assuming album context")
-                            break
-                    elif 'album_info' in frame_locals:
-                        album_info = frame_locals['album_info']
-                        if self._debug:
-                            print(f"[Apple Music Debug] Found album_info in frame: {type(album_info)}")
-                        # Only consider it an album context if it has multiple tracks
-                        # Check for tracks attribute (list of tracks)
-                        if hasattr(album_info, 'tracks') and album_info.tracks and len(album_info.tracks) > 1:
-                            is_album_context = True
-                            if self._debug:
-                                print(f"[Apple Music Debug] Multi-track album detected in frame: {len(album_info.tracks)} tracks")
-                            break
-                        # Fallback: check for track_count attribute
-                        elif hasattr(album_info, 'track_count') and album_info.track_count > 1:
-                            is_album_context = True
-                            if self._debug:
-                                print(f"[Apple Music Debug] Multi-track album detected in frame (track_count): {album_info.track_count} tracks")
-                            break
-
-            # Determine indentation based on context
-            if self._debug:
-                print(f"[Apple Music Debug] Context detection for track {track_id}:")
-                print(f"[Apple Music Debug] is_album_context: {is_album_context}")
-
-            if is_album_context:
-                # Check if we're also in an artist context (for nested album in artist)
-                is_artist_context = False
-                stack = inspect.stack()
-                for frame_info in stack:
-                    function_name = frame_info.function
-                    frame_locals = frame_info.frame.f_locals
-
-                    if (function_name == 'download_artist' or
-                        'artist_id' in frame_locals):
-                        is_artist_context = True
-                        break
-
-                if self._debug:
-                    print(f"[Apple Music Debug] is_artist_context: {is_artist_context}")
-
-                if is_artist_context:
-                    # Album track within artist download - use 8 spaces to match OrpheusDL's indentation system
-                    indent_spaces = "        "  # 8 spaces (matches OrpheusDL track content indentation)
-                    if self._debug:
-                        print(f"[Apple Music Debug] Using 8 spaces (album within artist)")
-                else:
-                    # Regular album track - use 8 spaces to match OrpheusDL's indentation system
-                    indent_spaces = "        "  # 8 spaces (matches OrpheusDL track content indentation)
-                    if self._debug:
-                        print(f"[Apple Music Debug] Using 8 spaces (regular album)")
-            else:
-                # Check for playlist context
-                is_playlist_context = False
-                stack = inspect.stack()
-                for frame_info in stack:
-                    function_name = frame_info.function
-                    if function_name == 'download_playlist':
-                        is_playlist_context = True
-                        if self._debug:
-                            print(f"[Apple Music Debug] Detected playlist context")
-                        break
-
-                if is_playlist_context:
-                    # Playlist track - use same indentation as other track details (8 spaces)
-                    indent_spaces = "        "  # 8 spaces
-                    if self._debug:
-                        print(f"[Apple Music Debug] Using 8 spaces (playlist track)")
-                else:
-                    # Single track (standalone or within artist)
-                    indent_spaces = "        "  # 8 spaces
-                    if self._debug:
-                        print(f"[Apple Music Debug] Using 8 spaces (single track)")
-
-        except:
-            # If detection fails, use default single track indentation
-            indent_spaces = "        "  # 8 spaces
+        indent_spaces = "        "  # 8 spaces
 
         if not self.is_authenticated:
             raise AuthenticationError('"cookies.txt" not found, invalid, or expired.')
@@ -1090,56 +951,6 @@ class ModuleInterface:
                     if self._debug:
                         print(f"[Apple Music Success] Remuxed file created successfully: {remuxed_path}, Size: {remuxed_path.stat().st_size} bytes")
                     
-                    # Apply gamdl's rich tagging system to preserve Apple Music metadata
-                    try:
-                        print(f"{indent_spaces}Applying Apple Music metadata...")
-                        
-                        # Extract rich metadata using gamdl's get_tags method
-                        if self.gamdl_downloader_song.codec in LEGACY_CODECS:
-                            # For legacy codecs, get tags from webplayback data
-                            rich_tags = legacy_downloader_song.get_tags(webplayback_data, None)  # No lyrics for now
-                        else:
-                            # For regular codecs, get tags from webplayback data
-                            rich_tags = self.gamdl_downloader_song.get_tags(webplayback_data, None)  # No lyrics for now
-                        
-                        if self._debug:
-                            print(f"[Apple Music Metadata] Extracted {len(rich_tags)} rich metadata fields")
-                        
-                        # Apply rich metadata using gamdl's apply_tags method
-                        # Get cover URL from track metadata for artwork
-                        cover_url = None
-                        if 'attributes' in gamdl_track_metadata_full and 'artwork' in gamdl_track_metadata_full['attributes']:
-                            artwork_template = gamdl_track_metadata_full['attributes']['artwork'].get('url')
-                            if artwork_template:
-                                cover_url = artwork_template.replace('{w}x{h}bb.jpg', '1400x1400bb.jpg')
-                        
-                        # Apply the rich tags to the remuxed file
-                        self.gamdl_downloader.apply_tags(
-                            remuxed_path,
-                            rich_tags,
-                            cover_url
-                        )
-                        
-                        if self._debug:
-                            print(f"[Apple Music Metadata] Successfully applied rich Apple Music metadata")
-                        
-                        # Set flag to prevent OrpheusDL from overwriting rich metadata
-                        self._using_rich_tagging = True
-                        
-                        # Return as TEMP_FILE_PATH since DIRECT_FILE_PATH doesn't exist
-                        # The rich metadata has been applied, so OrpheusDL should preserve it
-                        return TrackDownloadInfo(
-                            download_type=DownloadEnum.TEMP_FILE_PATH,
-                            temp_file_path=str(remuxed_path)
-                        )
-                        
-                    except Exception as tagging_error:
-                        if self._debug:
-                            print(f"[Apple Music Metadata] Rich tagging failed: {tagging_error}")
-                        # Fall back to OrpheusDL tagging
-                        print(f"{indent_spaces}Rich tagging failed, using OrpheusDL tagging")
-                    
-                    # Fallback to temp file for OrpheusDL tagging if rich tagging failed
                     return TrackDownloadInfo(
                         download_type=DownloadEnum.TEMP_FILE_PATH,
                         temp_file_path=str(remuxed_path)
@@ -1206,56 +1017,6 @@ class ModuleInterface:
                     if self._debug:
                         print(f"[Apple Music Success] Remuxed file created successfully: {remuxed_path}, Size: {remuxed_path.stat().st_size} bytes")
                     
-                    # Apply gamdl's rich tagging system to preserve Apple Music metadata
-                    try:
-                        print(f"{indent_spaces}Applying Apple Music metadata...")
-                        
-                        # Extract rich metadata using gamdl's get_tags method
-                        if self.gamdl_downloader_song.codec in LEGACY_CODECS:
-                            # For legacy codecs, get tags from webplayback data
-                            rich_tags = legacy_downloader_song.get_tags(webplayback_data, None)  # No lyrics for now
-                        else:
-                            # For regular codecs, get tags from webplayback data
-                            rich_tags = self.gamdl_downloader_song.get_tags(webplayback_data, None)  # No lyrics for now
-                        
-                        if self._debug:
-                            print(f"[Apple Music Metadata] Extracted {len(rich_tags)} rich metadata fields")
-                        
-                        # Apply rich metadata using gamdl's apply_tags method
-                        # Get cover URL from track metadata for artwork
-                        cover_url = None
-                        if 'attributes' in gamdl_track_metadata_full and 'artwork' in gamdl_track_metadata_full['attributes']:
-                            artwork_template = gamdl_track_metadata_full['attributes']['artwork'].get('url')
-                            if artwork_template:
-                                cover_url = artwork_template.replace('{w}x{h}bb.jpg', '1400x1400bb.jpg')
-                        
-                        # Apply the rich tags to the remuxed file
-                        self.gamdl_downloader.apply_tags(
-                            remuxed_path,
-                            rich_tags,
-                            cover_url
-                        )
-                        
-                        if self._debug:
-                            print(f"[Apple Music Metadata] Successfully applied rich Apple Music metadata")
-                        
-                        # Set flag to prevent OrpheusDL from overwriting rich metadata
-                        self._using_rich_tagging = True
-                        
-                        # Return as TEMP_FILE_PATH since DIRECT_FILE_PATH doesn't exist
-                        # The rich metadata has been applied, so OrpheusDL should preserve it
-                        return TrackDownloadInfo(
-                            download_type=DownloadEnum.TEMP_FILE_PATH,
-                            temp_file_path=str(remuxed_path)
-                        )
-                        
-                    except Exception as tagging_error:
-                        if self._debug:
-                            print(f"[Apple Music Metadata] Rich tagging failed: {tagging_error}")
-                        # Fall back to OrpheusDL tagging
-                        print(f"{indent_spaces}Rich tagging failed, using OrpheusDL tagging")
-                    
-                    # Fallback to temp file for OrpheusDL tagging if rich tagging failed
                     return TrackDownloadInfo(
                         download_type=DownloadEnum.TEMP_FILE_PATH,
                         temp_file_path=str(remuxed_path)

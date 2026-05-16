@@ -59,9 +59,10 @@ class TidalApi(object):
     TIDAL_VIDEO_BASE = 'https://api.tidalhifi.com/v1/'
     TIDAL_CLIENT_VERSION = '2.26.1'
 
-    def __init__(self, sessions: dict):
+    def __init__(self, sessions: dict, on_token_refresh=None):
         self.sessions = sessions
         self.default: SessionType = SessionType.TV  # Change to TV or MOBILE depending on AC-4/360RA
+        self.on_token_refresh = on_token_refresh
 
         self.s = create_requests_session()
 
@@ -89,7 +90,9 @@ class TidalApi(object):
 
         # if the request 401s or 403s, try refreshing the TV/Mobile session in case that helps
         if not refresh and (resp.status_code == 401 or resp.status_code == 403):
-            self.sessions[self.default.name].refresh()
+            session_name = self.default.name
+            if self.sessions[session_name].refresh() and self.on_token_refresh:
+                self.on_token_refresh(session_name, self.sessions[session_name].get_storage())
             return self._get(url, params, True)
 
         if resp.status_code == 429:
@@ -332,10 +335,8 @@ class TidalSession(ABC):
         """
         Checks if session is still valid and returns True/False
         """
-        if not isinstance(self, TidalSession):
-            if self.access_token is None or datetime.now() > self.expires:
-                return False
-
+        if self.access_token is None or self.expires is None or datetime.now() > self.expires:
+            return False
         r = requests.get('https://api.tidal.com/v1/sessions', headers=self.auth_headers())
         return r.status_code == 200
 

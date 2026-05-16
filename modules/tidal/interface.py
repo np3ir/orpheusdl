@@ -157,8 +157,15 @@ class ModuleInterface:
         self.album_cache = {}
         self._playback_cache = {}  # track_id -> {duration, album_id}
 
+        self._saved_sessions = saved_sessions
+        self._tsc = module_controller.temporary_settings_controller
+
         # load the Tidal session with all saved sessions (TV, Mobile Atmos, Mobile Default)
-        self.session: TidalApi = TidalApi(sessions)
+        self.session: TidalApi = TidalApi(sessions, on_token_refresh=self._save_refreshed_session)
+
+    def _save_refreshed_session(self, session_type_name: str, storage: dict):
+        self._saved_sessions[session_type_name] = storage
+        self._tsc.set('sessions', self._saved_sessions)
 
     def init_session(self, session_type):
         session = None
