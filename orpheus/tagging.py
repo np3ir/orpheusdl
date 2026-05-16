@@ -1,6 +1,7 @@
 import base64
 import logging
 import os
+import shutil
 import tempfile
 import re
 import unicodedata
@@ -21,36 +22,87 @@ from mutagen.oggvorbis import OggVorbisHeaderError
 from utils.exceptions import *
 from utils.models import ContainerEnum, TrackInfo
 
-_RE_FEAT = re.compile(
-    r'\s*\(\s*(?:feat|ft|featuring|with|con)\.?\s+.*?\)',
+_FEAT_KEYWORDS = r'(?:feat|ft|fea|featuring|with|w/|con|junto a|prod(?:\.|uced by)?)'
+
+_RE_FEAT_PARENS = re.compile(
+    r'\s*[\(\[]\s*' + _FEAT_KEYWORDS + r'\.?\s+(.*?)[\)\]]',
+    re.IGNORECASE
+)
+_RE_FEAT_DASH = re.compile(
+    r'\s+[-–]\s+' + _FEAT_KEYWORDS + r'\.?\s+(.*)$',
     re.IGNORECASE
 )
 
 def _clean_title(title: str, artists: list) -> str:
-    """Remove feat. from title if the featured artist is already in the artists list."""
+    """Remove feat. from title if the featured artist is already in the artists list.
+    Handles both parenthetical (feat. X) and dash separator (- feat. X) patterns.
+    Also handles multi-artist feat strings like 'feat. Ozuna & Wisin'."""
     if not title:
         return title
-    # Remove feat. parenthetical if featured artist appears in artist list
+
     def _norm(s):
         d = unicodedata.normalize('NFD', s)
-        return ''.join(c for c in d if unicodedata.category(c) != 'Mn').lower().strip()
-    artists_norm = ' '.join(_norm(a) for a in (artists or []))
-    match = _RE_FEAT.search(title)
-    if match:
-        feat_name = _norm(match.group(0))
-        # Extract just the artist name from the feat. string
-        inner = re.sub(r'^\s*\(\s*(?:feat|ft|featuring|with|con)\.?\s*', '', match.group(0), flags=re.IGNORECASE).rstrip(')')
-        if len(inner.strip()) > 2 and _norm(inner) in artists_norm:
-            title = title.replace(match.group(0), '').strip()
+        s = ''.join(c for c in d if unicodedata.category(c) != 'Mn').lower()
+        return re.sub(r'[\W_]+', '', s)
+
+    artists_set = {_norm(a) for a in (artists or []) if a}
+
+    def _feat_in_artists(inner: str) -> bool:
+        # First: try the whole string (handles duos like "Zion & Lennox" whose name contains &)
+        inner_norm = _norm(inner.strip())
+        if inner_norm and len(inner_norm) > 2 and inner_norm in artists_set:
+            return True
+        # Second: split by separators and check each name individually (e.g. "Ozuna & Wisin")
+        feat_names = re.split(r'\s*[,&]\s*|\s+(?:and|y)\s+', inner.strip(), flags=re.IGNORECASE)
+        if len(feat_names) > 1:
+            return all(len(_norm(n)) > 2 and _norm(n) in artists_set for n in feat_names)
+        return False
+
+    match = _RE_FEAT_PARENS.search(title)
+    if match and _feat_in_artists(match.group(1)):
+        title = title.replace(match.group(0), '').strip()
+
+    match = _RE_FEAT_DASH.search(title)
+    if match and _feat_in_artists(match.group(1)):
+        title = title[:match.start()].strip()
+
     return title
 
 # Needed for Windows tagging support
 MP4Tags._padding = 0
 
 
+def _save_flac_smb_safe(tagger, file_path: str) -> None:
+    """Save FLAC tags via temp file — fallback for Windows SMB shares where seek()+write() is unreliable."""
+    from pathlib import Path
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.flac')
+    tmp = Path(tmp_path)
+    try:
+        os.close(tmp_fd)
+        shutil.copy2(file_path, str(tmp))
+        tmp_tagger = FLAC(str(tmp))
+        tmp_tagger.clear()
+        tmp_tagger.update(dict(tagger))
+        tmp_tagger.clear_pictures()
+        for pic in tagger.pictures:
+            tmp_tagger.add_picture(pic)
+        tmp_tagger.save()
+        shutil.move(str(tmp), file_path)
+        logging.debug(f"FLAC metadata saved via temp file for {Path(file_path).name}")
+    except Exception as e2:
+        logging.warning(f"FLAC metadata save via temp file failed for {Path(file_path).name}: {e2}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
 def _resize_image_if_needed(image_path: str, max_size_bytes: int = 16 * 1024 * 1024,
                             target_resolution: tuple = (3000, 3000)) -> str:
     """Resize an image if it exceeds the maximum file size."""
+    if not image_path or not os.path.exists(image_path):
+        return image_path
     if os.path.getsize(image_path) <= max_size_bytes:
         return image_path
 
@@ -71,10 +123,14 @@ def _resize_image_if_needed(image_path: str, max_size_bytes: int = 16 * 1024 * 1
 def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_list: list, embedded_lyrics: str,
              container: ContainerEnum):
     """Tag file with metadata - Clean version without logging"""
-    
+
     # Basic validation
     if track_info is None:
         return
+
+    # mutagen doesn't support the Windows extended-path prefix (\\?\)
+    if file_path.startswith('\\\\?\\'):
+        file_path = file_path[4:]
     
     # Get original values
     titulo_original = track_info.name if hasattr(track_info, 'name') else ""
@@ -89,7 +145,11 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
     
     if not album_original:
         album_original = "Unknown Album"
-    
+
+    bpm_val = None
+    if hasattr(track_info, 'tags') and track_info.tags and hasattr(track_info.tags, 'bpm'):
+        bpm_val = track_info.tags.bpm
+
     # Open file with mutagen
     if container == ContainerEnum.flac:
         tagger = FLAC(file_path)
@@ -137,10 +197,10 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
     # Artist — joined with " / " (same separator as filename)
     if artistas_original:
         if isinstance(artistas_original, list):
-            artist_str = ' / '.join(str(a) for a in artistas_original if a)
+            artist_list = [str(a) for a in artistas_original if a]
         else:
-            artist_str = str(artistas_original)
-        tagger['artist'] = artist_str
+            artist_list = [str(artistas_original)]
+        tagger['artist'] = artist_list
     
     if album_original:
         tagger['album'] = str(album_original)
@@ -200,7 +260,17 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
     # Genre
     if hasattr(track_info, 'tags') and track_info.tags and hasattr(track_info.tags, 'genres') and track_info.tags.genres:
         tagger['genre'] = track_info.tags.genres
-    
+
+    # BPM (FLAC/OGG/MP3 inline; M4A tmpo is written after save via raw MP4 pass)
+    if bpm_val:
+        try:
+            if container in {ContainerEnum.flac, ContainerEnum.ogg, ContainerEnum.opus}:
+                tagger['BPM'] = str(int(float(bpm_val)))
+            elif container == ContainerEnum.mp3:
+                tagger['bpm'] = str(int(float(bpm_val)))
+        except (ValueError, TypeError):
+            pass
+
     # ISRC
     if hasattr(track_info, 'tags') and track_info.tags and hasattr(track_info.tags, 'isrc') and track_info.tags.isrc:
         tagger['isrc'] = track_info.tags.isrc.encode() if container == ContainerEnum.m4a else track_info.tags.isrc
@@ -256,8 +326,13 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
         else:
             for credit in credits_list:
                 try:
-                    tagger.tags[credit.type] = credit.names
-                except:
+                    raw_key = credit.type.upper()
+                    normalized = unicodedata.normalize('NFKD', raw_key)
+                    safe_key = normalized.encode('ascii', 'ignore').decode('ascii')
+                    safe_key = re.sub(r'[=\x00-\x1f]', '', safe_key).strip()
+                    if safe_key:
+                        tagger[safe_key] = credit.names
+                except Exception:
                     pass
     
     # Lyrics
@@ -276,7 +351,7 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
                 tagger['REPLAYGAIN_TRACK_PEAK'] = str(track_info.tags.replay_peak)
     
     # Handle cover art
-    if image_path:
+    if image_path and os.path.exists(image_path):
         # Clear existing cover art
         if container == ContainerEnum.flac:
             tagger.clear_pictures()
@@ -345,7 +420,13 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
     
     # Save file
     try:
-        if container == ContainerEnum.mp3:
+        if container == ContainerEnum.flac:
+            try:
+                tagger.save()
+            except Exception as _smb_err:
+                logging.debug(f"Direct FLAC save failed ({_smb_err}), retrying via temp file...")
+                _save_flac_smb_safe(tagger, file_path)
+        elif container == ContainerEnum.mp3:
             tagger.save(file_path, v1=2, v2_version=3, v23_sep=None)
         else:
             tagger.save()
@@ -366,3 +447,15 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
         tag_text += '\n\nlyrics:\n    ' + '\n    '.join(embedded_lyrics.split('\n')) if embedded_lyrics else ''
         open(file_path.rsplit('.', 1)[0] + '_tags.txt', 'w', encoding='utf-8').write(tag_text)
         raise TagSavingFailure
+
+    # BPM for M4A: tmpo is an integer atom not writable via EasyMP4 — second raw MP4 pass
+    if bpm_val and container == ContainerEnum.m4a:
+        try:
+            from mutagen.mp4 import MP4 as _RawMP4
+            _raw = _RawMP4(file_path)
+            if _raw.tags is None:
+                _raw.add_tags()
+            _raw.tags['tmpo'] = [int(float(bpm_val))]
+            _raw.save()
+        except Exception as _bpm_e:
+            logging.debug(f"Could not write BPM to M4A: {_bpm_e}")

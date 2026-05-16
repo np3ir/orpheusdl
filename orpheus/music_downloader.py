@@ -472,6 +472,60 @@ class Downloader:
 
     # _normalize_for_compare defined at module level below
 
+    @staticmethod
+    def _detect_container_from_magic(file_path: str):
+        """Detect actual audio container from file magic bytes, ignoring extension."""
+        try:
+            clean = file_path[4:] if file_path.startswith('\\\\?\\') else file_path
+            with open(clean, 'rb') as f:
+                header = f.read(12)
+            if header[:4] == b'fLaC':
+                return ContainerEnum.flac
+            if header[4:8] == b'ftyp':
+                return ContainerEnum.m4a
+            if header[:4] == b'OggS':
+                return ContainerEnum.ogg
+            if header[:3] == b'ID3' or (len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0):
+                return ContainerEnum.mp3
+            if header[:4] == b'RIFF' and header[8:12] == b'WAVE':
+                return ContainerEnum.wav
+        except Exception:
+            pass
+        return None
+
+    _CONTAINER_TO_CODEC = {
+        ContainerEnum.flac: CodecEnum.FLAC,
+        ContainerEnum.m4a:  CodecEnum.AAC,
+        ContainerEnum.mp3:  CodecEnum.MP3,
+        ContainerEnum.opus: CodecEnum.OPUS,
+        ContainerEnum.ogg:  CodecEnum.VORBIS,
+    }
+
+    def _check_codec_container_match(self, track_info, container: ContainerEnum, is_video: bool) -> None:
+        """Warn and fix track_info when the actual file container doesn't match the declared codec."""
+        if is_video or not track_info.codec or track_info.codec not in codec_data:
+            return
+        expected = codec_data[track_info.codec].container
+        if container == expected:
+            return
+        # Spatial codecs (EAC3, AC4, AC3, MHA1) are delivered in MP4/M4A by streaming
+        # services via MPEG-DASH — this is expected, not a mismatch
+        if codec_data[track_info.codec].spatial and container == ContainerEnum.m4a:
+            return
+        actual_codec = self._CONTAINER_TO_CODEC.get(container)
+        self.print(
+            f'Codec mismatch: declared {codec_data[track_info.codec].pretty_name} '
+            f'but file is {container.name.upper()} — tags updated accordingly',
+            drop_level=1
+        )
+        if actual_codec:
+            track_info.different_codec = actual_codec
+        # Remove MQA-specific tags if the file is plain FLAC (not actually MQA)
+        if track_info.codec == CodecEnum.MQA and container == ContainerEnum.flac:
+            if getattr(track_info, 'tags', None) and getattr(track_info.tags, 'extra_tags', None):
+                for k in ('ENCODER', 'MQAENCODER', 'ORIGINALSAMPLERATE'):
+                    track_info.tags.extra_tags.pop(k, None)
+
     def _track_file_exists(self, loc: str) -> Optional[str]:
         """Return the existing file path if a track already exists at this location
         with any audio extension — catches FLAC files when loc is .m4a and vice versa.
@@ -541,14 +595,25 @@ class Downloader:
                                                        track_info=track_info)
 
     def _concurrent_download_tracks(self, track_list, download_args_list, concurrent_downloads, performance_summary_indent=0):
+        track_delay_min = self.global_settings['general'].get('inter_track_delay_min', 0)
+        track_delay_max = self.global_settings['general'].get('inter_track_delay_max', 0)
         if concurrent_downloads <= 1:
             results = []
             for i, args in enumerate(download_args_list):
                 try:
                     res = self.download_track(**args)
                     results.append((i, res, None))
+                    if hasattr(self.service, 'report_track_playback'):
+                        try:
+                            self.service.report_track_playback(args.get('track_id'))
+                        except Exception:
+                            pass
                 except Exception as e:
                     results.append((i, None, e))
+                if i < len(download_args_list) - 1 and track_delay_max > 0:
+                    delay = random.randint(track_delay_min, track_delay_max)
+                    self.print(f'  [~] Pausa {delay}s entre tracks...')
+                    time.sleep(delay)
             return results
 
         from utils.utils import create_aiohttp_session
@@ -581,21 +646,28 @@ class Downloader:
                     loc = self._create_track_location(args.get('album_location', ''), track_info, custom_format=custom_fmt, extra_template_data=extra_data, forced_total_discs=forced_discs)
 
                     existing_loc = await loop.run_in_executor(None, self._track_file_exists, loc)
+                    old_lower_quality_loc_async = None
                     if existing_loc:
-                        loc = existing_loc
-                        lrc_path = os.path.splitext(loc)[0] + '.lrc'
-                        if not await loop.run_in_executor(None, os.path.exists, lrc_path):
-                             lyrics_info = await loop.run_in_executor(None, self._get_lyrics, track_id, track_info)
-                             if lyrics_info and lyrics_info.synced:
-                                 try:
-                                     self.print(f'Saving missing synced lyrics to {os.path.basename(lrc_path)}...', drop_level=1)
-                                     with open(lrc_path, 'w', encoding='utf-8') as f:
-                                         f.write(lyrics_info.synced)
-                                 except Exception as e:
-                                     self.print(f'Failed to save synced lyrics: {e}', drop_level=1)
+                        new_ext = os.path.splitext(loc)[1].lower()
+                        existing_ext = os.path.splitext(existing_loc)[1].lower()
+                        if new_ext == '.flac' and existing_ext != '.flac':
+                            self.print(f'Existing {existing_ext[1:].upper()} → upgrading to FLAC...', drop_level=1)
+                            old_lower_quality_loc_async = existing_loc
+                        else:
+                            loc = existing_loc
+                            lrc_path = os.path.splitext(loc)[0] + '.lrc'
+                            if not await loop.run_in_executor(None, os.path.exists, lrc_path):
+                                lyrics_info = await loop.run_in_executor(None, self._get_lyrics, track_id, track_info)
+                                if lyrics_info and lyrics_info.synced:
+                                    try:
+                                        self.print(f'Saving missing synced lyrics to {os.path.basename(lrc_path)}...', drop_level=1)
+                                        with open(lrc_path, 'w', encoding='utf-8') as f:
+                                            f.write(lyrics_info.synced)
+                                    except Exception as e:
+                                        self.print(f'Failed to save synced lyrics: {e}', drop_level=1)
 
-                        await loop.run_in_executor(None, self._add_to_db, track_info, loc)
-                        return (index, track_name, "SKIPPED", None, None)
+                            await loop.run_in_executor(None, self._add_to_db, track_info, loc)
+                            return (index, track_name, "SKIPPED", None, None)
 
                 # --- LÓGICA DE REINTENTO (Restaurada) ---
                 download_info = None
@@ -624,6 +696,12 @@ class Downloader:
                 
                 if isinstance(res, tuple) and res[0]:
                     await loop.run_in_executor(None, self._add_to_db, track_info, res[0])
+                    if old_lower_quality_loc_async and old_lower_quality_loc_async != res[0]:
+                        try:
+                            if await loop.run_in_executor(None, os.path.exists, old_lower_quality_loc_async):
+                                await loop.run_in_executor(None, os.remove, old_lower_quality_loc_async)
+                        except Exception:
+                            pass
                     return (index, track_name, None, res[0], None)
                 
                 if res and isinstance(res, tuple) and res[0] is None and res[1] == "INVALID_URL":
@@ -644,7 +722,10 @@ class Downloader:
             async with create_aiohttp_session() as session:
                 semaphore = asyncio.Semaphore(concurrent_downloads)
                 async def bounded_download(i, a):
-                    async with semaphore: return await download_worker_async(session, i, a)
+                    async with semaphore:
+                        if track_delay_max > 0:
+                            await asyncio.sleep(random.randint(track_delay_min, track_delay_max))
+                        return await download_worker_async(session, i, a)
                 tasks = [bounded_download(i, a) for i, a in enumerate(download_args_list)]
                 symbols = self._get_status_symbols()
                 
@@ -771,12 +852,21 @@ class Downloader:
             
         filename_rel = format_template_advanced(format_string, data)
         ext = {
-            CodecEnum.FLAC: '.flac',
-            CodecEnum.MP3: '.mp3',
-            CodecEnum.AAC: '.m4a',
-            CodecEnum.ALAC: '.m4a',
-            CodecEnum.H264: '.mp4',
-            CodecEnum.H265: '.mp4'
+            CodecEnum.FLAC:   '.flac',
+            CodecEnum.MQA:    '.flac',
+            CodecEnum.MP3:    '.mp3',
+            CodecEnum.AAC:    '.m4a',
+            CodecEnum.HEAAC:  '.m4a',
+            CodecEnum.ALAC:   '.m4a',
+            CodecEnum.EAC3:   '.m4a',
+            CodecEnum.AC4:    '.m4a',
+            CodecEnum.AC3:    '.m4a',
+            CodecEnum.MHA1:   '.m4a',
+            CodecEnum.MHM1:   '.mp4',
+            CodecEnum.H264:   '.mp4',
+            CodecEnum.H265:   '.mp4',
+            CodecEnum.OPUS:   '.opus',
+            CodecEnum.VORBIS: '.ogg',
         }.get(track_info.codec, '.flac')
         if not filename_rel.lower().endswith(ext): filename_rel += ext
         
@@ -1108,21 +1198,22 @@ class Downloader:
                 '.ogg': ContainerEnum.ogg, '.wav': ContainerEnum.wav,
                 '.aiff': ContainerEnum.aiff, '.mp4': ContainerEnum.mp4
             }
-            container = container_map.get(file_extension, ContainerEnum.flac)
-            
+            container = self._detect_container_from_magic(final_loc) or container_map.get(file_extension, ContainerEnum.flac)
+            self._check_codec_container_match(track_info, container, is_video)
+
             # Tag
             # Calculate LRC path before getting lyrics to check if it exists
             lrc_path = os.path.splitext(final_loc)[0] + '.lrc'
             lrc_exists = os.path.exists(lrc_path)
-            
+
             if lrc_exists:
                  self.print(f'LRC file already exists: {os.path.basename(lrc_path)}. Skipping lyric download.', drop_level=1)
                  lyrics_info = None
             else:
                  lyrics_info = self._get_lyrics(track_id, track_info)
-            
+
             lyrics = (lyrics_info.embedded if lyrics_info else None) or ""
-            
+
             # Save synced lyrics to .lrc file
             if lyrics_info and lyrics_info.synced and not lrc_exists:
                 try:
@@ -1156,23 +1247,30 @@ class Downloader:
             return None
         loc = self._create_track_location(album_location, track_info, custom_format=custom_filename_format, extra_template_data=extra_template_data, forced_total_discs=forced_total_discs)
         existing_loc = self._track_file_exists(loc)
+        old_lower_quality_loc = None
         if existing_loc:
-            loc = existing_loc
-            lrc_path = os.path.splitext(loc)[0] + '.lrc'
-            
-            if not os.path.exists(lrc_path):
-                 self.print(f'Track exists but LRC missing. Checking for lyrics...', drop_level=1)
-                 lyrics_info = self._get_lyrics(track_id, track_info)
-                 if lyrics_info and lyrics_info.synced:
-                     try:
-                        self.print(f'Saving synced lyrics to {os.path.basename(lrc_path)}...', drop_level=1)
-                        with open(lrc_path, 'w', encoding='utf-8') as f:
-                            f.write(lyrics_info.synced)
-                     except Exception as e:
-                        self.print(f'Failed to save synced lyrics: {e}', drop_level=1)
-            
-            self._add_to_db(track_info, loc)
-            return "SKIPPED"
+            new_ext = os.path.splitext(loc)[1].lower()
+            existing_ext = os.path.splitext(existing_loc)[1].lower()
+            if new_ext == '.flac' and existing_ext != '.flac':
+                self.print(f'Existing {existing_ext[1:].upper()} → upgrading to FLAC...', drop_level=1)
+                old_lower_quality_loc = existing_loc
+            else:
+                loc = existing_loc
+                lrc_path = os.path.splitext(loc)[0] + '.lrc'
+
+                if not os.path.exists(lrc_path):
+                    self.print(f'Track exists but LRC missing. Checking for lyrics...', drop_level=1)
+                    lyrics_info = self._get_lyrics(track_id, track_info)
+                    if lyrics_info and lyrics_info.synced:
+                        try:
+                            self.print(f'Saving synced lyrics to {os.path.basename(lrc_path)}...', drop_level=1)
+                            with open(lrc_path, 'w', encoding='utf-8') as f:
+                                f.write(lyrics_info.synced)
+                        except Exception as e:
+                            self.print(f'Failed to save synced lyrics: {e}', drop_level=1)
+
+                self._add_to_db(track_info, loc)
+                return "SKIPPED"
         
         # --- LÓGICA DE REINTENTO (Sincrona) ---
         download_info = None
@@ -1221,12 +1319,13 @@ class Downloader:
                 '.ogg': ContainerEnum.ogg, '.wav': ContainerEnum.wav,
                 '.aiff': ContainerEnum.aiff
             }
-            container = container_map.get(file_extension, ContainerEnum.flac)
+            container = self._detect_container_from_magic(final_loc) or container_map.get(file_extension, ContainerEnum.flac)
+            self._check_codec_container_match(track_info, container, is_video)
             # Tag
             # Calculate LRC path before getting lyrics to check if it exists
             lrc_path = os.path.splitext(final_loc)[0] + '.lrc'
             lrc_exists = os.path.exists(lrc_path)
-            
+
             if lrc_exists:
                  self.print(f'LRC file already exists: {os.path.basename(lrc_path)}. Skipping lyric download.', drop_level=1)
                  lyrics_info = None
@@ -1236,7 +1335,7 @@ class Downloader:
             lyrics = ""
             if lyrics_info:
                 lyrics = lyrics_info.synced or lyrics_info.embedded or ""
-            
+
             # Save synced lyrics to .lrc file
             if lyrics_info and lyrics_info.synced and not lrc_exists:
                 try:
@@ -1255,6 +1354,12 @@ class Downloader:
 
             if artwork_path and os.path.exists(artwork_path): os.remove(artwork_path)
             self._add_to_db(track_info, final_loc)
+            if old_lower_quality_loc and old_lower_quality_loc != final_loc and os.path.exists(old_lower_quality_loc):
+                try:
+                    os.remove(old_lower_quality_loc)
+                    self.print(f'Removed old {os.path.splitext(old_lower_quality_loc)[1][1:].upper()} after FLAC upgrade.', drop_level=1)
+                except Exception:
+                    pass
             return final_loc
         return None
 

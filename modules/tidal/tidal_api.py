@@ -240,6 +240,18 @@ class TidalApi(object):
     def get_artist_videos(self, artist_id, limit=100, offset=0):
         return self._get('artists/' + str(artist_id) + '/videos', params={'limit': limit, 'offset': offset})
 
+    def post_events(self, events: list) -> bool:
+        try:
+            resp = self.s.post(
+                self.TIDAL_API_BASE + 'events',
+                headers={**self.sessions[self.default.name].auth_headers(), 'Content-Type': 'application/json'},
+                json={'events': events},
+                timeout=5
+            )
+            return resp.status_code in (200, 201, 202, 204)
+        except Exception:
+            return False
+
     def get_type_from_id(self, id_):
         result = None
         try:

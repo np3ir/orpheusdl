@@ -324,19 +324,29 @@ class AppleMusicApi:
             "user-initiated": True,
         }
 
-        response = self.session.post(
-            self.LICENSE_API_URL,
-            json=payload,
-        )
-        try:
-            response.raise_for_status()
-            response_dict = response.json()
-            widevine_license = response_dict.get("license")
-            assert widevine_license
-        except (
-            requests.HTTPError,
-            requests.exceptions.JSONDecodeError,
-            AssertionError,
-        ):
-            raise_response_exception(response)
-        return widevine_license
+        max_retries = 5
+        backoff = 10
+        for attempt in range(max_retries):
+            response = self.session.post(
+                self.LICENSE_API_URL,
+                json=payload,
+            )
+            if response.status_code == 429:
+                wait = int(response.headers.get("Retry-After", backoff))
+                print(f"        [gamdl] License API rate limited (429). Waiting {wait}s before retry ({attempt + 1}/{max_retries})...")
+                time.sleep(wait)
+                backoff = min(backoff * 2, 120)
+                continue
+            try:
+                response.raise_for_status()
+                response_dict = response.json()
+                widevine_license = response_dict.get("license")
+                assert widevine_license
+            except (
+                requests.HTTPError,
+                requests.exceptions.JSONDecodeError,
+                AssertionError,
+            ):
+                raise_response_exception(response)
+            return widevine_license
+        raise_response_exception(response)

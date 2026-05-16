@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Any, Optional
 import json
@@ -1046,6 +1047,7 @@ class ModuleInterface:
             # --- END DEBUG LOGGING ---
 
             # 5. Get decryption key
+            time.sleep(3)
             print(f"{indent_spaces}Getting decryption key...")
             
             # Handle legacy vs regular codec decryption and remuxing - they have different workflows

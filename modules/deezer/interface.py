@@ -227,13 +227,18 @@ class ModuleInterface:
             total_tracks = 0
             total_discs = 0
 
+        _dz_genres = [
+            g.get('GENRE_NAME') for g in a_data.get('GENRES', {}).get('data', [])
+            if g.get('GENRE_NAME')
+        ]
         alb_tags = {
             'total_tracks': total_tracks,
             'total_discs': total_discs,
             'upc': a_data['UPC'],
             'label': a_data['LABEL_NAME'],
             'album_artist': a_data['ART_NAME'],
-            'release_date': a_data.get('ORIGINAL_RELEASE_DATE') or a_data['PHYSICAL_RELEASE_DATE']
+            'release_date': a_data.get('ORIGINAL_RELEASE_DATE') or a_data['PHYSICAL_RELEASE_DATE'],
+            'genres': _dz_genres or None,
         }
 
         _deezer_type_map = {'0': 'ALBUM', '1': 'SINGLE', '2': 'EP', 0: 'ALBUM', 1: 'SINGLE', 2: 'EP'}

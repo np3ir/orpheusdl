@@ -43,6 +43,8 @@ class Orpheus:
                 "concurrent_downloads": 5,
                 "inter_album_delay_min": 0,
                 "inter_album_delay_max": 0,
+                "inter_track_delay_min": 0,
+                "inter_track_delay_max": 0,
                 "progress_bar": False
             },
             "artist_downloading":{

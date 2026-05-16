@@ -279,6 +279,7 @@ class Tags:
     description: Optional[str] = None
     comment: Optional[str] = None
     label: Optional[str] = None
+    bpm: Optional[int] = None
     extra_tags: Optional[dict] = field(default_factory=dict)
 
 

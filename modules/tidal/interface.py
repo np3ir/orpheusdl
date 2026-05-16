@@ -2,6 +2,8 @@ import base64
 import json
 import logging
 import re
+import time as _time
+import uuid
 import ffmpeg
 
 from datetime import datetime
@@ -153,6 +155,7 @@ class ModuleInterface:
 
         # only needed for region locked albums where the track is available but force_album_format is used
         self.album_cache = {}
+        self._playback_cache = {}  # track_id -> {duration, album_id}
 
         # load the Tidal session with all saved sessions (TV, Mobile Atmos, Mobile Default)
         self.session: TidalApi = TidalApi(sessions)
@@ -761,6 +764,12 @@ class ModuleInterface:
         if error is not None:
             track_info.error = f'Error: {error}'
 
+        self._playback_cache[str(track_id)] = {
+            'duration': track_data.get('duration', 210),
+            'album_id': album_id,
+            'is_video': is_video,
+        }
+
         return track_info
 
     @staticmethod
@@ -1026,6 +1035,46 @@ class ModuleInterface:
             return [CreditsInfo(sanitise_name(k), v) for k, v in credits_dict.items()]
         return None
 
+    def report_track_playback(self, track_id: str):
+        cached = self._playback_cache.get(str(track_id), {})
+        duration = cached.get('duration', 210)
+        album_id = cached.get('album_id', '')
+        is_video = cached.get('is_video', False)
+
+        now_ms = int(_time.time() * 1000)
+        start_ms = now_ms - int(duration * 1000)
+
+        source_type = 'VIDEO' if is_video else 'ALBUM'
+        product_type = 'video' if is_video else 'track'
+
+        event = {
+            'group': 'playback',
+            'name': 'playback_session',
+            'ts': now_ms,
+            'payload': {
+                'playbackSessionId': str(uuid.uuid4()),
+                'startTimestamp': start_ms,
+                'stopTimestamp': now_ms,
+                'duration': duration,
+                'sourceType': source_type,
+                'sourceId': str(album_id),
+                'productId': str(track_id),
+                'productType': product_type,
+                'requestedProductId': str(track_id),
+                'actualProductId': str(track_id),
+                'actualQuality': 'LOSSLESS',
+                'requestedQuality': 'LOSSLESS',
+                'assetPresentation': 'FULL',
+                'audioMode': 'STEREO',
+                'endReason': 'COMPLETE',
+            }
+        }
+
+        try:
+            self.session.post_events([event])
+        except Exception:
+            pass
+
     @staticmethod
     def convert_tags(track_data: dict, album_data: dict, mqa_file: MqaIdentifier = None) -> Tags:
         track_name = track_data.get('title')
@@ -1040,6 +1089,14 @@ class ModuleInterface:
                 'ORIGINALSAMPLERATE': str(mqa_file.original_sample_rate)
             }
 
+        _genres = album_data.get('genres')
+        if isinstance(_genres, list):
+            genres = [g.get('name') for g in _genres if isinstance(g, dict) and g.get('name')]
+        elif isinstance(_genres, str) and _genres:
+            genres = [_genres]
+        else:
+            genres = None
+
         return Tags(
             album_artist=album_data.get('artist').get('name') if album_data.get('artist') else None,
             track_number=track_data.get('trackNumber'),
@@ -1050,6 +1107,8 @@ class ModuleInterface:
             upc=album_data.get('upc'),
             release_date=album_data.get('releaseDate'),
             copyright=track_data.get('copyright'),
+            label=album_data.get('label'),
+            genres=genres or None,
             replay_gain=track_data.get('replayGain'),
             replay_peak=track_data.get('peak'),
             extra_tags=extra_tags
