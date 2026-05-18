@@ -608,12 +608,13 @@ class Downloader:
                             self.service.report_track_playback(args.get('track_id'))
                         except Exception:
                             pass
+                    # Solo pausar si realmente descargó (no si el archivo ya existía)
+                    if res != "SKIPPED" and i < len(download_args_list) - 1 and track_delay_max > 0:
+                        delay = random.randint(track_delay_min, track_delay_max)
+                        self.print(f'  [~] Pausa {delay}s entre tracks...')
+                        time.sleep(delay)
                 except Exception as e:
                     results.append((i, None, e))
-                if i < len(download_args_list) - 1 and track_delay_max > 0:
-                    delay = random.randint(track_delay_min, track_delay_max)
-                    self.print(f'  [~] Pausa {delay}s entre tracks...')
-                    time.sleep(delay)
             return results
 
         from utils.utils import create_aiohttp_session
@@ -648,14 +649,8 @@ class Downloader:
                     existing_loc = await loop.run_in_executor(None, self._track_file_exists, loc)
                     old_lower_quality_loc_async = None
                     if existing_loc:
-                        new_ext = os.path.splitext(loc)[1].lower()
-                        existing_ext = os.path.splitext(existing_loc)[1].lower()
-                        if new_ext == '.flac' and existing_ext != '.flac':
-                            self.print(f'Existing {existing_ext[1:].upper()} → upgrading to FLAC...', drop_level=1)
-                            old_lower_quality_loc_async = existing_loc
-                        else:
-                            loc = existing_loc
-                            lrc_path = os.path.splitext(loc)[0] + '.lrc'
+                        loc = existing_loc
+                        lrc_path = os.path.splitext(loc)[0] + '.lrc'
                             if not await loop.run_in_executor(None, os.path.exists, lrc_path):
                                 lyrics_info = await loop.run_in_executor(None, self._get_lyrics, track_id, track_info)
                                 if lyrics_info and lyrics_info.synced:
@@ -723,9 +718,12 @@ class Downloader:
                 semaphore = asyncio.Semaphore(concurrent_downloads)
                 async def bounded_download(i, a):
                     async with semaphore:
-                        if track_delay_max > 0:
+                        result = await download_worker_async(session, i, a)
+                        # Solo pausar si realmente descargó (no si era SKIPPED)
+                        status = result[2] if result and len(result) > 2 else None
+                        if track_delay_max > 0 and status not in ("SKIPPED", "ALREADY_IN_DB"):
                             await asyncio.sleep(random.randint(track_delay_min, track_delay_max))
-                        return await download_worker_async(session, i, a)
+                        return result
                 tasks = [bounded_download(i, a) for i, a in enumerate(download_args_list)]
                 symbols = self._get_status_symbols()
                 
@@ -886,16 +884,50 @@ class Downloader:
         return track_location
 
     @staticmethod
+    _RELEASE_TYPE_RE = re.compile(
+        r'\s*\((ALBUM|SINGLE|EP|COMPILATION|ANTHOLOGY)\)\s*$', re.IGNORECASE
+    )
+
+    @staticmethod
+    def _strip_release_type(name: str) -> str:
+        """Remove trailing release type suffix for comparison: '(ALBUM)', '(SINGLE)', etc."""
+        return MusicDownloader._RELEASE_TYPE_RE.sub('', name).strip()
+
     def _find_fuzzy_folder(parent_dir: str, folder_name: str) -> str:
         """Return an existing subfolder of parent_dir whose name matches folder_name
-        when diacritics are ignored. Returns folder_name unchanged if none found."""
+        when diacritics are ignored, OR when it differs only in release type suffix
+        (ALBUM vs SINGLE vs EP). Returns folder_name unchanged if none found."""
         norm = _normalize_for_compare(folder_name)
+        norm_stripped = _normalize_for_compare(
+            MusicDownloader._strip_release_type(folder_name)
+        )
+        _audio_exts = {'.m4a', '.flac', '.mp3', '.ogg', '.opus', '.wav', '.mp4'}
         try:
             if os.path.isdir(parent_dir):
                 for entry in os.listdir(parent_dir):
-                    if entry != folder_name and os.path.isdir(os.path.join(parent_dir, entry)):
-                        if _normalize_for_compare(entry) == norm:
-                            return entry
+                    if entry == folder_name:
+                        continue
+                    entry_path = os.path.join(parent_dir, entry)
+                    if not os.path.isdir(entry_path):
+                        continue
+                    entry_norm = _normalize_for_compare(entry)
+                    # Exact match (diacritics ignored)
+                    if entry_norm == norm:
+                        return entry
+                    # Same album, different release type — only reuse if has audio files
+                    entry_stripped = _normalize_for_compare(
+                        MusicDownloader._strip_release_type(entry)
+                    )
+                    if entry_stripped and entry_stripped == norm_stripped:
+                        try:
+                            has_audio = any(
+                                os.path.splitext(f)[1].lower() in _audio_exts
+                                for f in os.listdir(entry_path)
+                            )
+                            if has_audio:
+                                return entry
+                        except Exception:
+                            pass
         except Exception:
             pass
         return folder_name
@@ -1249,14 +1281,8 @@ class Downloader:
         existing_loc = self._track_file_exists(loc)
         old_lower_quality_loc = None
         if existing_loc:
-            new_ext = os.path.splitext(loc)[1].lower()
-            existing_ext = os.path.splitext(existing_loc)[1].lower()
-            if new_ext == '.flac' and existing_ext != '.flac':
-                self.print(f'Existing {existing_ext[1:].upper()} → upgrading to FLAC...', drop_level=1)
-                old_lower_quality_loc = existing_loc
-            else:
-                loc = existing_loc
-                lrc_path = os.path.splitext(loc)[0] + '.lrc'
+            loc = existing_loc
+            lrc_path = os.path.splitext(loc)[0] + '.lrc'
 
                 if not os.path.exists(lrc_path):
                     self.print(f'Track exists but LRC missing. Checking for lyrics...', drop_level=1)
@@ -1402,12 +1428,15 @@ class Downloader:
                 folder_format = parts[0].strip()
                 file_format = parts[1].strip()
                 
-                # Combinamos para crear la ruta completa del archivo
-                PLAYLIST_TRACK_STRUCTURE_LOCAL = f"{folder_format}/{file_format}"
-                
                 # Si es una ruta absoluta en Windows (E:/...), desactivamos la carpeta por defecto del programa
                 if platform.system() == 'Windows' and _DRIVE_RE.match(folder_format.split('/')[0]):
                     use_default_playlist_folder = False
+                    # Ruta absoluta: combinamos carpeta + archivo para la ruta completa del track
+                    PLAYLIST_TRACK_STRUCTURE_LOCAL = f"{folder_format}/{file_format}"
+                else:
+                    # Ruta relativa: album_location ya incluye la carpeta de la playlist,
+                    # solo necesitamos el formato del archivo para evitar duplicar la carpeta
+                    PLAYLIST_TRACK_STRUCTURE_LOCAL = file_format
                 
                 # Sobrescribimos temporalmente el formato de playlist para que use solo la parte de la carpeta
                 # (para crear M3U y portada en el lugar correcto)
@@ -1426,6 +1455,8 @@ class Downloader:
             # Calculamos la ruta de la carpeta de la playlist (sea por defecto o personalizada E:/)
             playlist_tags = {k: sanitise_name(v) for k, v in asdict(playlist_info).items()}
             playlist_tags['name'] = safe_playlist_name
+            playlist_tags['playlist_title'] = safe_playlist_name
+            playlist_tags['playlist_name'] = safe_playlist_name
             playlist_tags['explicit'] = Explicit(playlist_info.explicit)
 
             format_string = self.global_settings['formatting']['playlist_format']
