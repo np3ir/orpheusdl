@@ -378,6 +378,7 @@ class TrackInfo:
     cover_extra_kwargs: Optional[dict] = field(default_factory=dict)
     credits_extra_kwargs: Optional[dict] = field(default_factory=dict)
     lyrics_extra_kwargs: Optional[dict] = field(default_factory=dict)
+    type: Optional[str] = None
     error: Optional[str] = None
 
 

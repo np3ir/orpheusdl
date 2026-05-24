@@ -751,10 +751,20 @@ class ModuleInterface:
                         artists_list.append(_fn)
 
             # Strip " - Single" etc. from album name to match Tidal behaviour
+            _kind = (album_attrs.get('playParams', {}).get('kind') or 'album').lower()
             final_album_name = self._strip_release_suffix(
                 album_attrs.get('name') or album_name,
-                album_attrs.get('playParams', {}).get('kind') or ''
+                _kind
             )
+
+            # Determine release type for correct folder naming
+            if album_attrs.get('isCompilation'):
+                _track_type = 'COMPILATION'
+            elif album_attrs.get('isSingle') or album_attrs.get('trackCount') == 1:
+                _track_type = 'SINGLE'
+            else:
+                _type_map = {'album': 'ALBUM', 'single': 'SINGLE', 'ep': 'EP', 'compilation': 'COMPILATION'}
+                _track_type = _type_map.get(_kind, 'ALBUM')
 
             return TrackInfo(
                 name=name,
@@ -770,6 +780,7 @@ class ModuleInterface:
                 cover_url=cover_url,
                 explicit=explicit,
                 tags=tags_obj,
+                type=_track_type,
                 download_extra_kwargs=(
                     {'track_id': str(track_id), 'quality_tier': quality_tier, 'is_music_video': True, 'country': country}
                     if is_music_video else

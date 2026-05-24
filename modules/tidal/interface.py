@@ -129,13 +129,19 @@ class ModuleInterface:
 
                 # always try to refresh session
                 if not sessions[session_type].valid():
-                    sessions[session_type].refresh()
-                    # Save the refreshed session in the temporary settings
-                    saved_sessions[session_type] = sessions[session_type].get_storage()
-                    module_controller.temporary_settings_controller.set('sessions', saved_sessions)
+                    try:
+                        sessions[session_type].refresh()
+                        # Save the refreshed session in the temporary settings
+                        saved_sessions[session_type] = sessions[session_type].get_storage()
+                        module_controller.temporary_settings_controller.set('sessions', saved_sessions)
+                    except Exception:
+                        pass  # Will be caught below via get_subscription
 
                 # check for a valid subscription
-                subscription = self.check_subscription(sessions[session_type].get_subscription())
+                try:
+                    subscription = self.check_subscription(sessions[session_type].get_subscription())
+                except Exception:
+                    subscription = None
                 if not subscription:
                     confirm = input(' Do you want to relogin? [Y/n]: ')
 

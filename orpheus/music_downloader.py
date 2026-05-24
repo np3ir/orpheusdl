@@ -338,7 +338,7 @@ def prepare_template_data(track_info: TrackInfo = None, album_info: AlbumInfo = 
             'title_clean': clean_title,
             'title_trunc': _truncate(original_title, MAX_TITLE_LEN),
             'artist': main_artist,
-            'artists': " / ".join(str(a) for a in artists_list),
+            'artists': " / ".join(sorted(str(a) for a in artists_list)),
             'album_artist': album_artist_raw,
             'explicit': Explicit(track_info.explicit),
             'quality': f"({track_info.codec.name})" if track_info.codec else '',
@@ -651,18 +651,18 @@ class Downloader:
                     if existing_loc:
                         loc = existing_loc
                         lrc_path = os.path.splitext(loc)[0] + '.lrc'
-                            if not await loop.run_in_executor(None, os.path.exists, lrc_path):
-                                lyrics_info = await loop.run_in_executor(None, self._get_lyrics, track_id, track_info)
-                                if lyrics_info and lyrics_info.synced:
-                                    try:
-                                        self.print(f'Saving missing synced lyrics to {os.path.basename(lrc_path)}...', drop_level=1)
-                                        with open(lrc_path, 'w', encoding='utf-8') as f:
-                                            f.write(lyrics_info.synced)
-                                    except Exception as e:
-                                        self.print(f'Failed to save synced lyrics: {e}', drop_level=1)
+                        if not await loop.run_in_executor(None, os.path.exists, lrc_path):
+                            lyrics_info = await loop.run_in_executor(None, self._get_lyrics, track_id, track_info)
+                            if lyrics_info and lyrics_info.synced:
+                                try:
+                                    self.print(f'Saving missing synced lyrics to {os.path.basename(lrc_path)}...', drop_level=1)
+                                    with open(lrc_path, 'w', encoding='utf-8') as f:
+                                        f.write(lyrics_info.synced)
+                                except Exception as e:
+                                    self.print(f'Failed to save synced lyrics: {e}', drop_level=1)
 
-                            await loop.run_in_executor(None, self._add_to_db, track_info, loc)
-                            return (index, track_name, "SKIPPED", None, None)
+                        await loop.run_in_executor(None, self._add_to_db, track_info, loc)
+                        return (index, track_name, "SKIPPED", None, None)
 
                 # --- LÓGICA DE REINTENTO (Restaurada) ---
                 download_info = None
@@ -883,7 +883,6 @@ class Downloader:
 
         return track_location
 
-    @staticmethod
     _RELEASE_TYPE_RE = re.compile(
         r'\s*\((ALBUM|SINGLE|EP|COMPILATION|ANTHOLOGY)\)\s*$', re.IGNORECASE
     )
@@ -891,15 +890,16 @@ class Downloader:
     @staticmethod
     def _strip_release_type(name: str) -> str:
         """Remove trailing release type suffix for comparison: '(ALBUM)', '(SINGLE)', etc."""
-        return MusicDownloader._RELEASE_TYPE_RE.sub('', name).strip()
+        return Downloader._RELEASE_TYPE_RE.sub('', name).strip()
 
+    @staticmethod
     def _find_fuzzy_folder(parent_dir: str, folder_name: str) -> str:
         """Return an existing subfolder of parent_dir whose name matches folder_name
         when diacritics are ignored, OR when it differs only in release type suffix
         (ALBUM vs SINGLE vs EP). Returns folder_name unchanged if none found."""
         norm = _normalize_for_compare(folder_name)
         norm_stripped = _normalize_for_compare(
-            MusicDownloader._strip_release_type(folder_name)
+            Downloader._strip_release_type(folder_name)
         )
         _audio_exts = {'.m4a', '.flac', '.mp3', '.ogg', '.opus', '.wav', '.mp4'}
         try:
@@ -916,7 +916,7 @@ class Downloader:
                         return entry
                     # Same album, different release type — only reuse if has audio files
                     entry_stripped = _normalize_for_compare(
-                        MusicDownloader._strip_release_type(entry)
+                        Downloader._strip_release_type(entry)
                     )
                     if entry_stripped and entry_stripped == norm_stripped:
                         try:
@@ -1272,6 +1272,9 @@ class Downloader:
         quality_tier = QualityEnum[self.global_settings['general']['download_quality'].upper()]
         codec_options = CodecOptions(spatial_codecs=self.global_settings['codecs']['spatial_codecs'], proprietary_codecs=self.global_settings['codecs']['proprietary_codecs'])
         track_info = self.service.get_track_info(track_id, quality_tier, codec_options, **extra_kwargs)
+        if track_info is None:
+            self.print(f'Error: could not get track info for {track_id}', drop_level=1)
+            return None
         if forced_total_discs: track_info.tags.total_discs = forced_total_discs
         is_video = track_info.codec in [CodecEnum.H264, CodecEnum.H265]
         if getattr(track_info, 'error', None):
@@ -1284,19 +1287,19 @@ class Downloader:
             loc = existing_loc
             lrc_path = os.path.splitext(loc)[0] + '.lrc'
 
-                if not os.path.exists(lrc_path):
-                    self.print(f'Track exists but LRC missing. Checking for lyrics...', drop_level=1)
-                    lyrics_info = self._get_lyrics(track_id, track_info)
-                    if lyrics_info and lyrics_info.synced:
-                        try:
-                            self.print(f'Saving synced lyrics to {os.path.basename(lrc_path)}...', drop_level=1)
-                            with open(lrc_path, 'w', encoding='utf-8') as f:
-                                f.write(lyrics_info.synced)
-                        except Exception as e:
-                            self.print(f'Failed to save synced lyrics: {e}', drop_level=1)
+            if not os.path.exists(lrc_path):
+                self.print(f'Track exists but LRC missing. Checking for lyrics...', drop_level=1)
+                lyrics_info = self._get_lyrics(track_id, track_info)
+                if lyrics_info and lyrics_info.synced:
+                    try:
+                        self.print(f'Saving synced lyrics to {os.path.basename(lrc_path)}...', drop_level=1)
+                        with open(lrc_path, 'w', encoding='utf-8') as f:
+                            f.write(lyrics_info.synced)
+                    except Exception as e:
+                        self.print(f'Failed to save synced lyrics: {e}', drop_level=1)
 
-                self._add_to_db(track_info, loc)
-                return "SKIPPED"
+            self._add_to_db(track_info, loc)
+            return "SKIPPED"
         
         # --- LÓGICA DE REINTENTO (Sincrona) ---
         download_info = None
