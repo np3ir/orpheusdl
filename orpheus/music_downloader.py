@@ -78,6 +78,22 @@ MAX_ARTISTS_LEN = 100
 MAX_TITLE_LEN = 150
 ASCII_ONLY = False
 
+# Max artists rendered in an on-disk name before the tail collapses into
+# "& others". Compilation tracks can list 20+ artists which, joined into the
+# filename, blow past Windows MAX_PATH (260 chars) and make the file
+# unopenable in players that aren't long-path-aware. ALL artists are still
+# written to the ARTIST tag (orpheus/tagging.py) — this only shortens the name.
+MAX_ARTISTS_IN_NAME = 3
+OTHERS_SUFFIX = " & others"
+
+
+def _join_artists_capped(names, separator=" / ", limit=MAX_ARTISTS_IN_NAME):
+    """Join artist names, collapsing the tail into '& others' past `limit`."""
+    names = [str(n) for n in names if n]
+    if len(names) <= limit:
+        return separator.join(names)
+    return separator.join(names[:limit]) + OTHERS_SUFFIX
+
 _WIN_FORBIDDEN_RE = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 _DRIVE_RE = re.compile(r"^[A-Za-z]:$")
 
@@ -338,7 +354,7 @@ def prepare_template_data(track_info: TrackInfo = None, album_info: AlbumInfo = 
             'title_clean': clean_title,
             'title_trunc': _truncate(original_title, MAX_TITLE_LEN),
             'artist': main_artist,
-            'artists': " / ".join(sorted(str(a) for a in artists_list)),
+            'artists': _join_artists_capped(artists_list),
             'album_artist': album_artist_raw,
             'explicit': Explicit(track_info.explicit),
             'quality': f"({track_info.codec.name})" if track_info.codec else '',
