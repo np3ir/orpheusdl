@@ -492,6 +492,7 @@ class ModuleInterface:
         _full_release_date = _raw_release_date[:10] if len(_raw_release_date) >= 10 else _raw_release_date
 
         return AlbumInfo(
+            id=album_id,
             name=album_data.get('title'),
             release_year=release_year,
             release_date=_full_release_date or None,

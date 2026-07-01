@@ -742,13 +742,17 @@ class ModuleInterface:
                 r'[\(\[]\s*(?:feat|ft|fea|featuring|with|con)\.?\s+([^\)\]]+)[\)\]]',
                 name, re.IGNORECASE
             )
+            _feat_added = []
             if _feat_match:
                 _feat_str = _feat_match.group(1).strip()
                 _feat_names = re.split(r'\s*(?:[&,+]| y | and )\s*', _feat_str)
                 for _fn in _feat_names:
                     _fn = _fn.strip()
                     if _fn and not any(_fn.lower() == _a.lower() for _a in artists_list):
-                        artists_list.append(_fn)
+                        _feat_added.append(_fn)
+
+            # principal+feat ordenado (paridad tiddl/Orpheus-Deezer/deemix): sorted(MAIN) + sorted(FEATURED)
+            artists_list = sorted(artists_list) + sorted(_feat_added)
 
             # Strip " - Single" etc. from album name to match Tidal behaviour
             _kind = (album_attrs.get('playParams', {}).get('kind') or 'album').lower()

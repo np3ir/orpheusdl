@@ -194,7 +194,18 @@ class DeezerAPI:
             'track_tokens': [track_token]
         }
         resp = self.s.post('https://media.deezer.com/v1/get_url', json=json).json()
-        return resp['data'][0]['media'][0]['sources'][0]['url']
+        # Error claro en vez de KeyError('data'): Deezer devuelve {'errors':[...]} cuando
+        # la cuenta no tiene derechos (code 1002 = soft-block/streaming off) o el track no esta disponible.
+        if resp.get('errors'):
+            raise self.exception(f"Deezer: {resp['errors'][0].get('message', 'error')}")
+        data = resp.get('data') or []
+        if not data or data[0].get('errors'):
+            msg = data[0]['errors'][0].get('message') if (data and data[0].get('errors')) else 'sin derechos de streaming / track no disponible'
+            raise self.exception(f"Deezer: {msg}")
+        media = data[0].get('media') or []
+        if not media:
+            raise self.exception("Deezer: sin media (cuenta sin derechos o track no disponible)")
+        return media[0]['sources'][0]['url']
     
    
     def _get_blowfish_key(self, track_id):

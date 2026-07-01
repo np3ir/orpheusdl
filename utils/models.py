@@ -193,6 +193,7 @@ class DownloadTypeEnum(Flag):
     playlist = auto()
     artist = auto()
     album = auto()
+    label = auto()
 
 
 @dataclass
@@ -209,6 +210,7 @@ class QualityEnum(Flag):
     HIGH = auto()
     LOSSLESS = auto()
     HIFI = auto()
+    ATMOS = auto()
 
 
 @dataclass
@@ -280,6 +282,7 @@ class Tags:
     comment: Optional[str] = None
     label: Optional[str] = None
     bpm: Optional[int] = None
+    track_url: Optional[str] = None
     extra_tags: Optional[dict] = field(default_factory=dict)
 
 
@@ -323,6 +326,8 @@ class AlbumInfo:
     type: Optional[str] = None
     release_date: Optional[str] = None
     track_extra_kwargs: Optional[dict] = field(default_factory=dict)
+    album_artist: Optional[list] = None
+    expected_track_count: Optional[int] = None
 
 
 @dataclass

@@ -424,3 +424,12 @@ async def download_to_temp_async(session, url, headers={}, extension='', enable_
     location = create_temp_filename() + (('.' + extension) if extension else '')
     await download_file_async(session, url, location, headers=headers, enable_progress_bar=enable_progress_bar, indent_level=indent_level)
     return location
+
+
+def open_url_in_browser(url):
+    """Open a URL in the user's default web browser (used by modules for OAuth login flows)."""
+    import webbrowser
+    try:
+        return webbrowser.open(url)
+    except Exception:
+        return False

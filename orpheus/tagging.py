@@ -209,29 +209,12 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
     if hasattr(track_info, 'tags') and track_info.tags and hasattr(track_info.tags, 'album_artist') and track_info.tags.album_artist:
         tagger['albumartist'] = str(track_info.tags.album_artist)
     
-    # Track number
+    # Track / disc number — solo número, sin totales (parity tiddl: trkn/disk=(n,0), sin TRACKTOTAL/DISCTOTAL)
     if hasattr(track_info, 'tags') and track_info.tags:
-        if container == ContainerEnum.m4a or container == ContainerEnum.mp3:
-            if hasattr(track_info.tags, 'track_number') and track_info.tags.track_number:
-                if hasattr(track_info.tags, 'total_tracks') and track_info.tags.total_tracks:
-                    tagger['tracknumber'] = str(track_info.tags.track_number) + '/' + str(track_info.tags.total_tracks)
-                else:
-                    tagger['tracknumber'] = str(track_info.tags.track_number)
-            
-            if hasattr(track_info.tags, 'disc_number') and track_info.tags.disc_number:
-                if hasattr(track_info.tags, 'total_discs') and track_info.tags.total_discs:
-                    tagger['discnumber'] = str(track_info.tags.disc_number) + '/' + str(track_info.tags.total_discs)
-                else:
-                    tagger['discnumber'] = str(track_info.tags.disc_number)
-        else:
-            if hasattr(track_info.tags, 'track_number') and track_info.tags.track_number:
-                tagger['tracknumber'] = str(track_info.tags.track_number)
-            if hasattr(track_info.tags, 'total_tracks') and track_info.tags.total_tracks:
-                tagger['totaltracks'] = str(track_info.tags.total_tracks)
-            if hasattr(track_info.tags, 'disc_number') and track_info.tags.disc_number:
-                tagger['discnumber'] = str(track_info.tags.disc_number)
-            if hasattr(track_info.tags, 'total_discs') and track_info.tags.total_discs:
-                tagger['totaldiscs'] = str(track_info.tags.total_discs)
+        if hasattr(track_info.tags, 'track_number') and track_info.tags.track_number:
+            tagger['tracknumber'] = str(track_info.tags.track_number)
+        if hasattr(track_info.tags, 'disc_number') and track_info.tags.disc_number:
+            tagger['discnumber'] = str(track_info.tags.disc_number)
     
     # Date
     if hasattr(track_info, 'tags') and track_info.tags and hasattr(track_info.tags, 'release_date') and track_info.tags.release_date:
@@ -240,22 +223,13 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
             tagger.tags._EasyID3__id3._DictProxy__dict['TDAT'] = TDAT(encoding=3, text=release_dd_mm)
             tagger['date'] = str(track_info.release_year) if hasattr(track_info, 'release_year') and track_info.release_year else track_info.tags.release_date[:4]
         else:
-            tagger['date'] = str(track_info.tags.release_date)
+            tagger['date'] = str(track_info.tags.release_date)[:4]
     elif hasattr(track_info, 'release_year') and track_info.release_year:
         tagger['date'] = str(track_info.release_year)
     
     # Copyright
     if hasattr(track_info, 'tags') and track_info.tags and hasattr(track_info.tags, 'copyright') and track_info.tags.copyright:
         tagger['copyright'] = str(track_info.tags.copyright)
-    
-    # Explicit
-    if hasattr(track_info, 'explicit') and track_info.explicit is not None:
-        if container == ContainerEnum.m4a:
-            tagger['explicit'] = b'\x01' if track_info.explicit else b'\x02'
-        elif container == ContainerEnum.mp3:
-            tagger['Rating'] = 'Explicit' if track_info.explicit else 'Clean'
-        else:
-            tagger['Rating'] = 'Explicit' if track_info.explicit else 'Clean'
     
     # Genre
     if hasattr(track_info, 'tags') and track_info.tags and hasattr(track_info.tags, 'genres') and track_info.tags.genres:
@@ -274,20 +248,6 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
     # ISRC
     if hasattr(track_info, 'tags') and track_info.tags and hasattr(track_info.tags, 'isrc') and track_info.tags.isrc:
         tagger['isrc'] = track_info.tags.isrc.encode() if container == ContainerEnum.m4a else track_info.tags.isrc
-    
-    # UPC
-    if hasattr(track_info, 'tags') and track_info.tags and hasattr(track_info.tags, 'upc') and track_info.tags.upc:
-        tagger['UPC'] = track_info.tags.upc.encode() if container == ContainerEnum.m4a else track_info.tags.upc
-    
-    # Label
-    if hasattr(track_info, 'tags') and track_info.tags and hasattr(track_info.tags, 'label') and track_info.tags.label:
-        if container in {ContainerEnum.flac, ContainerEnum.ogg}:
-            tagger['Label'] = track_info.tags.label
-        elif container == ContainerEnum.mp3:
-            tagger.tags._EasyID3__id3._DictProxy__dict['TPUB'] = TPUB(encoding=3, text=track_info.tags.label)
-        elif container == ContainerEnum.m4a:
-            tagger.RegisterTextKey('label', '\xa9pub')
-            tagger['label'] = track_info.tags.label
     
     # Description
     if hasattr(track_info, 'tags') and track_info.tags and hasattr(track_info.tags, 'description') and track_info.tags.description and container == ContainerEnum.m4a:
@@ -342,13 +302,6 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
                 encoding=3, lang=u'eng', text=embedded_lyrics)
         else:
             tagger['lyrics'] = embedded_lyrics
-    
-    # Replay gain
-    if hasattr(track_info, 'tags') and track_info.tags:
-        if hasattr(track_info.tags, 'replay_gain') and hasattr(track_info.tags, 'replay_peak'):
-            if track_info.tags.replay_gain and track_info.tags.replay_peak and container != ContainerEnum.m4a:
-                tagger['REPLAYGAIN_TRACK_GAIN'] = str(track_info.tags.replay_gain)
-                tagger['REPLAYGAIN_TRACK_PEAK'] = str(track_info.tags.replay_peak)
     
     # Handle cover art
     if image_path and os.path.exists(image_path):

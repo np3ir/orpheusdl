@@ -630,6 +630,7 @@ class Downloader:
                         self.print(f'  [~] Pausa {delay}s entre tracks...')
                         time.sleep(delay)
                 except Exception as e:
+                    self.print(f'  [X] Error en track: {e!r}', drop_level=1)
                     results.append((i, None, e))
             return results
 
@@ -1069,6 +1070,10 @@ class Downloader:
 
     def download_album(self, album_id, artist_name='', path=None, indent_level=1, extra_kwargs=None):
         self.set_indent_number(indent_level)
+        # Tidal inyecta un pseudo-album 'videos_<artist>' (name "Music Videos") por cada artista.
+        # Con download_videos desactivado, saltarlo entero evita crear la carpeta vacia "() Music Videos".
+        if not self.global_settings['general'].get('download_videos', True) and str(album_id).startswith('videos_'):
+            return []
         self.print(f'Fetching album data...')
         album_info: AlbumInfo = self.service.get_album_info(album_id, **(extra_kwargs or {}))
         if not album_info: return []
@@ -1181,10 +1186,21 @@ class Downloader:
         total_albums = len(artist_info.albums)
         for index, album_item in enumerate(artist_info.albums, start=1):
             self.print(f'Album {index}/{total_albums}')
-            album_id = album_item.id if hasattr(album_item, 'id') else str(album_item)
+            # album_item may be an object with .id, a dict {'id': ...} (qobuz module), or a plain id string
+            if hasattr(album_item, 'id'):
+                album_id = album_item.id
+            elif isinstance(album_item, dict):
+                album_id = album_item.get('id') or album_item.get('album_id')
+            else:
+                album_id = str(album_item)
 
             # Pasamos self.path en lugar de artist_path para evitar duplicidad en ALBUMES
-            self.download_album(album_id, artist_name=artist_info.name, path=self.path, indent_level=2, extra_kwargs=artist_info.album_extra_kwargs)
+            # Skip individual albums that fail (e.g. Qobuz 404 for delisted/region-locked
+            # releases) so one bad album doesn't abort the whole artist download.
+            try:
+                self.download_album(album_id, artist_name=artist_info.name, path=self.path, indent_level=2, extra_kwargs=artist_info.album_extra_kwargs)
+            except Exception as e:
+                self.print(f'  [X] Álbum {album_id} omitido (error: {e})')
 
             if index < total_albums and delay_max > 0:
                 delay = random.randint(delay_min, delay_max)
@@ -1316,21 +1332,26 @@ class Downloader:
 
             self._add_to_db(track_info, loc)
             return "SKIPPED"
-        
-        # --- LÓGICA DE REINTENTO (Sincrona) ---
+
+        # Anuncio por pista (visible aunque progress_bar este off)
+        try:
+            _td = int(getattr(track_info.tags, 'total_discs', 0) or 0)
+            _disc = f"[D{getattr(track_info.tags, 'disc_number', 1)}] " if _td > 1 else ""
+        except Exception:
+            _disc = ""
+        _pos = f"{track_index}/{number_of_tracks}" if number_of_tracks else f"{track_index}"
+        self.print(f'Downloading {_pos}: {_disc}{" / ".join(track_info.artists)} - {track_info.name}', drop_level=1)
+
+        # --- DESCARGA ---
         download_info = None
         if hasattr(track_info, 'download_extra_kwargs') and track_info.download_extra_kwargs:
-            try:
-                download_info = self.service.get_track_download(**track_info.download_extra_kwargs)
-            except DownloadError:
-                raise
-            except Exception:
-                download_info = None
-
-        if not download_info:
+            # Módulos estilo download_extra_kwargs (Deezer/Tidal): llamar directo y dejar
+            # que el error real propague. NO usar el fallback posicional (firma estilo Apple),
+            # que enmascaraba el fallo con "missing required positional arguments".
+            download_info = self.service.get_track_download(**track_info.download_extra_kwargs)
+        else:
             download_kwargs = extra_kwargs.copy()
             if 'data' in download_kwargs: download_kwargs.pop('data')
-
             try:
                 download_info = self.service.get_track_download(track_id, quality_tier, codec_options=codec_options, **download_kwargs)
             except TypeError:

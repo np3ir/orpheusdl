@@ -183,7 +183,7 @@ class ModuleInterface:
             album_id = t_data['ALB_ID'],
             album = t_data['ALB_TITLE'],
             artists = (
-                [a['ART_NAME'] for a in sorted(t_data['ARTISTS'], key=lambda x: x.get('ROLE_ID', 0))]
+                [a['ART_NAME'] for a in sorted(t_data['ARTISTS'], key=lambda x: (x.get('ROLE_ID', 0) != 0, x.get('ART_NAME') or ''))]
                 if 'ARTISTS' in t_data else [t_data['ART_NAME']]
             ),
             tags = tags,
