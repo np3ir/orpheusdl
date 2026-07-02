@@ -293,9 +293,14 @@ class ModuleInterface:
     def get_artist_info(self, artist_id: str, get_credited_albums: bool, artist_name = None) -> ArtistInfo:
         name = artist_name if artist_name else self.session.get_artist_name(artist_id)
 
+        albums = self.session.get_artist_album_ids(artist_id, 0, -1, get_credited_albums)
+        # Sort oldest-release-first (undated releases sort last) instead of
+        # trusting whatever order the discography endpoint returns.
+        albums.sort(key=lambda a: a.get('release_date') or '9999-99-99')
+
         return ArtistInfo(
             name = name,
-            albums = self.session.get_artist_album_ids(artist_id, 0, -1, get_credited_albums),
+            albums = [str(a['id']) for a in albums],
         )
 
     def get_track_credits(self, track_id: str, data={}):

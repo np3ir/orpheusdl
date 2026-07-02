@@ -357,15 +357,27 @@ class ModuleInterface:
                 credit_albums = [item.get('item').get('album') for item in items]
                 self.session.default = SessionType.TV
 
-        # use set to filter out duplicate album ids
-        albums = {str(album.get('id')) for album in artist_albums + artist_singles + credit_albums}
+        # Dedup by id (keep first occurrence) — a plain set was used before, but sets
+        # don't preserve insertion order, so the download order was effectively random
+        # on every run. Sort oldest-release-first instead (undated releases sort last).
+        unique_albums = {}
+        for album in artist_albums + artist_singles + credit_albums:
+            aid = str(album.get('id'))
+            if aid not in unique_albums:
+                unique_albums[aid] = album
 
-        # Add videos "album"
-        albums.add(f'videos_{artist_id}')
+        sorted_albums = sorted(
+            unique_albums.values(),
+            key=lambda a: (a.get('releaseDate') or '9999-99-99', a.get('title') or '')
+        )
+        albums = [str(a.get('id')) for a in sorted_albums]
+
+        # Add videos "album" (no release date to sort by — keep it last)
+        albums.append(f'videos_{artist_id}')
 
         return ArtistInfo(
             name=artist_data.get('name'),
-            albums=list(albums),
+            albums=albums,
             album_extra_kwargs={'data': {str(album.get('id')): album for album in artist_albums + artist_singles}}
         )
 

@@ -755,6 +755,20 @@ class ModuleInterface:
                 if aid in a_meta:
                     albums_raw[idx].update(a_meta[aid])
 
+        # Sort oldest-release-first (undated/non-dict entries sort last) instead
+        # of trusting whatever order the artist page happens to list albums in.
+        def _album_sort_key(album):
+            if not isinstance(album, dict):
+                return '9999-99-99'
+            return (
+                album.get('release_date_original')
+                or album.get('released_at')
+                or album.get('release_date')
+                or '9999-99-99'
+            )
+
+        albums_raw.sort(key=_album_sort_key)
+
         albums_out = []
 
         for album in albums_raw:
@@ -876,6 +890,20 @@ class ModuleInterface:
                 aid = str(albums_raw[idx]['id'])
                 if aid in a_meta:
                     albums_raw[idx].update(a_meta[aid])
+
+        # Sort oldest-release-first (undated/non-dict entries sort last) instead
+        # of trusting whatever order the label page happens to list albums in.
+        def _album_sort_key(album):
+            if not isinstance(album, dict):
+                return '9999-99-99'
+            return (
+                album.get('release_date_original')
+                or album.get('released_at')
+                or album.get('release_date')
+                or '9999-99-99'
+            )
+
+        albums_raw.sort(key=_album_sort_key)
 
         albums_out = []
 

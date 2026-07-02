@@ -1499,7 +1499,7 @@ class ModuleInterface:
         return result
 
     def _fetch_albums_for_storefront(self, artist_id: str, storefront: str) -> dict:
-        """Fetch all album IDs for an artist in one storefront. Returns {album_id: storefront}."""
+        """Fetch all album IDs for an artist in one storefront. Returns {album_id: (storefront, release_date)}."""
         result = {}
         try:
             url = f'https://amp-api.music.apple.com/v1/catalog/{storefront}/artists/{artist_id}/albums'
@@ -1509,7 +1509,7 @@ class ModuleInterface:
                 return result
             data = resp.json()
             for album in data.get('data', []):
-                result[album['id']] = storefront
+                result[album['id']] = (storefront, (album.get('attributes') or {}).get('releaseDate'))
             # Paginate
             next_path = data.get('next')
             while next_path:
@@ -1520,7 +1520,7 @@ class ModuleInterface:
                     break
                 data = resp.json()
                 for album in data.get('data', []):
-                    result.setdefault(album['id'], storefront)
+                    result.setdefault(album['id'], (storefront, (album.get('attributes') or {}).get('releaseDate')))
                 next_path = data.get('next')
         except Exception:
             pass
@@ -1559,11 +1559,14 @@ class ModuleInterface:
         with ThreadPoolExecutor(max_workers=25) as executor:
             futures = {executor.submit(self._fetch_albums_for_storefront, artist_id, sf): sf for sf in ordered}
             for future in as_completed(futures):
-                for album_id, sf in future.result().items():
-                    all_albums.setdefault(album_id, sf)
+                for album_id, (sf, release_date) in future.result().items():
+                    all_albums.setdefault(album_id, (sf, release_date))
 
-        album_ids = list(all_albums.keys())
-        storefront_map = dict(all_albums)
+        # as_completed() resolves in whatever order the network requests happen to
+        # finish, so without an explicit sort the album order was effectively random
+        # from run to run. Sort oldest-release-first (undated releases sort last).
+        album_ids = sorted(all_albums.keys(), key=lambda aid: all_albums[aid][1] or '9999-99-99')
+        storefront_map = {aid: sf for aid, (sf, _release_date) in all_albums.items()}
         print(f'        Found {len(album_ids)} unique albums across all storefronts.')
 
         return ArtistInfo(
