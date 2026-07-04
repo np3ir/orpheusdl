@@ -47,15 +47,26 @@ def _clean_title(title: str, artists: list) -> str:
 
     artists_set = {_norm(a) for a in (artists or []) if a}
 
+    def _known(name_norm: str) -> bool:
+        if len(name_norm) <= 2:
+            return False
+        if name_norm in artists_set:
+            return True
+        # Some tracks have a single MAIN artist whose name is already a
+        # compound "Artist feat. X, Y & Z" string (Tidal data quirk — no
+        # separate FEATURED entries at all). In that case X/Y/Z are
+        # substrings of that one artist entry, not separate set members.
+        return any(name_norm in a for a in artists_set)
+
     def _feat_in_artists(inner: str) -> bool:
         # First: try the whole string (handles duos like "Zion & Lennox" whose name contains &)
         inner_norm = _norm(inner.strip())
-        if inner_norm and len(inner_norm) > 2 and inner_norm in artists_set:
+        if inner_norm and _known(inner_norm):
             return True
         # Second: split by separators and check each name individually (e.g. "Ozuna & Wisin")
         feat_names = re.split(r'\s*[,&]\s*|\s+(?:and|y)\s+', inner.strip(), flags=re.IGNORECASE)
         if len(feat_names) > 1:
-            return all(len(_norm(n)) > 2 and _norm(n) in artists_set for n in feat_names)
+            return all(_known(_norm(n)) for n in feat_names)
         return False
 
     match = _RE_FEAT_PARENS.search(title)
