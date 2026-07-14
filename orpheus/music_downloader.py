@@ -97,6 +97,13 @@ def _join_artists_capped(names, separator=" / ", limit=MAX_ARTISTS_IN_NAME):
 _WIN_FORBIDDEN_RE = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 _DRIVE_RE = re.compile(r"^[A-Za-z]:$")
 
+# Unicode dash/hyphen lookalikes -> ASCII hyphen (matches tiddl), so the same
+# release names identically regardless of source.
+_DASH_TO_HYPHEN = str.maketrans({
+    "‐": "-", "‑": "-", "‒": "-", "–": "-",
+    "—": "-", "―": "-", "−": "-",
+})
+
 _RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
     *{f"COM{i}" for i in range(1, 10)},
@@ -178,6 +185,7 @@ def sanitise_name(path: str) -> str:
         return ""
     s = str(path).strip()
     s = unicodedata.normalize("NFC", s)
+    s = s.translate(_DASH_TO_HYPHEN)  # normalize Unicode dash lookalikes to "-"
     s = "".join(ch for ch in s if unicodedata.category(ch) not in ("Cc", "Cf", "Cs"))
     replacements = {
         "/": "／", "\\": "＼", ":": "：", "*": "＊",
