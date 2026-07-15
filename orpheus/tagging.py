@@ -33,6 +33,29 @@ _RE_FEAT_DASH = re.compile(
     re.IGNORECASE
 )
 
+def _normalize_artist_name(name: str) -> str:
+    """Clave de comparación de artistas: sin acentos, sin mayúsculas, espacios
+    colapsados — "Rosalia" == "ROSALÍA". Paridad con dedup_artists de
+    music_downloader.py (local aquí para evitar import circular)."""
+    decomposed = unicodedata.normalize("NFKD", str(name))
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return " ".join(stripped.casefold().split())
+
+
+def dedup_artists(names, exclude=()):
+    """Quita artistas duplicados (por _normalize_artist_name), preservando el
+    orden y la PRIMERA grafía vista."""
+    seen = {_normalize_artist_name(n) for n in exclude}
+    out = []
+    for n in names:
+        key = _normalize_artist_name(n)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(n)
+    return out
+
+
 def _clean_title(title: str, artists: list) -> str:
     """Remove feat. from title if the featured artist is already in the artists list.
     Handles both parenthetical (feat. X) and dash separator (- feat. X) patterns.
@@ -205,10 +228,12 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
     if titulo_clean:
         tagger['title'] = str(titulo_clean)
 
-    # Artist — joined with " / " (same separator as filename)
+    # Artist — joined with " / " (same separator as filename).
+    # Dedup normalizado (acentos/mayúsculas) para no repetir el mismo artista
+    # con distinta grafía (paridad tiddl/streamrip).
     if artistas_original:
         if isinstance(artistas_original, list):
-            artist_list = [str(a) for a in artistas_original if a]
+            artist_list = dedup_artists(str(a) for a in artistas_original if a)
         else:
             artist_list = [str(artistas_original)]
         tagger['artist'] = artist_list

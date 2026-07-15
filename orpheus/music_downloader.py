@@ -94,6 +94,29 @@ def _join_artists_capped(names, separator=" / ", limit=MAX_ARTISTS_IN_NAME):
         return separator.join(names)
     return separator.join(names[:limit]) + OTHERS_SUFFIX
 
+
+def normalize_artist_name(name: str) -> str:
+    """Comparison key for artist names: accent-insensitive, case-insensitive,
+    whitespace-collapsed — "Rosalia" and "ROSALÍA" count as the same artist.
+    Parity with tiddl-elvigilante / streamrip-elvigilante dedup_artists."""
+    decomposed = unicodedata.normalize("NFKD", str(name))
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return " ".join(stripped.casefold().split())
+
+
+def dedup_artists(names, exclude=()):
+    """Drop duplicate artist names (per normalize_artist_name), keeping order
+    and the FIRST spelling seen."""
+    seen = {normalize_artist_name(n) for n in exclude}
+    out = []
+    for n in names:
+        key = normalize_artist_name(n)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(n)
+    return out
+
 _WIN_FORBIDDEN_RE = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 _DRIVE_RE = re.compile(r"^[A-Za-z]:$")
 
@@ -328,7 +351,9 @@ def prepare_template_data(track_info: TrackInfo = None, album_info: AlbumInfo = 
         flat_artists = []
         for a in artists_list:
             flat_artists.extend(re.split(r'\s*[／/]\s*', str(a)))
-        artists_list = [a for a in flat_artists if a]
+        # Dedup normalizado (acentos/mayúsculas): el mismo artista con distinta
+        # grafía cuenta una sola vez (paridad tiddl/streamrip).
+        artists_list = dedup_artists(a for a in flat_artists if a)
         main_artist = artists_list[0] if artists_list else "Unknown Artist"
         original_title = track_info.name
         
