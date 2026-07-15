@@ -1333,7 +1333,12 @@ class Downloader:
 
     def download_track(self, track_id, album_location='', track_index=0, number_of_tracks=0, indent_level=1, extra_kwargs={}, forced_total_discs=None, custom_filename_format=None, extra_template_data=None, verbose=True, m3u_playlist=None, **_):
         self.set_indent_number(indent_level)
-        if self._check_db(track_id): return "SKIPPED"
+        if self._check_db(track_id):
+            # Antes retornaba en silencio total: un `orpheus <url>` de un track ya
+            # archivado imprimía el banner y salía sin decir nada (confuso).
+            if verbose:
+                self.print(f'{self._get_status_symbols()["skip"]} Track {track_id} already downloaded (in archive.db) — skipping', drop_level=1)
+            return "SKIPPED"
         quality_tier = QualityEnum[self.global_settings['general']['download_quality'].upper()]
         codec_options = CodecOptions(spatial_codecs=self.global_settings['codecs']['spatial_codecs'], proprietary_codecs=self.global_settings['codecs']['proprietary_codecs'])
         track_info = self.service.get_track_info(track_id, quality_tier, codec_options, **extra_kwargs)
