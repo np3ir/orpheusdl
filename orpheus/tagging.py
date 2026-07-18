@@ -236,7 +236,9 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
             artist_list = dedup_artists(str(a) for a in artistas_original if a)
         else:
             artist_list = [str(artistas_original)]
-        tagger['artist'] = artist_list
+        # Opcion A: un solo valor unido con " / " (VirtualDJ/RadioBoss no leen
+        # campos de artista multivaluados; muestran solo el primero).
+        tagger['artist'] = " / ".join(artist_list)
     
     if album_original:
         tagger['album'] = str(album_original)
