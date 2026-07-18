@@ -131,6 +131,8 @@ temp/
 config/settings.json
 config/cookies.txt
 config/spotify/
+config/loginstorage.bin
+config/*.bin
 
 # Databases
 *.db
