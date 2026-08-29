@@ -66,6 +66,21 @@ PLATFORM_COLORS = {
 
 RESET_COLOR = "\033[0m"
 
+# File extension used for each codec's final output container, derived from
+# codec_data so the two can never disagree. Container mapping examples:
+#   - MHA1 (360RA MPEG-H 3D Audio) -> .m4a, MHM1 (360RA) -> .mp4
+#   - EAC3 / AC4 (Dolby Atmos) -> .m4a, AC3 (Dolby Digital) -> .ac3
+#   - MQA -> .flac (stored in a FLAC container), HEAAC -> .m4a
+# NONE is intentionally excluded: it is an error sentinel, not a real format,
+# so it keeps the historical '.flac' default.
+CODEC_EXTENSIONS = {
+    codec: f'.{data.container.name}'
+    for codec, data in codec_data.items()
+    if codec != CodecEnum.NONE
+}
+
+DEFAULT_TRACK_EXTENSION = '.flac'
+
 def get_colored_platform_name(service_name):
     """Get the platform name with appropriate ANSI color coding"""
     if not service_name:
@@ -1043,7 +1058,7 @@ class Downloader:
             if 'ATMOS' in upper or '◗◖' in part:
                 label = 'Atmos'
             elif '360' in upper and ('REALITY' in upper or 'RA' in upper):
-                label = '360 Reality Audio'
+                label = '360RA'
             elif 'HI-RES' in upper or '🅷' in part or 'ʜɪ' in part.lower():
                 label = 'Hi-Res'
             elif 'FLAC' in upper:
@@ -1105,7 +1120,7 @@ class Downloader:
         # Render the chosen label with its icon so folder names match the search/quality display.
         display_map = {
             'ATMOS': '◗◖ ATMOS',
-            '360RA': '360 Reality Audio',
+            '360RA': '360RA',
             'IMMERSIVE': 'Immersive Audio',
             'HI-RES': '🅷 HI-RES',
             'FLAC': 'FLAC',
@@ -1135,7 +1150,7 @@ class Downloader:
             elif re.search(r'HI[\s\-_]*RES', pu) or '🅷' in part or 'ʜɪ' in part.lower():
                 label = '🅷 HI-RES'
             elif '360' in pu and ('REALITY' in pu or 'RA' in pu):
-                label = '360 Reality Audio'
+                label = '360RA'
             elif 'IMMERSIVE' in pu:
                 label = 'Immersive Audio'
             elif 'FLAC' in pu:
@@ -1169,6 +1184,10 @@ class Downloader:
         if info is None:
             return codec.name
         if info.spatial:
+            # Distinguish Sony 360RA (MPEG-H 3D Audio) from Dolby Atmos so folder
+            # labels match the search UI: MHA1/MHM1 -> 360RA, EAC3/AC4 -> ATMOS.
+            if codec in (CodecEnum.MHA1, CodecEnum.MHM1):
+                return '360RA'
             return 'ATMOS'
         if info.lossless:
             bit_depth = getattr(track_info, 'bit_depth', None) or 16
@@ -3489,22 +3508,10 @@ class Downloader:
                     self.print('⚠ Path too long, folder name was truncated for filesystem safety.')
         
         # Add file extension based on codec (or override when e.g. Tidal remuxes Atmos to M4A)
-        # AC4/EAC3 (Dolby Atmos): use .m4a so output is always M4A (MPEG-4 audio) per Tidal convention
-        codec_extensions = {
-            CodecEnum.FLAC: '.flac',
-            CodecEnum.MP3: '.mp3',
-            CodecEnum.AAC: '.m4a',
-            CodecEnum.ALAC: '.m4a',
-            CodecEnum.OPUS: '.opus',
-            CodecEnum.VORBIS: '.ogg',
-            CodecEnum.WAV: '.wav',
-            CodecEnum.AIFF: '.aiff',
-            CodecEnum.AC4: '.m4a',
-            CodecEnum.AC3: '.ac3',
-            CodecEnum.EAC3: '.m4a'
-        }
+        # AC4/EAC3 (Dolby Atmos): use .m4a so output is always M4A (MPEG-4 audio) per Tidal convention.
+        # MHM1 (Sony 360RA): .mp4, MHA1 (360RA): .m4a.
         codec_for_ext = override_codec if override_codec is not None else track_info.codec
-        extension = codec_extensions.get(codec_for_ext, '.flac')  # Default to .flac
+        extension = CODEC_EXTENSIONS.get(codec_for_ext, DEFAULT_TRACK_EXTENSION)
         track_filename += extension
         
         # Combine with album location
@@ -4571,6 +4578,7 @@ class Downloader:
                 '.ac4': ContainerEnum.ac4,
                 '.ac3': ContainerEnum.ac3,
                 '.eac3': ContainerEnum.eac3,
+                '.mp4': ContainerEnum.mp4,
                 '.webm': ContainerEnum.webm
             }
             container = container_map.get(file_extension, ContainerEnum.flac)
@@ -5368,6 +5376,7 @@ class Downloader:
                 '.ac4': ContainerEnum.ac4,
                 '.ac3': ContainerEnum.ac3,
                 '.eac3': ContainerEnum.eac3,
+                '.mp4': ContainerEnum.mp4,
                 '.webm': ContainerEnum.webm
             }
             container = container_map.get(file_extension, ContainerEnum.flac)
