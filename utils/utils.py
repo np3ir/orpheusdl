@@ -974,6 +974,121 @@ def find_system_ffmpeg():
     return _ffmpeg_cache
 
 
+_ffmpeg_opus_cache = None
+
+def ffmpeg_has_opus(binary) -> bool:
+    """
+    Return True if the given ffmpeg executable can encode Opus (libopus or native
+    opus encoder advertised in `-encoders`).
+    """
+    import subprocess
+    import platform
+
+    if not binary or not os.path.isfile(binary):
+        return False
+    try:
+        run_kwargs = {
+            'capture_output': True,
+            'timeout': 8,
+            'env': get_clean_env(),
+        }
+        if platform.system() == 'Windows':
+            run_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        res = subprocess.run([binary, '-hide_banner', '-encoders'], **run_kwargs)
+    except Exception:
+        return False
+    if res.returncode != 0:
+        return False
+    out = (res.stdout or b'').decode('utf-8', 'ignore').lower()
+    # Accept libopus, or the native opus encoder (some builds mark it experimental,
+    # but when present it is a working Opus encoder). Ensures Opus mux/encode works.
+    return ('libopus' in out) or (' opus ' in out or '\nopus ' in out)
+
+
+def resolve_ffmpeg_with_opus(preferred=None):
+    """
+    Return a path to an ffmpeg that can encode Opus, or None if none found.
+
+    ``preferred`` (if given) is probed first; if it lacks an Opus encoder (some
+    installs ship ffmpeg without libopus, or build the native 'opus' encoder as
+    experimental/disabled), the app-bundled ffmpeg and then every ffmpeg on PATH
+    are tried so callers never fail silently on Opus muxing. Candidates are probed
+    and cached only when no explicit ``preferred`` is passed.
+    """
+    global _ffmpeg_opus_cache
+    if preferred is None:
+        if _ffmpeg_opus_cache is not None:
+            return _ffmpeg_opus_cache
+
+    import subprocess
+    import platform
+    import shutil
+
+    system = platform.system()
+    candidates = []
+
+    if preferred:
+        candidates.append(preferred)
+
+    # The app/project-bundled ffmpeg (highest priority, like find_system_ffmpeg).
+    try:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        root_ffmpeg = os.path.join(project_root, 'ffmpeg.exe' if system == 'Windows' else 'ffmpeg')
+        if os.path.isfile(root_ffmpeg):
+            candidates.append(root_ffmpeg)
+    except Exception:
+        pass
+
+    # Whatever find_system_ffmpeg resolves (bundled path or first PATH hit).
+    try:
+        found, path = find_system_ffmpeg()
+        if found and path:
+            candidates.append(path)
+    except Exception:
+        pass
+
+    # Every ffmpeg on PATH, in order, so we never fail if the preferred ones lack Opus.
+    if system == 'Windows':
+        resolved = shutil.which('ffmpeg.exe') or shutil.which('ffmpeg')
+        if resolved:
+            candidates.append(resolved)
+        # Windows PATH can list several ffmpeg binaries; the highest-priority one may
+        # lack an Opus encoder, so also probe the rest (essentials/dev builds, etc.).
+        try:
+            all_on_path = subprocess.run(
+                ['where', 'ffmpeg.exe'], capture_output=True, timeout=8, env=get_clean_env()
+            ).stdout.decode('utf-8', 'ignore').splitlines()
+            for p in all_on_path:
+                p = p.strip()
+                if p:
+                    candidates.append(p)
+        except Exception:
+            pass
+    else:
+        resolved = shutil.which('ffmpeg')
+        if resolved:
+            candidates.append(resolved)
+
+    # Deduplicate (preserving order), then probe each for an Opus encoder.
+    seen = set()
+    for cand in candidates:
+        try:
+            cand_abs = os.path.abspath(cand)
+        except Exception:
+            cand_abs = cand
+        if cand_abs in seen:
+            continue
+        seen.add(cand_abs)
+        if ffmpeg_has_opus(cand_abs):
+            if preferred is None:
+                _ffmpeg_opus_cache = cand_abs
+            return cand_abs
+
+    if preferred is None:
+        _ffmpeg_opus_cache = None
+    return None
+
+
 def is_missing_executable_error(error_str) -> bool:
     """True when subprocess failed because an executable path could not be resolved (e.g. missing ffmpeg)."""
     if not error_str:
