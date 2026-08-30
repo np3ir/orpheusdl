@@ -1200,32 +1200,6 @@ class Downloader:
                 return 'HI-RES'
         return info.pretty_name or codec.name
 
-    def _maybe_warn_codec_fallback(self, track_info) -> None:
-        """Warn when a lossless/Atmos request silently resolved to a lossy stream.
-
-        The album folder's {quality} label is derived from the requested tier, so a
-        per-track fallback to AAC would otherwise leave the folder saying
-        "FLAC"/"Lossless" while the actual file is lossy.
-        """
-        if not track_info:
-            return
-        codec = getattr(track_info, 'codec', None)
-        if not codec:
-            return
-        requested = str(
-            self.global_settings.get('general', {}).get('download_quality', 'hifi') or 'hifi'
-        ).lower()
-        if requested not in ('hifi', 'lossless', 'atmos'):
-            return
-        info = codec_data.get(codec)
-        if not info or info.lossless or info.spatial:
-            return
-        name = getattr(track_info, 'name', None) or 'track'
-        self.print(
-            f'⚠ {name}: requested {requested} but the stream fell back to {info.pretty_name} (lossy)',
-            drop_level=1,
-        )
-
     # kwargs the GUI attaches for display/logging only — never valid module info-method args
     _DISPLAY_ONLY_KWARGS = ('catalog_quality', 'display_quality', 'download_quality_override')
 
@@ -4433,7 +4407,6 @@ class Downloader:
         if track_id is None:
             track_id = track_info.id
 
-        self._maybe_warn_codec_fallback(track_info)
         self._apply_track_index_to_tags(track_info, track_index, number_of_tracks)
             
         # Check if track already exists (for backward compatibility) - use thread pool for file checks
@@ -4982,8 +4955,6 @@ class Downloader:
                     codec_info.append(f'sample rate: {track_info.sample_rate}kHz')
 
             d_print(', '.join(codec_info))
-
-        self._maybe_warn_codec_fallback(track_info)
 
         # Playlist index vs album track number (see formatting.use_playlist_position)
         self._apply_track_index_to_tags(track_info, track_index, number_of_tracks)
