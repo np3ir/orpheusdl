@@ -263,7 +263,13 @@ def simplify_error_message(error_str: str) -> str:
             return f"Apple Music error: {error_str}"
                 
         return "Apple Music error (see logs for details)"
-    
+
+    # Other HTTP status code errors (403, 500, etc.) - 404 is handled above
+    import re
+    status_match = re.search(r'(?:status code|http error)\s*(\d{3})', error_str, re.IGNORECASE)
+    if status_match:
+        return f"Request failed (status {status_match.group(1)})"
+
     # Missing executable (typically ffmpeg when settings point at a stale path)
     if is_missing_executable_error(error_str):
         if 'shaka' not in error_lower and 'packager' not in error_lower:
@@ -4816,7 +4822,7 @@ class Downloader:
                     
                     symbols = self._get_status_symbols()
                     d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-                    return return_with_blank_line(None)
+                    return return_with_blank_line(None, failure_reason=msg)
 
                 # For other exceptions, retry if we have attempts left
                 if attempt < max_retries - 1:
@@ -4840,7 +4846,7 @@ class Downloader:
                         
                     symbols = self._get_status_symbols()
                     d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-                    return return_with_blank_line(None)
+                    return return_with_blank_line(None, failure_reason=msg)
 
         # Check if track_info is still None after all retries
         if track_info is not None and attempt > 0:
@@ -4849,7 +4855,8 @@ class Downloader:
             self.print(f'Track info is None for {display_track_id}. Track may be unavailable or not found.')
             symbols = self._get_status_symbols()
             d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-            return return_with_blank_line(None)
+            retry_reason = f'Track info could not be retrieved: {last_exception}' if last_exception else 'Track info could not be retrieved'
+            return return_with_blank_line(None, failure_reason=retry_reason)
 
         # Check if the service reported the track as unavailable (e.g. geo-restricted, credentials missing)
         track_error = getattr(track_info, 'error', None)
@@ -4877,7 +4884,7 @@ class Downloader:
                 self.print(f'Track unavailable: {track_error}')
             symbols = self._get_status_symbols()
             d_print(f'=== {symbols["error"]} Track failed ===', drop_level=header_drop_level)
-            return return_with_blank_line(None)
+            return return_with_blank_line(None, failure_reason=track_error)
 
         # For single track downloads, use no indentation for headers but keep indentation for details
         # For multi-track contexts (albums, playlists, artists), use drop_level=1 to align with "Track X/Y" line
@@ -5173,7 +5180,7 @@ class Downloader:
                     # Restore original indent level if it was adjusted
                     if details_indent_adjustment != 0:
                         self.set_indent_number(indent_level)
-                    return return_with_blank_line(None)
+                    return return_with_blank_line(None, failure_reason=error_msg)
             else:
                 # For non-TypeError exceptions, extract concise error message
                 error_msg = str(e)
@@ -5207,7 +5214,7 @@ class Downloader:
                 # Restore original indent level if it was adjusted
                 if details_indent_adjustment != 0:
                     self.set_indent_number(indent_level)
-                return return_with_blank_line(None)
+                return return_with_blank_line(None, failure_reason=error_msg)
         if not download_info:
             d_print(f'No download info available')
             symbols = self._get_status_symbols()
@@ -5215,7 +5222,7 @@ class Downloader:
             # Restore original indent level if it was adjusted
             if details_indent_adjustment != 0:
                 self.set_indent_number(indent_level)
-            return return_with_blank_line(None)
+            return return_with_blank_line(None, failure_reason='No download info available')
 
         # Use actual container when module converts (e.g. Tidal Atmos AC4 -> FLAC)
         if getattr(download_info, 'different_codec', None):
@@ -5272,7 +5279,7 @@ class Downloader:
             # Restore original indent level if it was adjusted
             if details_indent_adjustment != 0:
                 self.set_indent_number(indent_level)
-            return return_with_blank_line(None)
+            return return_with_blank_line(None, failure_reason=str(download_e))
 
         if not final_location:
             d_print(f'Failed to download track {track_id}')
@@ -5281,7 +5288,7 @@ class Downloader:
             # Restore original indent level if it was adjusted
             if details_indent_adjustment != 0:
                 self.set_indent_number(indent_level)
-            return return_with_blank_line(None)
+            return return_with_blank_line(None, failure_reason='Download produced no file')
 
         # Validate file size to catch corrupted downloads (fixed 100KB threshold)
         try:
@@ -5304,7 +5311,7 @@ class Downloader:
 
                 symbols = self._get_status_symbols()
                 d_print(f'=== {symbols["error"]} Track failed (corrupted source) ===', drop_level=header_drop_level)
-                return return_with_blank_line(None)
+                return return_with_blank_line(None, failure_reason=f'Downloaded file suspiciously small ({file_size:,} bytes)')
 
         except OSError as e:
             d_print(f'Could not check file size: {e}')
@@ -5444,7 +5451,7 @@ class Downloader:
                 except OSError:
                     pass  # Ignore cleanup errors
 
-            return return_with_blank_line(None)  # Return None to indicate failure for concurrent download tracking
+            return return_with_blank_line(None, failure_reason=f'Tagging failed: {e}')  # Return None to indicate failure for concurrent download tracking
 
     def _convert_file_if_needed(self, file_path, track_info, d_print):
         """Convert file based on codec_conversions settings - based on old working version"""
