@@ -2231,7 +2231,7 @@ class Downloader:
             context_type='playlist',
         )
         
-        if playlist_info.cover_url:
+        if playlist_info.cover_url and self.global_settings['covers']['save_external']:
             self.print('Downloading playlist cover')
             download_file(playlist_info.cover_url, f'{playlist_path}cover.{playlist_info.cover_type.name}', artwork_settings=self._get_artwork_settings(is_external=True))
         
@@ -2246,7 +2246,7 @@ class Downloader:
             self.print('Downloading animated playlist cover')
             download_file(playlist_info.animated_cover_url, playlist_path + 'cover.mp4', enable_progress_bar=self.global_settings['general'].get('progress_bar', False))
         
-        if playlist_info.description:
+        if playlist_info.description and self.global_settings['covers']['save_external']:
             with open(playlist_path + 'description.txt', 'w', encoding='utf-8') as f: f.write(playlist_info.description)
 
         m3u_playlist_path = None
