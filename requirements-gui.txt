@@ -1,3 +1,0 @@
-CTkToolTip
-customtkinter
-packaging

@@ -48,8 +48,6 @@ class CodecEnum(Flag):
     EAC3 = auto() # Lossy, spatial, proprietary
     AC4 = auto() # Lossy, spatial, proprietary
     AC3 = auto() # Lossy, spatial, proprietary
-    H264 = auto() # Video
-    H265 = auto() # Video
     NONE = auto()  # No codec
 
 
@@ -65,6 +63,7 @@ class ContainerEnum(Flag):
     ac4 = auto()
     ac3 = auto()
     mp4 = auto()
+    webm = auto()
 
 
 @dataclass
@@ -76,6 +75,7 @@ class SearchResult:
     explicit: Optional[bool] = False
     duration: Optional[int] = None  # Duration in whole seconds
     image_url: Optional[str] = None
+    preview_url: Optional[str] = None  # URL to audio preview (e.g., 30-second snippet)
     additional: Optional[list] = None
     extra_kwargs: Optional[dict] = field(default_factory=dict)
 
@@ -100,12 +100,10 @@ codec_data = {
     CodecEnum.MP3:    CodecData(pretty_name='MP3',              container=ContainerEnum.mp3,  lossless=False, spatial=False, proprietary=False),
     CodecEnum.AAC:    CodecData(pretty_name='AAC-LC',           container=ContainerEnum.m4a,  lossless=False, spatial=False, proprietary=False),
     CodecEnum.HEAAC:  CodecData(pretty_name='HE-AAC',           container=ContainerEnum.m4a,  lossless=False, spatial=False, proprietary=True),
-    CodecEnum.H264:   CodecData(pretty_name='H.264',            container=ContainerEnum.mp4,  lossless=False, spatial=False, proprietary=False),
-    CodecEnum.H265:   CodecData(pretty_name='H.265',            container=ContainerEnum.mp4,  lossless=False, spatial=False, proprietary=False),
     CodecEnum.MHA1:   CodecData(pretty_name='MPEG-H 3D Audio',  container=ContainerEnum.m4a,  lossless=False, spatial=True,  proprietary=True),
     CodecEnum.MHM1:   CodecData(pretty_name='MPEG-H 3D Audio',  container=ContainerEnum.mp4,  lossless=False, spatial=True,  proprietary=True),
-    CodecEnum.EAC3:   CodecData(pretty_name='Dolby Digital+',   container=ContainerEnum.eac3, lossless=False, spatial=True,  proprietary=True),
-    CodecEnum.AC4:    CodecData(pretty_name='Dolby AC-4 IMS',   container=ContainerEnum.ac4,  lossless=False, spatial=True,  proprietary=True),
+    CodecEnum.EAC3:   CodecData(pretty_name='E-AC-3 JOC',       container=ContainerEnum.m4a,  lossless=False, spatial=True,  proprietary=True),
+    CodecEnum.AC4:    CodecData(pretty_name='AC-4 IMS',         container=ContainerEnum.m4a,  lossless=False, spatial=True,  proprietary=True),
     CodecEnum.AC3:    CodecData(pretty_name='Dolby Digital',    container=ContainerEnum.ac3,  lossless=False, spatial=False, proprietary=True), # AC3 is technically not spatial
     CodecEnum.NONE:   CodecData(pretty_name='Error',            container=ContainerEnum.m4a,  lossless=False, spatial=False, proprietary=False)
 }  # Note: spatial has priority over proprietary when deciding if a codec is enabled
@@ -243,6 +241,7 @@ class OrpheusOptions:
     disable_subscription_check: bool
     quality_tier: QualityEnum  # Here because of subscription checking
     default_cover_options: CoverOptions
+    play_sound_on_finish: bool = True
 
 
 @dataclass
@@ -269,6 +268,7 @@ class Tags:
     composer: Optional[str] = None
     track_number: Optional[int] = None
     total_tracks: Optional[int] = None
+    playlist_position: Optional[int] = None  # 1-based index when downloaded from a playlist
     copyright: Optional[str] = None
     isrc: Optional[str] = None
     upc: Optional[str] = None
@@ -281,7 +281,7 @@ class Tags:
     description: Optional[str] = None
     comment: Optional[str] = None
     label: Optional[str] = None
-    bpm: Optional[int] = None
+    catalog_number: Optional[str] = None
     track_url: Optional[str] = None
     extra_tags: Optional[dict] = field(default_factory=dict)
 
@@ -311,6 +311,11 @@ class AlbumInfo:
     artist: str
     tracks: list
     release_year: int
+    # Catalog size from the service (e.g. TIDAL web UI). When greater than len(tracks),
+    # OrpheusDL logs the gap in error.txt for the album output folder.
+    expected_track_count: Optional[int] = None
+    # Tracks known to the service but excluded from tracks (id/name/reason dicts).
+    excluded_tracks: Optional[list] = None
     duration: Optional[int] = None  # Duration in whole seconds
     explicit: Optional[bool] = False
     artist_id: Optional[str] = None
@@ -323,11 +328,11 @@ class AlbumInfo:
     all_track_cover_jpg_url: Optional[str] = None
     animated_cover_url: Optional[str] = None
     description: Optional[str] = None
-    type: Optional[str] = None
-    release_date: Optional[str] = None
+    # str or list[str]; list is joined with filename_separator (or metadata_separator) for paths, metadata_separator for tags
+    album_artist: Optional[Union[str, List[str]]] = None
+    label: Optional[str] = None
+    catalog_number: Optional[str] = None
     track_extra_kwargs: Optional[dict] = field(default_factory=dict)
-    album_artist: Optional[list] = None
-    expected_track_count: Optional[int] = None
 
 
 @dataclass
@@ -349,6 +354,7 @@ class PlaylistInfo:
     id: Optional[str] = None
     num_tracks: Optional[int] = None
     num_tracks_from_api: Optional[int] = None
+    excluded_tracks: Optional[list] = None  # [{id, name/title, reason}] not in tracks
     duration: Optional[int] = None  # Duration in whole seconds
     explicit: Optional[bool] = False
     creator_id: Optional[str] = None
@@ -383,8 +389,12 @@ class TrackInfo:
     cover_extra_kwargs: Optional[dict] = field(default_factory=dict)
     credits_extra_kwargs: Optional[dict] = field(default_factory=dict)
     lyrics_extra_kwargs: Optional[dict] = field(default_factory=dict)
-    type: Optional[str] = None
+    lyrics: Optional[str] = None
+    synced_lyrics: Optional[str] = None
+    credits_list: Optional[list] = field(default_factory=list)
     error: Optional[str] = None
+    preview_url: Optional[str] = None  # URL to audio preview (e.g. Beatport/Beatsource sample)
+    additional: Optional[str] = None
 
 
 @dataclass

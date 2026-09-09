@@ -3,7 +3,7 @@ from time import time
 from math import ceil
 from Cryptodome.Hash import MD5
 from Cryptodome.Cipher import Blowfish
-from tqdm import tqdm
+from utils.utils import tqdm
 from utils.utils import create_requests_session
 
 class APIError(Exception):
@@ -70,10 +70,6 @@ class DeezerAPI:
         return resp['results']
 
     def login_via_email(self, email, password):
-
-        if not self.client_id or not self.client_secret:
-            raise self.exception('client_id/client_secret setting is empty or missing, check settings.json')
-
         # server sends set-cookie header with anonymous sid
         self.s.get('https://www.deezer.com')
         
@@ -86,11 +82,21 @@ class DeezerAPI:
             'hash': MD5.new((self.client_id + email + password + self.client_secret).encode()).hexdigest(),
         }
 
+        # Check if credentials are provided
+        if not email or not password:
+            raise self.exception(
+                'Deezer credentials are required. Please fill in your email and password in the settings. '
+                'Alternatively, you can use ARL instead.'
+            )
+        
         # server sends set-cookie header with account sid
         json = self.s.get('https://connect.deezer.com/oauth/user_auth.php', params=params).json()
 
         if 'error' in json:
-            raise self.exception('Error while getting access token, check your credentials')
+            raise self.exception(
+                'Deezer authentication failed. Please check your email and password in the settings. '
+                'Alternatively, you can use ARL instead.'
+            )
 
         arl = self._api_call('user.getArl')
 
@@ -103,15 +109,7 @@ class DeezerAPI:
         if not user_data['USER']['USER_ID']:
             self.s.cookies.clear()
             raise self.exception('Invalid arl')
-        
-        if len(self.country) == 2:
-            code_point_1 = ord(self.country[0]) + 127397
-            code_point_2 = ord(self.country[1]) + 127397
-            country_flag = chr(code_point_1) + chr(code_point_2)
-        else:
-            country_flag = ''
 
-        print(f"ARL Country: {self.country} {country_flag} - Available Formats: {' | '.join(self.available_formats)}")
         return user_data
 
     def get_track(self, id):
@@ -129,6 +127,90 @@ class DeezerAPI:
     def get_track_cover(self, id):
         return self._api_call('song.getData', {'sng_id': id, 'array_default': ['ALB_PICTURE']})['ALB_PICTURE']
     
+    def is_authenticated(self):
+        """True if session has been logged in (internal API + download available)."""
+        return bool(getattr(self, 'api_token', None))
+
+    def search_public(self, query, resource_type, index=0, limit=25):
+        """Search using public API (no login). resource_type: 'track', 'album', 'artist', 'playlist'.
+        Returns (list of items, total count)."""
+        url = f'https://api.deezer.com/search/{resource_type}'
+        params = {'q': query, 'index': index, 'limit': limit}
+        try:
+            resp = self.s.get(url, params=params, timeout=15).json()
+            if 'error' in resp:
+                return [], 0
+            return resp.get('data') or [], resp.get('total', 0)
+        except Exception:
+            return [], 0
+
+    def get_track_public(self, track_id):
+        """Get track metadata from public API (no login). Returns raw JSON or None."""
+        try:
+            r = self.s.get(f'https://api.deezer.com/track/{track_id}', timeout=10).json()
+            return r if 'error' not in r else None
+        except Exception:
+            return None
+
+    def get_album_public(self, album_id):
+        """Get album metadata and track list from public API (no login). Returns raw JSON or None."""
+        try:
+            r = self.s.get(f'https://api.deezer.com/album/{album_id}', timeout=10).json()
+            return r if 'error' not in r else None
+        except Exception:
+            return None
+
+    def get_artist_public(self, artist_id):
+        """Get artist metadata from public API (no login). Returns raw JSON or None."""
+        try:
+            r = self.s.get(f'https://api.deezer.com/artist/{artist_id}', timeout=10).json()
+            return r if 'error' not in r else None
+        except Exception:
+            return None
+
+    def get_artist_albums_public(self, artist_id, index=0, limit=100):
+        """Get artist albums from public API (no login). Returns list of album dicts."""
+        try:
+            r = self.s.get(f'https://api.deezer.com/artist/{artist_id}/albums', params={'index': index, 'limit': limit}, timeout=10).json()
+            if 'error' in r:
+                return []
+            return r.get('data') or []
+        except Exception:
+            return []
+
+    def get_playlist_public(self, playlist_id):
+        """Get playlist metadata and tracks from public API (no login). Returns raw JSON or None."""
+        try:
+            r = self.s.get(f'https://api.deezer.com/playlist/{playlist_id}', timeout=10).json()
+            return r if 'error' not in r else None
+        except Exception:
+            return None
+
+    def get_playlist_tracks_public(self, playlist_id, limit=100, max_tracks=10000):
+        """Fetch ALL tracks from a playlist via the public API with pagination.
+        Returns list of full track dicts (title, artist, album, duration, preview, etc.)."""
+        all_tracks = []
+        url = f'https://api.deezer.com/playlist/{playlist_id}/tracks'
+        params = {'index': 0, 'limit': limit}
+        try:
+            while url and len(all_tracks) < max_tracks:
+                resp = self.s.get(url, params=params, timeout=15).json()
+                if 'error' in resp:
+                    break
+                batch = resp.get('data') or []
+                if not batch:
+                    break
+                all_tracks.extend(batch)
+                next_url = resp.get('next')
+                if next_url:
+                    url = next_url
+                    params = {}  # next URL already contains query params
+                else:
+                    break
+        except Exception:
+            pass
+        return all_tracks
+
     def get_track_data_by_isrc(self, isrc):
         resp = self.s.get(f'https://api.deezer.com/track/isrc:{isrc}').json()
         if 'error' in resp:
@@ -143,6 +225,45 @@ class DeezerAPI:
             'ALB_TITLE': resp['album']['title']
         }
 
+    def get_track_preview_url(self, track_id):
+        """Get the 30-second preview URL for a track from the public Deezer API."""
+        try:
+            resp = self.s.get(f'https://api.deezer.com/track/{track_id}').json()
+            if 'error' not in resp and 'preview' in resp:
+                return resp.get('preview')
+        except Exception:
+            pass
+        return None
+    
+    def get_tracks_public_data(self, track_ids):
+        """Get public API data for multiple tracks (preview URLs, etc.) using parallel requests."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        results = {}
+        
+        def fetch_track(track_id):
+            try:
+                resp = self.s.get(f'https://api.deezer.com/track/{track_id}').json()
+                if 'error' not in resp:
+                    return str(track_id), {
+                        'preview': resp.get('preview'),
+                        'album_cover_small': resp.get('album', {}).get('cover_small'),
+                        'album_cover_medium': resp.get('album', {}).get('cover_medium')
+                    }
+            except Exception:
+                pass
+            return None
+        
+        # Parallel requests - max 10 concurrent to avoid rate limiting
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(fetch_track, tid) for tid in track_ids]
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    results[result[0]] = result[1]
+        
+        return results
+
     def get_album(self, id):
         try:
             return self._api_call('deezer.pageAlbum', {'alb_id': id, 'lang': self.language})
@@ -154,6 +275,17 @@ class DeezerAPI:
 
     def get_playlist(self, id, nb, start):
         return self._api_call('deezer.pagePlaylist', {'nb': nb, 'start': start, 'playlist_id': id, 'lang': self.language, 'tab': 0, 'tags': True, 'header': True})
+
+    def get_playlist_cover_public(self, playlist_id):
+        """Fetch playlist from public Deezer API to get the composite (2x2) cover URL.
+        The internal pagePlaylist often returns a placeholder; the public API returns the proper cover."""
+        try:
+            r = self.s.get(f'https://api.deezer.com/playlist/{playlist_id}', timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            return (data.get('picture_xl') or data.get('picture_big') or data.get('picture_medium') or '').strip() or None
+        except Exception:
+            return None
 
     def get_artist_name(self, id):
         return self._api_call('artist.getData', {'art_id': id, 'array_default': ['ART_NAME']})['ART_NAME']
@@ -169,18 +301,25 @@ class DeezerAPI:
             'filter_role_id': [0,5] if credited_albums else [0],
             'nb_songs': 0,
             'discography_mode': 'all' if credited_albums else None,
-            # Include release date so the caller can sort oldest-first instead of
-            # trusting whatever order the discography endpoint happens to return.
-            'array_default': ['ALB_ID', 'PHYSICAL_RELEASE_DATE', 'ORIGINAL_RELEASE_DATE']
+            'array_default': ['ALB_ID']
         }
         resp = self._api_call('album.getDiscography', payload)
-        return [
-            {
-                'id': a['ALB_ID'],
-                'release_date': a.get('ORIGINAL_RELEASE_DATE') or a.get('PHYSICAL_RELEASE_DATE'),
-            }
-            for a in resp['data']
-        ]
+        return [a['ALB_ID'] for a in resp['data']]
+
+    def get_artist_discography(self, id, start, nb, credited_albums):
+        """Get artist discography with album details (title, year, cover, artist) for GUI display."""
+        payload = {
+            'art_id': id,
+            'start': start,
+            'nb': nb,
+            'filter_role_id': [0,5] if credited_albums else [0],
+            'nb_songs': 0,
+            'discography_mode': 'all' if credited_albums else None,
+            'array_default': ['ALB_ID', 'ALB_TITLE', 'ART_NAME', 'PHYSICAL_RELEASE_DATE', 'ORIGINAL_RELEASE_DATE', 'ALB_PICTURE', 'EXPLICIT_ALBUM', 'EXPLICIT_ALBUM_CONTENT', 'EXPLICIT_LYRICS']
+,
+        }
+        resp = self._api_call('album.getDiscography', payload)
+        return resp.get('data') or []
 
     def get_track_url(self, id, track_token, track_token_expiry, format):
         # renews license token
@@ -202,25 +341,12 @@ class DeezerAPI:
             'track_tokens': [track_token]
         }
         resp = self.s.post('https://media.deezer.com/v1/get_url', json=json).json()
-        # Error claro en vez de KeyError('data'): Deezer devuelve {'errors':[...]} cuando
-        # la cuenta no tiene derechos (code 1002 = soft-block/streaming off) o el track no esta disponible.
-        if resp.get('errors'):
-            raise self.exception(f"Deezer: {resp['errors'][0].get('message', 'error')}")
-        data = resp.get('data') or []
-        if not data or data[0].get('errors'):
-            msg = data[0]['errors'][0].get('message') if (data and data[0].get('errors')) else 'sin derechos de streaming / track no disponible'
-            raise self.exception(f"Deezer: {msg}")
-        media = data[0].get('media') or []
-        if not media:
-            raise self.exception("Deezer: sin media (cuenta sin derechos o track no disponible)")
-        return media[0]['sources'][0]['url']
+        return resp['data'][0]['media'][0]['sources'][0]['url']
     
-   
     def _get_blowfish_key(self, track_id):
         # yeah, you use the bytes of the hex digest of the hash. bruh moment
         md5_id = MD5.new(str(track_id).encode()).hexdigest().encode('ascii')
-        if not self.bf_secret:
-            raise self.exception('bf_secret missing or empty, check config.json')
+
         key = bytes([md5_id[i] ^ md5_id[i + 16] ^ self.bf_secret[i] for i in range(16)])
 
         return key

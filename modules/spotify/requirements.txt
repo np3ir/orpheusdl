@@ -1,0 +1,7 @@
+# Requirements for the OrpheusDL Spotify module
+# Audio downloads use the Librespot backend (OAuth). Episodes/lyrics use HTTP APIs.
+pkce>=1.0.3
+pycryptodome
+protobuf
+httpx
+pybase62

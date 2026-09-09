@@ -1,19 +1,13 @@
 import pickle, requests, errno, hashlib, math, os, re, operator, asyncio
 import aiohttp
 import aiofiles
-import platform  # <--- CORRECCIÓN DE IMPORTACIÓN
+from urllib.parse import urlparse, urlunparse
 from tqdm import tqdm as original_tqdm
 import threading
-from urllib3.util.retry import Retry
-from functools import reduce
-from PIL import Image, ImageChops
-from requests.adapters import HTTPAdapter
-import urllib.parse  # <--- NECESARIO PARA LA FUNCIÓN _is_valid_url
 
 # Global flag for progress bar settings (more reliable than thread-local in async contexts)
 _progress_bars_enabled = True
 _progress_bars_lock = threading.Lock()
-
 
 def tqdm(*args, **kwargs):
     """Custom tqdm wrapper that respects global progress bar settings"""
@@ -24,14 +18,11 @@ def tqdm(*args, **kwargs):
             kwargs['disable'] = True
     return original_tqdm(*args, **kwargs)
 
-
 def set_progress_bars_enabled(enabled):
     """Set whether progress bars should be enabled globally"""
     global _progress_bars_enabled
     with _progress_bars_lock:
         _progress_bars_enabled = enabled
-
-
 from PIL import Image, ImageChops
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -44,27 +35,25 @@ def hash_string(input_str: str, hash_type: str = 'MD5'):
     else:
         raise Exception('Invalid hash type selected')
 
-
 def create_requests_session():
     session_ = requests.Session()
-    retries = Retry(total=10, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504])
+    retries = Retry(total=10, backoff_factor=0.4, status_forcelist=[429, 500, 502, 503, 504])
     session_.mount('http://', HTTPAdapter(max_retries=retries))
     session_.mount('https://', HTTPAdapter(max_retries=retries))
     return session_
 
-
 def create_aiohttp_session():
     """Create an aiohttp session with retry and timeout configuration"""
     timeout = aiohttp.ClientTimeout(total=300, connect=30, sock_read=60)
-
+    
     # Optimized connector settings for better concurrent performance
     connector = aiohttp.TCPConnector(
-        limit=200,  # Increased total connection pool from 100 to 200
-        limit_per_host=50,  # Increased per-host connections from 30 to 50
+        limit=200,           # Increased total connection pool from 100 to 200
+        limit_per_host=50,   # Increased per-host connections from 30 to 50
         enable_cleanup_closed=True,
         use_dns_cache=False  # Disable DNS cache to avoid aiodns issues on Windows
     )
-
+    
     return aiohttp.ClientSession(
         connector=connector,
         timeout=timeout,
@@ -72,89 +61,218 @@ def create_aiohttp_session():
         trust_env=True
     )
 
+def sanitise_name(name):
+    """Make a string safe for file paths, matching tiddl-elvigilante's handling.
 
-sanitise_name = lambda name: re.sub(r'[:]', ' - ', re.sub(r'[\\/*?"<>|$]', '', re.sub(r'[\x00-\x1F\x7F]', '',
-                                                                                      str(name).strip()))) if name else ''
-
-
-# --- INICIO DE FUNCIÓN QUE ARREGLA EL SLASH FINAL ---
-def _is_valid_url(url: str, type: str) -> bool:
-    import re
-
-    # 1. Limpieza de la URL para eliminar parámetros de consulta y fragmentos (ej: ?utm_source=...)
-    parsed_url = urllib.parse.urlparse(url)
-    url = urllib.parse.urlunparse(parsed_url._replace(query='', fragment=''))
-
-    # 2. Definición de la expresión regular
-    # Utilizamos /?$ al final para que el slash sea opcional.
-    regex = ''
-    if type == 'album':
-        regex = r'https?:\/\/(?:www\.|listen\.|m\.)?(?:tidal|spotify|deezer|qobuz|applemusic|bandcamp)\.com\/album\/[0-9a-zA-Z\/-]+\/?$'
-    elif type == 'track':
-        regex = r'https?:\/\/(?:www\.|listen\.|m\.)?(?:tidal|spotify|deezer|qobuz|applemusic|bandcamp)\.com\/track\/[0-9a-zA-Z\/-]+\/?$'
-    elif type == 'playlist':
-        regex = r'https?:\/\/(?:www\.|listen\.|m\.)?(?:tidal|spotify|deezer|qobuz|applemusic|bandcamp)\.com\/playlist\/[0-9a-zA-Z\/-]+\/?$'
-    elif type == 'artist':
-        regex = r'https?:\/\/(?:www\.|listen\.|m\.)?(?:tidal|spotify|deezer|qobuz|applemusic|bandcamp)\.com\/artist\/[0-9a-zA-Z\/-]+\/?$'
-
-    if not regex:
-        return False
-
-    return bool(re.match(regex, url, re.IGNORECASE))
+    Special-character handling is delegated to the ported strings.py so the
+    Windows-forbidden characters < > : " / \\ | ? * are mapped to their full-width
+    Unicode look-alikes (\uff1c\uff1e\uff1a\uff02\uff0f\uff3c\uff5c\uff1f\uff0a) instead of being deleted, plus zalgo
+    removal, NFC normalisation, dash-look-alike folding, reserved-name guarding and
+    per-component byte truncation. Kept as a thin wrapper so the historical contract
+    holds: one path component in, a non-empty component out, callable on a str or a
+    list of names, applied per component. The whole-path byte cap stays with
+    fix_byte_limit() (where present).
+    """
+    if not name:
+        return ''
+    s = ", ".join(map(str, name)) if isinstance(name, list) else str(name)
+    # max_len == tiddl's per-component limit (255) with no download-suffix reserve.
+    return _sanitize_filename(s, max_len=_MAX_COMPONENT_LEN, reserve_bytes=0) or '_'
 
 
-# --- FIN DE FUNCIÓN QUE ARREGLA EL SLASH FINAL ---
+from .strings import sanitize_filename as _sanitize_filename, MAX_COMPONENT_LEN as _MAX_COMPONENT_LEN
 
 
-def fix_byte_limit(path: str) -> str:
-    # Max bytes allowed for the path after converting to UTF-8 (250 bytes for safety)
-    MAX_PATH_BYTES = 250
+def zfill_number(value, total=None, min_digits=2):
+    """Zero-pad a track/disc index for filenames and metadata (minimum two digits)."""
+    if value is None or value == '':
+        return ''
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    width = min_digits
+    if total is not None and total != '':
+        try:
+            width = max(min_digits, len(str(int(total))))
+        except (TypeError, ValueError):
+            pass
+    return str(n).zfill(width)
 
-    if platform.system() != 'Windows':
-        return path
 
-    path_bytes = path.encode('utf-8')
+def get_primary_artist(artist_data):
+    """
+    Extract only the primary (first) artist from a list or a string with separators.
+    Used to standardize the ALBUMARTIST tag across all platforms.
+    """
+    if not artist_data:
+        return ""
+    
+    # Handle list input (preferred)
+    if isinstance(artist_data, list):
+        return str(artist_data[0]) if artist_data else ""
+    
+    # Handle string input (fallback for platforms that return joined strings)
+    if isinstance(artist_data, str):
+        # Only split by high-confidence separators that are unlikely to be in a group name.
+        # We avoid splitting by " & ", " and ", or ", " for strings because of names like "Earth, Wind & Fire".
+        # If a platform wants to specify multiple artists, it should pass a list instead.
+        parts = re.split(r' / | feat\. | ft\. ', artist_data, flags=re.IGNORECASE)
+        return parts[0].strip()
+    
+    return str(artist_data)
 
-    if len(path_bytes) > MAX_PATH_BYTES:
-        import os
 
-        # FIX: Evitar el error de ruta C: vs Z:
+def _dedupe_artist_names(names: list) -> list[str]:
+    seen = set()
+    out = []
+    for name in names:
+        cleaned = str(name).strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cleaned)
+    return out
 
-        # 1. Get directory and base name
-        dirname = os.path.dirname(path)
-        basename = os.path.basename(path)
 
-        # 2. Convert the base name to bytes
-        basename_bytes = basename.encode('utf-8')
+def parse_multi_artist_name(artist_name) -> list[str]:
+    """
+    Split a display artist string into individual artists when it lists collaborators.
 
-        # 3. Calculate available bytes for the filename
-        # -1 accounts for the directory separator (slash/backslash)
-        available_bytes = MAX_PATH_BYTES - len(dirname.encode('utf-8')) - 1
+    Apple Music (and iTunes) join collaborators with " & " (e.g. "Albert King & Stevie Ray Vaughan").
+    Duo or group names such as "Simon & Garfunkel" are kept intact unless both sides look like
+    multi-word names, which indicates separate credited artists rather than a single act.
+    """
+    if artist_name is None:
+        return []
+    if isinstance(artist_name, list):
+        combined = []
+        for item in artist_name:
+            combined.extend(parse_multi_artist_name(item))
+        return _dedupe_artist_names(combined)
 
-        if available_bytes < 1:
-            # If the directory path itself is too long, we cannot truncate the filename
-            return path
+    name = str(artist_name).strip()
+    if not name:
+        return []
 
-            # 4. Truncate the base name if necessary
-        truncated_basename = basename
-        if len(basename_bytes) > available_bytes:
-            # Truncate to the maximum allowed byte length
-            truncated_basename = basename_bytes[:available_bytes].decode('utf-8', 'ignore')
+    if ' & ' not in name:
+        return [name]
 
-        # Reconstruct the path using the truncated basename
-        path = os.path.join(dirname, truncated_basename).replace('\\', '/')
+    parts = [part.strip() for part in name.split(' & ') if part.strip()]
+    if len(parts) < 2:
+        return [name]
 
-    return path
+    # "Albert King & Stevie Ray Vaughan" — both sides contain a space.
+    # "Simon & Garfunkel" — neither side contains a space; keep as one artist.
+    if len(parts) > 2 or all(' ' in part for part in parts):
+        return _dedupe_artist_names(parts)
+    return [name]
+
+
+def artists_from_apple_attrs(attrs: dict) -> list[str]:
+    """Build a list of track/album artists from Apple Music catalog attributes."""
+    if not attrs:
+        return ['Unknown Artist']
+
+    raw_names = attrs.get('artistNames')
+    if isinstance(raw_names, list) and raw_names:
+        names = [str(n).strip() for n in raw_names if n and str(n).strip()]
+        if names:
+            return _dedupe_artist_names(names)
+
+    parsed = parse_multi_artist_name(attrs.get('artistName') or attrs.get('name'))
+    return parsed if parsed else ['Unknown Artist']
+
+
+def resolve_filename_separator(formatting: dict | None = None) -> str:
+    """Separator for joining multi-value fields in path/filename templates."""
+    fmt = formatting or {}
+    sep = fmt.get('filename_separator')
+    if sep is None or (isinstance(sep, str) and sep == ''):
+        return fmt.get('metadata_separator', ', ')
+    return str(sep)
+
+
+def format_album_artist_tag(artist_data, separator: str = ', ', primary_only: bool = False) -> str:
+    """Join multiple album artists for embedded metadata display.
+
+    With primary_only=True, only the first/primary artist is returned — used for the
+    ALBUMARTIST tag so collaboration albums are filed under one primary artist instead
+    of every credited artist.
+    """
+    if isinstance(artist_data, list):
+        names = _dedupe_artist_names(artist_data)
+    else:
+        names = parse_multi_artist_name(artist_data)
+    if not names:
+        return ''
+    if primary_only:
+        return names[0]
+    return separator.join(names) if len(names) > 1 else names[0]
+
+
+def resolve_album_artist_tag(*sources, separator: str = ', ', primary_only: bool = False) -> str:
+    """Pick the first usable album-artist source and normalize separators."""
+    for source in sources:
+        if not source:
+            continue
+        formatted = format_album_artist_tag(source, separator=separator, primary_only=primary_only)
+        if formatted:
+            return formatted
+    return ''
+
+
+def _truncate_utf8_bytes(value: str, max_bytes: int) -> str:
+    """Truncate a string to max UTF-8 bytes without cutting mid-sequence."""
+    if max_bytes <= 0:
+        return ''
+    encoded = value.encode('utf-8')
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode('utf-8', 'ignore')
+
+
+def fix_byte_limit(path: str, byte_limit=250):
+    """
+    Keep generated paths filename-safe by:
+    - limiting the filename byte size (while preserving extension)
+    - additionally shrinking filename for legacy Windows MAX_PATH safety
+    """
+    normalized_path = os.path.normpath(path)
+    directory, filename = os.path.split(normalized_path)
+
+    if not filename:
+        return normalized_path
+
+    stem, ext = os.path.splitext(filename)
+    ext_bytes = len(ext.encode('utf-8'))
+    max_stem_bytes = max(1, byte_limit - ext_bytes)
+    stem = _truncate_utf8_bytes(stem, max_stem_bytes)
+    fixed_filename = f'{stem}{ext}'
+    candidate_path = os.path.join(directory, fixed_filename) if directory else fixed_filename
+
+    # Windows still commonly hits MAX_PATH (260 incl. null terminator) in non-long-path contexts.
+    if os.name == 'nt':
+        # Keep headroom below MAX_PATH for shell/Explorer operations (e.g. Recycle Bin move).
+        windows_path_limit = 220
+        check_path = os.path.abspath(candidate_path)
+        while len(check_path) > windows_path_limit and len(stem) > 1:
+            stem = _truncate_utf8_bytes(stem, len(stem.encode('utf-8')) - 1)
+            fixed_filename = f'{stem}{ext}'
+            candidate_path = os.path.join(directory, fixed_filename) if directory else fixed_filename
+            check_path = os.path.abspath(candidate_path)
+
+    return candidate_path.replace('\\', '/')
 
 
 r_session = create_requests_session()
 
-
-# ... (El resto de las funciones como download_file_async, etc., deberían seguir abajo)
-
-async def download_file_async(session, url, file_location, headers={}, enable_progress_bar=False, indent_level=0, artwork_settings=None, max_retries=3):
+async def download_file_async(session, url, file_location, headers={}, enable_progress_bar=False, indent_level=0, artwork_settings=None, max_retries=3, skip_if_exists=True):
     """Async version of download_file using aiohttp - returns (file_location, bytes_downloaded)"""
-    if os.path.isfile(file_location):
+    if skip_if_exists and os.path.isfile(file_location):
         # File already exists - return 0 bytes downloaded
         return (file_location, 0)
 
@@ -238,20 +356,6 @@ async def download_file_async(session, url, file_location, headers={}, enable_pr
                 return (file_location, bytes_downloaded)
                 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            if isinstance(e, aiohttp.ClientResponseError) and e.status == 429:
-                # Special handling for Rate Limiting
-                retry_after = 20
-                # Try to get Retry-After header from response if possible, 
-                # but ClientResponseError doesn't always carry headers easily unless we passed them.
-                # Just wait 10s and retry without counting towards limit? 
-                # For now, just wait longer and continue.
-                print(f"Rate limited (429). Waiting {retry_after}s...")
-                await asyncio.sleep(retry_after)
-                # Decrement attempt to not count this as a failure? 
-                # Cannot modify loop variable 'attempt'.
-                # But we can just continue. If we want infinite retries for 429, we need a while loop.
-                # For now, let's just accept the wait.
-                
             if attempt < max_retries - 1:
                 await asyncio.sleep(2 ** attempt)  # Exponential backoff
                 continue
@@ -268,10 +372,19 @@ async def download_file_async(session, url, file_location, headers={}, enable_pr
                 print(f'\tDeleting partially downloaded file "{str(file_location)}"')
                 silentremove(file_location)
             raise KeyboardInterrupt
+        except Exception:
+            # Clean up the partial file on any other failure so skip-if-exists
+            # logic can never treat a broken download as a complete file (issue #96).
+            if os.path.isfile(file_location):
+                try:
+                    os.remove(file_location)
+                except OSError:
+                    pass
+            raise
 
-def download_file(url, file_location, headers={}, enable_progress_bar=False, indent_level=0, artwork_settings=None):
+def download_file(url, file_location, headers={}, enable_progress_bar=False, indent_level=0, artwork_settings=None, skip_if_exists=True):
     """Synchronous wrapper for the async download function for backward compatibility"""
-    if os.path.isfile(file_location):
+    if skip_if_exists and os.path.isfile(file_location):
         return None
 
     # Create directory structure if it doesn't exist
@@ -280,6 +393,7 @@ def download_file(url, file_location, headers={}, enable_progress_bar=False, ind
         os.makedirs(directory, exist_ok=True)
 
     r = r_session.get(url, stream=True, headers=headers, verify=False)
+    r.raise_for_status()
 
     total = None
     if 'content-length' in r.headers:
@@ -345,6 +459,12 @@ def download_file(url, file_location, headers={}, enable_progress_bar=False, ind
             print(f'\tDeleting partially downloaded file "{str(file_location)}"')
             silentremove(file_location)
         raise KeyboardInterrupt
+    except Exception:
+        # Clean up the partial file on any failure so skip-if-exists logic can
+        # never treat a broken download as a complete file (issue #96).
+        if os.path.isfile(file_location):
+            silentremove(file_location)
+        raise
     
     # Return the file location on successful download
     return file_location
@@ -366,46 +486,89 @@ def silentremove(filename):
             raise
 
 def read_temporary_setting(settings_location, module, root_setting=None, setting=None, global_mode=False):
-    temporary_settings = pickle.load(open(settings_location, 'rb'))
-    module_settings = temporary_settings['modules'][module] if module in temporary_settings['modules'] else None
+    # Standardize module name to lowercase (as used by orpheus core)
+    module = module.lower()
+    try:
+        with open(settings_location, 'rb') as f:
+            temporary_settings = pickle.load(f)
+    except (FileNotFoundError, EOFError):
+        temporary_settings = {'modules': {}}
+
+    module_settings = temporary_settings['modules'].get(module)
     
     if module_settings:
         if global_mode:
             session = module_settings
         else:
-            session = module_settings['sessions'][module_settings['selected']]
+            session = module_settings['sessions'].get(module_settings.get('selected', 'default'))
     else:
         session = None
 
     if session and root_setting:
         if setting:
-            return session[root_setting][setting] if root_setting in session and setting in session[root_setting] else None
+            return session[root_setting].get(setting) if root_setting in session and isinstance(session[root_setting], dict) else None
         else:
-            return session[root_setting] if root_setting in session else None
+            return session.get(root_setting)
     elif root_setting and not session:
-        raise Exception('Module does not use temporary settings') 
+        return None  # Return None instead of raising Exception to support cleared sessions
     else:
         return session
 
 def set_temporary_setting(settings_location, module, root_setting, setting=None, value=None, global_mode=False):
-    temporary_settings = pickle.load(open(settings_location, 'rb'))
-    module_settings = temporary_settings['modules'][module] if module in temporary_settings['modules'] else None
+    # Standardize module name to lowercase (as used by orpheus core)
+    module = module.lower()
+    try:
+        with open(settings_location, 'rb') as f:
+            temporary_settings = pickle.load(f)
+    except (FileNotFoundError, EOFError):
+        temporary_settings = {'modules': {}}
+
+    if module not in temporary_settings['modules']:
+        # Initialize default structure if missing
+        temporary_settings['modules'][module] = {'sessions': {'default': {'clear_session': False, 'hashes': {}, 'custom_data': {}}}, 'selected': 'default'}
+
+    module_settings = temporary_settings['modules'][module]
 
     if module_settings:
         if global_mode:
             session = module_settings
         else:
+            if 'sessions' not in module_settings or not module_settings['sessions']:
+                module_settings['sessions'] = {'default': {'clear_session': False, 'hashes': {}, 'custom_data': {}}}
+                module_settings['selected'] = 'default'
             session = module_settings['sessions'][module_settings['selected']]
     else:
         session = None
 
     if not session:
-        raise Exception('Module does not use temporary settings')
+        # Should be unreachable with above init, but safety fallback
+        temporary_settings['modules'][module] = {'sessions': {'default': {'clear_session': False, 'hashes': {}, 'custom_data': {}}}, 'selected': 'default'}
+        session = temporary_settings['modules'][module]['sessions']['default']
+
     if setting:
+        if root_setting not in session:
+            session[root_setting] = {}
         session[root_setting][setting] = value
     else:
         session[root_setting] = value
-    pickle.dump(temporary_settings, open(settings_location, 'wb'))
+        
+    with open(settings_location, 'wb') as f:
+        pickle.dump(temporary_settings, f)
+
+def remove_module_from_storage(settings_location, module):
+    """Removes a module's entire entry from storage."""
+    # Standardize module name to lowercase (as used by orpheus core)
+    module = module.lower()
+    try:
+        with open(settings_location, 'rb') as f:
+            temporary_settings = pickle.load(f)
+    except (FileNotFoundError, EOFError):
+        return
+
+    if 'modules' in temporary_settings and module in temporary_settings['modules']:
+        del temporary_settings['modules'][module]
+        with open(settings_location, 'wb') as f:
+            pickle.dump(temporary_settings, f)
 
 create_temp_filename = lambda : f'temp/{os.urandom(16).hex()}'
 
@@ -425,11 +588,615 @@ async def download_to_temp_async(session, url, headers={}, extension='', enable_
     await download_file_async(session, url, location, headers=headers, enable_progress_bar=enable_progress_bar, indent_level=indent_level)
     return location
 
+def get_clean_env():
+    """Get a clean environment for subprocesses to avoid PyInstaller library conflicts."""
+    import os
+    import sys
+    import platform as _platform
+    env = os.environ.copy()
+    
+    # Only strip library paths if we are in a frozen (PyInstaller) environment
+    # or if the _ORIG version exists (which indicates we were spawned from a frozen parent)
+    is_frozen = getattr(sys, 'frozen', False)
+    has_orig_ld = 'LD_LIBRARY_PATH_ORIG' in env
+    has_orig_dyld = 'DYLD_LIBRARY_PATH_ORIG' in env
 
-def open_url_in_browser(url):
-    """Open a URL in the user's default web browser (used by modules for OAuth login flows)."""
-    import webbrowser
+    if is_frozen or has_orig_ld or has_orig_dyld:
+        env.pop('LD_LIBRARY_PATH', None)
+        env.pop('DYLD_LIBRARY_PATH', None)
+        if has_orig_ld:
+            env['LD_LIBRARY_PATH'] = env['LD_LIBRARY_PATH_ORIG']
+        if has_orig_dyld:
+            env['DYLD_LIBRARY_PATH'] = env['DYLD_LIBRARY_PATH_ORIG']
+
+    # Windows: PyInstaller onefile extracts DLLs under _MEIPASS on PATH. Native tools
+    # (Shaka Packager, ffmpeg) can load the wrong DLLs and crash (exit 0xC0000005).
+    if is_frozen and _platform.system() == 'Windows':
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            meipass_norm = os.path.normcase(os.path.abspath(meipass))
+            cleaned_path = []
+            for entry in env.get('PATH', '').split(os.pathsep):
+                if not entry:
+                    continue
+                try:
+                    entry_norm = os.path.normcase(os.path.abspath(entry))
+                except OSError:
+                    cleaned_path.append(entry)
+                    continue
+                if entry_norm == meipass_norm or entry_norm.startswith(meipass_norm + os.sep):
+                    continue
+                cleaned_path.append(entry)
+            env['PATH'] = os.pathsep.join(cleaned_path)
+    
+    return env
+
+
+def open_with_system_default(target: str) -> bool:
+    """Open a URL, file, or folder with the OS default handler.
+
+    Uses a cleaned environment on Linux/macOS frozen builds (PyInstaller/AppImage)
+    so xdg-open/open do not inherit LD_LIBRARY_PATH/DYLD_LIBRARY_PATH from the bundle,
+    which otherwise prevents the handler from starting on Wayland and X11.
+    Returns True if a launcher was invoked without raising."""
+    import platform as _platform
+    import subprocess
+
+    if not target:
+        return False
     try:
-        return webbrowser.open(url)
+        if _platform.system() == 'Windows':
+            os.startfile(target)  # type: ignore[attr-defined]
+            return True
+        env = get_clean_env()
+        if _platform.system() == 'Darwin':
+            subprocess.run(['open', target], check=False, env=env)
+        else:
+            subprocess.run(['xdg-open', target], check=False, env=env)
+        return True
     except Exception:
         return False
+
+
+def open_url_in_browser(url: str) -> bool:
+    """Open *url* in the system default browser (alias for open_with_system_default)."""
+    return open_with_system_default(url)
+
+
+_webbrowser_open_patched = False
+
+
+def patch_webbrowser_open():
+    """Route webbrowser.open() through open_with_system_default (OAuth, vendor code, etc.)."""
+    global _webbrowser_open_patched
+    if _webbrowser_open_patched:
+        return
+    import webbrowser
+    _orig_open = webbrowser.open
+
+    def _open(url, new=0, autoraise=True):
+        if open_with_system_default(url):
+            return True
+        try:
+            return _orig_open(url, new, autoraise)
+        except Exception:
+            return False
+
+    webbrowser.open = _open
+    _webbrowser_open_patched = True
+
+
+patch_webbrowser_open()
+
+
+_SHAKA_PACKAGER_NAMES = {
+    'Windows': ('packager-win-x64.exe', 'packager-win.exe', 'shaka-packager.exe'),
+    'Darwin': ('packager-osx-x64', 'packager-osx', 'shaka-packager'),
+    'Linux': ('packager-linux-x64', 'packager-linux', 'shaka-packager'),
+}
+
+_SHAKA_PACKAGER_DOWNLOAD = {
+    'Windows': 'packager-win-x64.exe',
+    'Darwin': 'packager-osx-x64',
+    'Linux': 'packager-linux-x64',
+}
+
+_MP4DECRYPT_NAMES = {
+    'Windows': ('mp4decrypt.exe',),
+    'Darwin': ('mp4decrypt',),
+    'Linux': ('mp4decrypt',),
+}
+
+
+def _shaka_packager_version_output(executable) -> str:
+    """Return combined stdout/stderr from `packager -version` / `--version`."""
+    import subprocess
+    import platform as _platform
+    from pathlib import Path
+
+    path = Path(executable)
+    if not path.is_file():
+        return ''
+    run_kwargs = {
+        'args': [str(path), '-version'],
+        'capture_output': True,
+        'text': True,
+        'timeout': 15,
+        'env': get_clean_env(),
+    }
+    if _platform.system() == 'Windows':
+        run_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+    try:
+        result = subprocess.run(**run_kwargs)
+    except Exception:
+        try:
+            run_kwargs['args'] = [str(path), '--version']
+            result = subprocess.run(**run_kwargs)
+        except Exception:
+            return ''
+    return f"{result.stdout or ''}{result.stderr or ''}".strip()
+
+
+def ensure_shaka_packager_binary(search_root=None):
+    """Download Shaka Packager (latest) only when missing under search_root. Never replaces an existing binary."""
+    import platform as _platform
+    import urllib.request
+    import stat
+    from pathlib import Path
+
+    system = _platform.system()
+    filename = _SHAKA_PACKAGER_DOWNLOAD.get(system)
+    if not filename:
+        return None
+
+    if search_root is None:
+        roots = _shaka_packager_search_roots()
+        root = Path(roots[0]) if roots else Path.cwd()
+    else:
+        root = Path(search_root)
+
+    dest = (root / filename).resolve()
+    if dest.is_file() and dest.stat().st_size > 0:
+        return dest
+
+    url = f'https://github.com/shaka-project/shaka-packager/releases/latest/download/{filename}'
+    try:
+        print(f'[Shaka] Downloading {filename} (latest release)...')
+        urllib.request.urlretrieve(url, dest)
+        if system != 'Windows':
+            dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
+        version_text = _shaka_packager_version_output(dest)
+        if version_text:
+            print(f'[Shaka] {version_text}')
+        return dest.resolve() if dest.is_file() else None
+    except Exception as exc:
+        print(f'[Shaka] WARNING: Could not download Shaka Packager: {exc}')
+        return resolve_shaka_packager()
+
+
+def _shaka_packager_search_roots():
+    """Directories to search for the Shaka Packager binary (app root, bundle, cwd)."""
+    import sys
+    roots = []
+    seen = set()
+
+    def _add(path):
+        if not path:
+            return
+        try:
+            key = os.path.normcase(os.path.abspath(path))
+        except OSError:
+            return
+        if key not in seen and os.path.isdir(path):
+            seen.add(key)
+            roots.append(path)
+
+    if getattr(sys, 'frozen', False):
+        _add(os.path.dirname(os.path.abspath(sys.executable)))
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            _add(meipass)
+    else:
+        try:
+            _add(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        except OSError:
+            pass
+    _add(os.getcwd())
+    return roots
+
+
+def resolve_shaka_packager():
+    """Return absolute path to Shaka Packager, or None if not found."""
+    import platform as _platform
+    import shutil
+    from pathlib import Path
+
+    names = _SHAKA_PACKAGER_NAMES.get(_platform.system())
+    if not names:
+        return None
+
+    for root in _shaka_packager_search_roots():
+        for name in names:
+            candidate = Path(root) / name
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate.resolve()
+
+    env = get_clean_env()
+    for name in names:
+        found = shutil.which(name, path=env.get('PATH'))
+        if found:
+            path = Path(found)
+            if path.is_file() and path.stat().st_size > 0:
+                return path.resolve()
+    return None
+
+
+def resolve_mp4decrypt():
+    """Return path to Bento4 mp4decrypt (optional Amazon Music fallback), or None."""
+    import platform as _platform
+    import shutil
+    from pathlib import Path
+
+    system = _platform.system()
+    names = _MP4DECRYPT_NAMES.get(system)
+    if not names:
+        return None
+
+    for root in _shaka_packager_search_roots():
+        for name in names:
+            candidate = Path(root) / name
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate.resolve()
+
+    env = get_clean_env()
+    search_path = env.get('PATH', '')
+    # Finder-launched .app bundles inherit a minimal PATH that omits Homebrew and
+    # other common bin dirs, so a `brew install bento4` binary is otherwise invisible.
+    if system in ('Darwin', 'Linux'):
+        extra_dirs = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin']
+        home = env.get('HOME')
+        if home:
+            extra_dirs.append(os.path.join(home, '.local', 'bin'))
+        existing = search_path.split(os.pathsep) if search_path else []
+        merged = existing + [d for d in extra_dirs if d not in existing]
+        search_path = os.pathsep.join(merged)
+
+    for name in names:
+        found = shutil.which(name, path=search_path or None)
+        if found:
+            path = Path(found)
+            if path.is_file() and path.stat().st_size > 0:
+                return path.resolve()
+    return None
+
+
+def ensure_shaka_packager_in_data_dir(data_dir: str) -> str | None:
+    """
+    Copy bundled Shaka Packager into the writable data directory (frozen builds).
+    Returns the packager path if available.
+    """
+    import shutil
+    import platform as _platform
+
+    resolved = resolve_shaka_packager()
+    if not resolved:
+        return None
+
+    if not data_dir:
+        return str(resolved)
+
+    names = _SHAKA_PACKAGER_NAMES.get(_platform.system(), ())
+    dest_name = names[0] if names else resolved.name
+    dest = os.path.join(data_dir, dest_name)
+    src = str(resolved)
+
+    try:
+        if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dest)):
+            return dest
+        if not os.path.isfile(dest) or os.path.getsize(dest) < os.path.getsize(src):
+            shutil.copy2(src, dest)
+    except OSError:
+        return src
+    return dest
+
+_ffmpeg_cache = None
+
+def find_system_ffmpeg():
+    """
+    Find FFmpeg on macOS, Linux, or Windows. Returns (found: bool, path: str).
+    Checks common locations first, then system PATH.
+    """
+    global _ffmpeg_cache
+    if _ffmpeg_cache is not None:
+        return _ffmpeg_cache
+
+    import subprocess
+    import platform
+    
+    system = platform.system()
+    # Common FFmpeg locations by platform
+    common_paths = []
+    if system == 'Darwin':
+        # macOS - Homebrew and system locations
+        common_paths = [
+            '/opt/homebrew/bin/ffmpeg',   # Apple Silicon
+            '/usr/local/bin/ffmpeg',      # Intel
+            '/usr/bin/ffmpeg',            # System
+        ]
+    elif system == 'Linux':
+        # Linux - common package manager locations
+        common_paths = [
+            '/usr/bin/ffmpeg',            # apt, dnf, pacman
+            '/usr/local/bin/ffmpeg',      # manual install
+            '/snap/bin/ffmpeg',           # snap
+        ]
+    elif system == 'Windows':
+        # Windows - common chocolatey/scoop/manual locations
+        common_paths = [
+            'C:/ProgramData/chocolatey/bin/ffmpeg.exe',
+            os.path.expandvars('%USERPROFILE%/scoop/shims/ffmpeg.exe'),
+            'C:/ffmpeg/bin/ffmpeg.exe',
+        ]
+    # Add project root to common_paths as the highest priority
+    try:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        root_ffmpeg = os.path.join(project_root, 'ffmpeg.exe' if system == 'Windows' else 'ffmpeg')
+        common_paths = [root_ffmpeg] + common_paths
+    except:
+        pass
+    
+    for path in common_paths:
+            try:
+                # Use CREATE_NO_WINDOW on Windows to avoid transient console popup
+                run_kwargs = {'capture_output': True, 'timeout': 3, 'env': get_clean_env()}
+                if platform.system() == 'Windows':
+                    run_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+                result = subprocess.run([path, '-version'], **run_kwargs)
+                if result.returncode == 0:
+                    _ffmpeg_cache = (True, path)
+                    return _ffmpeg_cache
+            except:
+                pass
+    
+    try:
+        cmd = 'where' if system == 'Windows' else 'which'
+        # Use CREATE_NO_WINDOW on Windows to avoid transient console popup
+        run_kwargs = {'capture_output': True, 'timeout': 3, 'env': get_clean_env()}
+        if system == 'Windows':
+            run_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run([cmd, 'ffmpeg' if system != 'Windows' else 'ffmpeg.exe'], **run_kwargs)
+        if result.returncode == 0:
+            ffmpeg_path = result.stdout.decode().strip().split('\n')[0].strip()
+            if ffmpeg_path and os.path.isfile(ffmpeg_path):
+                _ffmpeg_cache = (True, ffmpeg_path)
+                return _ffmpeg_cache
+    except:
+        pass
+    
+    _ffmpeg_cache = (False, None)
+    return _ffmpeg_cache
+
+
+_ffmpeg_opus_cache = None
+
+def ffmpeg_has_opus(binary) -> bool:
+    """
+    Return True if the given ffmpeg executable can encode Opus (libopus or native
+    opus encoder advertised in `-encoders`).
+    """
+    import subprocess
+    import platform
+
+    if not binary or not os.path.isfile(binary):
+        return False
+    try:
+        run_kwargs = {
+            'capture_output': True,
+            'timeout': 8,
+            'env': get_clean_env(),
+        }
+        if platform.system() == 'Windows':
+            run_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        res = subprocess.run([binary, '-hide_banner', '-encoders'], **run_kwargs)
+    except Exception:
+        return False
+    if res.returncode != 0:
+        return False
+    out = (res.stdout or b'').decode('utf-8', 'ignore').lower()
+    # Accept libopus, or the native opus encoder (some builds mark it experimental,
+    # but when present it is a working Opus encoder). Ensures Opus mux/encode works.
+    return ('libopus' in out) or (' opus ' in out or '\nopus ' in out)
+
+
+def resolve_ffmpeg_with_opus(preferred=None):
+    """
+    Return a path to an ffmpeg that can encode Opus, or None if none found.
+
+    ``preferred`` (if given) is probed first; if it lacks an Opus encoder (some
+    installs ship ffmpeg without libopus, or build the native 'opus' encoder as
+    experimental/disabled), the app-bundled ffmpeg and then every ffmpeg on PATH
+    are tried so callers never fail silently on Opus muxing. Candidates are probed
+    and cached only when no explicit ``preferred`` is passed.
+    """
+    global _ffmpeg_opus_cache
+    if preferred is None:
+        if _ffmpeg_opus_cache is not None:
+            return _ffmpeg_opus_cache
+
+    import subprocess
+    import platform
+    import shutil
+
+    system = platform.system()
+    candidates = []
+
+    if preferred:
+        candidates.append(preferred)
+
+    # The app/project-bundled ffmpeg (highest priority, like find_system_ffmpeg).
+    try:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        root_ffmpeg = os.path.join(project_root, 'ffmpeg.exe' if system == 'Windows' else 'ffmpeg')
+        if os.path.isfile(root_ffmpeg):
+            candidates.append(root_ffmpeg)
+    except Exception:
+        pass
+
+    # Whatever find_system_ffmpeg resolves (bundled path or first PATH hit).
+    try:
+        found, path = find_system_ffmpeg()
+        if found and path:
+            candidates.append(path)
+    except Exception:
+        pass
+
+    # Every ffmpeg on PATH, in order, so we never fail if the preferred ones lack Opus.
+    if system == 'Windows':
+        resolved = shutil.which('ffmpeg.exe') or shutil.which('ffmpeg')
+        if resolved:
+            candidates.append(resolved)
+        # Windows PATH can list several ffmpeg binaries; the highest-priority one may
+        # lack an Opus encoder, so also probe the rest (essentials/dev builds, etc.).
+        try:
+            all_on_path = subprocess.run(
+                ['where', 'ffmpeg.exe'], capture_output=True, timeout=8, env=get_clean_env()
+            ).stdout.decode('utf-8', 'ignore').splitlines()
+            for p in all_on_path:
+                p = p.strip()
+                if p:
+                    candidates.append(p)
+        except Exception:
+            pass
+    else:
+        resolved = shutil.which('ffmpeg')
+        if resolved:
+            candidates.append(resolved)
+
+    # Deduplicate (preserving order), then probe each for an Opus encoder.
+    seen = set()
+    for cand in candidates:
+        try:
+            cand_abs = os.path.abspath(cand)
+        except Exception:
+            cand_abs = cand
+        if cand_abs in seen:
+            continue
+        seen.add(cand_abs)
+        if ffmpeg_has_opus(cand_abs):
+            if preferred is None:
+                _ffmpeg_opus_cache = cand_abs
+            return cand_abs
+
+    if preferred is None:
+        _ffmpeg_opus_cache = None
+    return None
+
+
+def is_missing_executable_error(error_str) -> bool:
+    """True when subprocess failed because an executable path could not be resolved (e.g. missing ffmpeg)."""
+    if not error_str:
+        return False
+    el = str(error_str).lower()
+    return (
+        'winerror 2' in el
+        or 'errno 2' in el
+        or 'cannot find the file specified' in el
+        or 'no such file or directory' in el
+        or 'het systeem kan het opgegeven bestand niet vinden' in el
+    )
+
+
+def locate_ffmpeg(preferred_path=None, extra_search_dirs=None):
+    """
+    Resolve the ffmpeg executable. Checks the configured path, app/bundle dirs, then system PATH.
+    Returns an absolute path string, or None if not found.
+    """
+    import platform
+    import sys
+
+    system = platform.system()
+    ffmpeg_name = 'ffmpeg.exe' if system == 'Windows' else 'ffmpeg'
+    extra_search_dirs = extra_search_dirs or []
+
+    def _is_valid(path):
+        return bool(path) and os.path.isfile(path)
+
+    if isinstance(preferred_path, str):
+        candidate = preferred_path.strip()
+        if candidate and candidate.lower() != 'ffmpeg' and _is_valid(candidate):
+            return os.path.abspath(candidate)
+
+    search_paths = []
+    for directory in extra_search_dirs:
+        if directory:
+            search_paths.append(os.path.join(directory, ffmpeg_name))
+
+    try:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        search_paths.append(os.path.join(project_root, ffmpeg_name))
+    except Exception:
+        pass
+
+    search_paths.append(os.path.join(os.getcwd(), ffmpeg_name))
+
+    if hasattr(sys, '_MEIPASS'):
+        search_paths.append(os.path.join(sys._MEIPASS, ffmpeg_name))
+
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        search_paths.insert(0, os.path.join(exe_dir, ffmpeg_name))
+
+    seen = set()
+    for path in search_paths:
+        norm = os.path.normcase(os.path.abspath(path)) if os.path.isabs(path) or path else path
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if _is_valid(path):
+            return os.path.abspath(path)
+
+    found, system_path = find_system_ffmpeg()
+    if found and system_path:
+        return system_path
+    return None
+
+
+def resolve_deezer_share_url(url: str) -> str:
+    """Expand link.deezer.com share URLs to a canonical www.deezer.com URL."""
+    if not url or not isinstance(url, str):
+        return url
+    stripped = url.strip()
+    try:
+        parsed = urlparse(stripped)
+    except Exception:
+        return url
+    host = (parsed.netloc or '').lower()
+    if host not in ('link.deezer.com', 'www.link.deezer.com'):
+        return url
+    if parsed.scheme not in ('http', 'https'):
+        return url
+    try:
+        session = create_requests_session()
+        response = session.head(stripped, allow_redirects=True, timeout=15)
+        if response.status_code >= 400:
+            response = session.get(stripped, allow_redirects=True, timeout=15)
+        response.raise_for_status()
+        final_parsed = urlparse(response.url)
+        final_host = (final_parsed.netloc or '').lower()
+        if 'deezer.com' not in final_host or final_host == 'link.deezer.com':
+            return url
+        # Drop tracking query params; keep locale + path (e.g. /en/playlist/123).
+        return urlunparse((
+            final_parsed.scheme or 'https',
+            final_parsed.netloc,
+            final_parsed.path.rstrip('/') or '/',
+            '', '', '',
+        ))
+    except Exception:
+        return url
+
+
+def resolve_platform_share_url(url: str) -> str:
+    """Resolve known platform short/share links to downloadable canonical URLs."""
+    resolved = resolve_deezer_share_url(url)
+    return resolved if resolved != url else url

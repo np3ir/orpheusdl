@@ -1,10 +1,11 @@
-import importlib, json, logging, os, pickle, requests, urllib3, base64, shutil
+import importlib, json, logging, os, pickle, requests, urllib3, base64, shutil, sys
 from datetime import datetime
 
 from orpheus.music_downloader import Downloader
 from utils.models import *
 from utils.utils import *
 from utils.exceptions import *
+from utils.module_settings import merge_module_settings
 
 os.environ['CURL_CA_BUNDLE'] = ''  # Hack to disable SSL errors for requests module for easier debugging
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # Make SSL warnings hidden
@@ -36,60 +37,47 @@ class Orpheus:
         self.default_global_settings = {
             "general": {
                 "download_path": "./downloads/",
-                "video_download_path": "./videos/",
-                "download_videos": True,
                 "download_quality": "hifi",
-                "search_limit": 10,
+                "search_limit": 25,
+                "disabled_search_platforms": [],
                 "concurrent_downloads": 5,
-                "inter_album_delay_min": 0,
-                "inter_album_delay_max": 0,
-                "inter_track_delay_min": 0,
-                "inter_track_delay_max": 0,
-                "progress_bar": False
+                "progress_bar": False,
+                "throttle_batch_size": 0,
+                "throttle_pause_seconds": 30,
+                "create_platform_folder": False,
+                "disable_subscription_checks": False,
+                "ignore_existing_files": False,
+                "reverify_existing_files": False,
             },
             "artist_downloading":{
                 "return_credited_albums": True,
-                "separate_tracks_skip_downloaded": True
+                "separate_tracks_skip_downloaded": True,
+                "prefer_highest_quality_edition": True,
+                "merge_same_name_albums": False,
+                "explicit_content": "prefer_explicit",
             },
             "formatting": {
-                "album_format": "{name}{explicit}",
-                "playlist_format": "{name}{explicit}",
-                "track_filename_format": "{track_number}. {name}",
-                "single_full_path_format": "{name}",
+                "discography_format": "{name} {quality}",
+                "album_format": "{artist}/{name}",
+                "playlist_format": "{name}",
+                "track_filename_format": "{track_number}. {artist} - {name}",
+                "playlist_track_filename_format": "",
+                "single_full_path_format": "{artist} - {name}",
+                "metadata_separator": ", ",
+                "filename_separator": "",
+                "split_metadata": False,
                 "enable_zfill": True,
-                "force_album_format": False
+                "force_album_format": False,
+                "use_album_artist_for_discography": False,
+                "use_playlist_position": False,
+                "use_album_position": False
             },
             "codecs": {
                 "proprietary_codecs": False,
-                "spatial_codecs": True
+                "spatial_codecs": True,
+                "include_dolby_atmos": False,
             },
-            "module_defaults": {
-                "lyrics": "default",
-                "covers": "default",
-                "credits": "default"
-            },
-            "lyrics": {
-                "embed_lyrics": True,
-                "embed_synced_lyrics": False,
-                "save_synced_lyrics": True
-            },
-            "covers": {
-                "embed_cover": True,
-                "main_compression": "high",
-                "main_resolution": 1400,
-                "save_external": False,
-                "external_format": 'png',
-                "external_compression": "low",
-                "external_resolution": 3000,
-                "save_animated_cover": True
-            },
-            "playlist": {
-                "save_m3u": True,
-                "paths_m3u": "absolute",
-                "extended_m3u": True
-            },
-            "advanced": {
-                "advanced_login_system": False,
+            "codec_conversion": {
                 "codec_conversions": {
                     "alac": "flac",
                     "wav": "flac",
@@ -108,12 +96,41 @@ class Orpheus:
                 },
                 "conversion_keep_original": False,
                 "ffmpeg_path": "ffmpeg",
-                "cover_variance_threshold": 8,
-                "debug_mode": False,
-                "disable_subscription_checks": False,
-                "enable_undesirable_conversions": False,
-                "ignore_existing_files": False,
-                "ignore_different_artists": True
+                "enable_undesirable_conversions": False
+            },
+            "module_defaults": {
+                "lyrics": "default",
+                "covers": "default",
+                "credits": "default"
+            },
+            "lyrics": {
+                "embed_lyrics": True,
+                "embed_synced_lyrics": False,
+                "save_synced_lyrics": True
+            },
+            "covers": {
+                "embed_cover": True,
+                "main_compression": "high",
+                "main_resolution": 1400,
+                "save_original_cover_size": False,
+                "save_external": False,
+                "external_format": 'png',
+                "external_compression": "low",
+                "external_resolution": 3000,
+                "save_animated_cover": True
+            },
+            "playlist": {
+                "save_m3u": True,
+                "paths_m3u": "absolute",
+                "extended_m3u": True,
+                "group_by_album": False,
+                "m3u_only": False,
+                "sync": False,
+                "sync_remove_orphaned": False
+            },
+            "advanced": {
+                "advanced_login_system": False,
+                "debug_mode": False
             }
         }
 
@@ -123,9 +140,13 @@ class Orpheus:
 
         os.makedirs('config', exist_ok=True)
         try:
-            self.settings = json.loads(open(self.settings_location, 'r').read()) if os.path.exists(self.settings_location) else {}
-        except (json.JSONDecodeError, ValueError):
-            print(f'Warning: {self.settings_location} is corrupt or empty, resetting to defaults')
+            if os.path.exists(self.settings_location):
+                with open(self.settings_location, "r", encoding="utf-8") as f:
+                    self.settings = json.loads(f.read())
+            else:
+                self.settings = {}
+        except (json.JSONDecodeError, FileNotFoundError):
+            logging.warning("Orpheus: settings.json was corrupted or empty. Resetting to defaults.")
             self.settings = {}
 
         try:
@@ -136,47 +157,40 @@ class Orpheus:
                 logging.basicConfig(level=logging.CRITICAL)
                 # Specifically suppress common Spotify authentication messages
                 logging.getLogger('modules.spotify.spotify_api').setLevel(logging.CRITICAL)
-                logging.getLogger('librespot').setLevel(logging.CRITICAL)
                 logging.getLogger('spotify').setLevel(logging.CRITICAL)
         except KeyError:
             # Configure logging to suppress Spotify module warnings/errors even if no settings
             logging.basicConfig(level=logging.CRITICAL)
             logging.getLogger('modules.spotify.spotify_api').setLevel(logging.CRITICAL)
-            logging.getLogger('librespot').setLevel(logging.CRITICAL)
             logging.getLogger('spotify').setLevel(logging.CRITICAL)
 
         os.makedirs('extensions', exist_ok=True)
         for extension in os.listdir('extensions'):  # Loading extensions
             if os.path.isdir(f'extensions/{extension}') and os.path.exists(f'extensions/{extension}/interface.py'):
-                try:
-                    class_ = getattr(importlib.import_module(f'extensions.{extension}.interface'), 'OrpheusExtension', None)
-                    if class_:
-                        self.extension_list.add(extension)
-                        logging.debug(f'Orpheus: {extension} extension detected')
-                    else:
-                        raise Exception(f'Error loading extension: "{extension}"')
-                except Exception as e:
-                    logging.warning(f"Failed to load extension '{extension}': {e}")
+                class_ = getattr(importlib.import_module(f'extensions.{extension}.interface'), 'OrpheusExtension', None)
+                if class_:
+                    self.extension_list.add(extension)
+                    logging.debug(f'Orpheus: {extension} extension detected')
+                else:
+                    raise Exception('Error loading extension: "{extension}"')
 
         # Module preparation (not loaded yet for performance purposes)
+        # Modules in this set are skipped during discovery (e.g. deprecated/removed but folder may remain on macOS upgrades)
+        modules_ignored = {'jiosaavn', 'beatsource'}
         os.makedirs('modules', exist_ok=True)
-        module_list = [module.lower() for module in os.listdir('modules') if os.path.exists(f'modules/{module}/interface.py')]
+        module_list = [m.lower() for m in os.listdir('modules') if m.lower() not in modules_ignored and os.path.exists(f'modules/{m}/interface.py')]
         if not module_list or module_list == ['example']:
-            print('No modules are installed, quitting')
-            exit()
+            raise Exception('No modules are installed. Please install at least one module in the modules folder.')
         logging.debug('Orpheus: Modules detected: ' + ", ".join(module_list))
 
         for module in module_list:  # Loading module information into module_settings
-            try:
-                module_information: ModuleInformation = getattr(importlib.import_module(f'modules.{module}.interface'), 'module_information', None)
-                if module_information and not ModuleFlags.private in module_information.flags and not private_mode:
-                    self.module_list.add(module)
-                    self.module_settings[module] = module_information
-                    logging.debug(f'Orpheus: {module} added as a module')
-                else:
-                    raise Exception(f'Error loading module information from module: "{module}"') # TODO: replace with InvalidModuleError
-            except Exception as e:
-                logging.warning(f"Failed to load module '{module}': {e}")
+            module_information: ModuleInformation = getattr(importlib.import_module(f'modules.{module}.interface'), 'module_information', None)
+            if module_information and not ModuleFlags.private in module_information.flags and not private_mode:
+                self.module_list.add(module)
+                self.module_settings[module] = module_information
+                logging.debug(f'Orpheus: {module} added as a module')
+            else:
+                raise Exception(f'Error loading module information from module: "{module}"') # TODO: replace with InvalidModuleError
 
         duplicates = set()
         for module in self.module_list: # Detecting duplicate url constants
@@ -197,7 +211,14 @@ class Orpheus:
                         if ModuleFlags.private in self.module_settings[constant].flags: duplicates.add(constant)
                     else:
                         duplicates.add(tuple(sorted([module, self.module_netloc_constants[constant]])))
-        if duplicates: raise Exception('Multiple modules installed that connect to the same service names: ' + ', '.join(' and '.join(duplicates)))
+        if duplicates:
+            duplicate_msgs = []
+            for d in duplicates:
+                if isinstance(d, (list, tuple)):
+                    duplicate_msgs.append(' and '.join(d))
+                else:
+                    duplicate_msgs.append(str(d))
+            raise Exception('Multiple modules installed that connect to the same service names: ' + ', '.join(duplicate_msgs))
 
         self.update_module_storage()
 
@@ -229,10 +250,31 @@ class Orpheus:
             if class_:
                 class ModuleError(Exception): # TODO: get rid of this, as it is deprecated
                     def __init__(self, message):
-                        super().__init__(module + ' --> ' + str(message))
+                        super().__init__(str(message))
+
+                # Get settings with fallbacks to defaults for robustness on first run
+                global_settings = self.settings.get('global', {})
+                general_settings = global_settings.get('general', self.default_global_settings.get('general', {}))
+                advanced_settings = global_settings.get('advanced', self.default_global_settings.get('advanced', {}))
+                covers_settings = global_settings.get('covers', self.default_global_settings.get('covers', {}))
+
+                module_info = self.module_settings[module]
+                stored_module_settings = self.settings.get('modules', {}).get(module, {})
+                module_settings = merge_module_settings(module_info, stored_module_settings)
+
+                if module == 'amazonmusic':
+                    try:
+                        from modules.amazonmusic.interface import validate_amazonmusic_setup
+                        validate_amazonmusic_setup(
+                            module_settings,
+                            self.session_storage_location,
+                            gui_mode=bool(self.gui_handlers),
+                        )
+                    except ImportError:
+                        pass
 
                 module_controller = ModuleController(
-                    module_settings = self.settings['modules'][module] if module in self.settings['modules'] else {},
+                    module_settings=module_settings,
                     data_folder = os.path.join(self.data_folder_base, 'modules', module),
                     extensions = self.extensions,
                     temporary_settings_controller = TemporarySettingsController(module, self.session_storage_location),
@@ -240,38 +282,42 @@ class Orpheus:
                     get_current_timestamp = true_current_utc_timestamp,
                     printer_controller = oprinter,
                     orpheus_options = OrpheusOptions(
-                        debug_mode = self.settings['global']['advanced']['debug_mode'],
-                        quality_tier = QualityEnum[self.settings['global']['general']['download_quality'].upper()],
-                        disable_subscription_check = self.settings['global']['advanced']['disable_subscription_checks'],
+                        debug_mode = advanced_settings.get('debug_mode', False),
+                        quality_tier = QualityEnum[general_settings.get('download_quality', 'hifi').upper()],
+                        disable_subscription_check = general_settings.get('disable_subscription_checks', advanced_settings.get('disable_subscription_checks', False)),
                         default_cover_options = CoverOptions(
-                            file_type = ImageFileTypeEnum[self.settings['global']['covers']['external_format']],
-                            resolution = self.settings['global']['covers']['main_resolution'],
-                            compression = CoverCompressionEnum[self.settings['global']['covers']['main_compression']]
-                        )
+                            file_type = ImageFileTypeEnum[covers_settings.get('external_format', 'png')],
+                            resolution = covers_settings.get('main_resolution', 1400),
+                            compression = CoverCompressionEnum[covers_settings.get('main_compression', 'high')]
+                        ),
+                        play_sound_on_finish = general_settings.get('play_sound_on_finish', True)
                     ),
                     gui_handlers = self.gui_handlers,
-                    progress_bar_enabled = self.settings['global']['general'].get('progress_bar', True)
+                    progress_bar_enabled = general_settings.get('progress_bar', True)
                 )
 
                 loaded_module = class_(module_controller)
                 self.loaded_modules[module] = loaded_module
 
                 # Check if module has settings
-                settings = self.settings['modules'][module] if module in self.settings['modules'] else {}
+                settings = self.settings.get('modules', {}).get(module, {})
                 temporary_session = read_temporary_setting(self.session_storage_location, module)
                 if self.module_settings[module].login_behaviour is ManualEnum.orpheus:
-                    # Login if simple mode, username login and requested by update_setting_storage
-                    if temporary_session and temporary_session['clear_session'] and not self.settings['global']['advanced']['advanced_login_system']:
+                    # Login if simple mode (email or username + password) when requested by update_setting_storage
+                    if temporary_session and temporary_session['clear_session'] and not advanced_settings.get('advanced_login_system', False):
                         hashes = {k: hash_string(str(v)) for k, v in settings.items()}
                         if not temporary_session.get('hashes') or \
                             any(k not in hashes or hashes[k] != v for k,v in temporary_session['hashes'].items() if k in self.module_settings[module].session_settings):
-                            print('Logging into ' + self.module_settings[module].service_name)
-                            try:
-                                loaded_module.login(settings['email'] if 'email' in settings else settings['username'], settings['password'])
-                            except:
-                                set_temporary_setting(self.session_storage_location, module, 'hashes', None, {})
-                                raise
-                            set_temporary_setting(self.session_storage_location, module, 'hashes', None, hashes)
+                            username_or_email = (settings.get('email') or settings.get('username') or '').strip()
+                            password = (settings.get('password') or '').strip()
+                            if username_or_email and password:
+                                print('Logging into ' + self.module_settings[module].service_name)
+                                try:
+                                    loaded_module.login(settings['email'] if 'email' in settings else settings['username'], settings['password'])
+                                except:
+                                    set_temporary_setting(self.session_storage_location, module, 'hashes', None, {})
+                                    raise
+                                set_temporary_setting(self.session_storage_location, module, 'hashes', None, hashes)
                     if ModuleFlags.enable_jwt_system in self.module_settings[module].flags and temporary_session and \
                             temporary_session['refresh'] and not temporary_session['bearer']:
                         loaded_module.refresh_login()
@@ -336,6 +382,12 @@ class Orpheus:
                     else:
                         module_settings[i][j] = settings_to_parse[j]
                         new_setting_detected = True
+                # Preserve user-defined module keys that are not part of module schemas
+                # (e.g. GUI-only toggles like modules.tidal.throttle).
+                if i in old_settings['modules'] and isinstance(old_settings['modules'][i], dict):
+                    for legacy_key, legacy_value in old_settings['modules'][i].items():
+                        if legacy_key not in module_settings[i]:
+                            module_settings[i][legacy_key] = legacy_value
             else:
                 module_settings.pop(i)
 
@@ -344,7 +396,11 @@ class Orpheus:
         new_settings['modules'] = module_settings
 
         ## Sessions
-        sessions = pickle.load(open(self.session_storage_location, 'rb')) if os.path.exists(self.session_storage_location) else {}
+        try:
+            sessions = pickle.load(open(self.session_storage_location, 'rb')) if os.path.exists(self.session_storage_location) else {}
+        except (pickle.UnpicklingError, EOFError, AttributeError):
+            logging.warning("Orpheus: loginstorage.bin was corrupted. Resetting session storage.")
+            sessions = {}
 
         if not ('advancedmode' in sessions and 'modules' in sessions and sessions['advancedmode'] == advanced_login_mode):
             sessions = {'advancedmode': advanced_login_mode, 'modules':{}}
@@ -361,10 +417,16 @@ class Orpheus:
                 {j:new_module_sessions[i]['custom_data'][j] for j in self.module_settings[i].global_storage_variables \
                     if 'custom_data' in new_module_sessions[i] and j in new_module_sessions[i]['custom_data']}
 
+            # Migration/Fix for list-based sessions (legacy or corrupted)
+            if isinstance(new_module_sessions[i]['sessions'], list):
+                 first_session = new_module_sessions[i]['sessions'][0] if new_module_sessions[i]['sessions'] else {}
+                 new_module_sessions[i]['sessions'] = {'default': first_session}
+                 new_module_sessions[i]['selected'] = 'default'
+
             for current_session in new_module_sessions[i]['sessions'].values():
                 # For simple login type only, as it does not apply to advanced login
                 if self.module_settings[i].login_behaviour is ManualEnum.orpheus and not advanced_login_mode:
-                    hashes = {k:hash_string(str(v)) for k,v in module_settings[i].items()}
+                    hashes = {k:hash_string(str(v)) for k,v in module_settings.get(i, {}).items()}
                     if current_session.get('hashes'):
                         clear_session = any(k not in hashes or hashes[k] != v for k,v in current_session['hashes'].items() if k in self.module_settings[i].session_settings)
                     else:
@@ -394,23 +456,82 @@ class Orpheus:
                 elif 'custom_data' in current_session: current_session.pop('custom_data')
 
         pickle.dump({'advancedmode': advanced_login_mode, 'modules': new_module_sessions}, open(self.session_storage_location, 'wb'))
-        if os.path.exists(self.settings_location):
-            import shutil
-            shutil.copy2(self.settings_location, self.settings_location + '.bak')
-        open(self.settings_location, 'w').write(json.dumps(new_settings, indent = 4, sort_keys = False))
+        open(self.settings_location, 'w', encoding='utf-8').write(json.dumps(new_settings, indent = 4, sort_keys = False))
 
         if new_setting_detected:
-            print('New settings detected, or the configuration has been reset. Please update settings.json')
-            exit()
+            if self.settings.get('global', {}).get('advanced', {}).get('debug_mode', False):
+                print('New settings detected, or the configuration has been reset. Please update settings.json')
+            # Don't exit in GUI mode - just print the message and continue
+            # The GUI will handle showing appropriate messages to the user
+
+    def get_merged_global_settings(self):
+        """Returns global settings merged with defaults to ensure all keys exist."""
+        merged = {}
+        current_global = self.settings.get('global', {})
+        for section_name, section_defaults in self.default_global_settings.items():
+            if isinstance(section_defaults, dict):
+                merged[section_name] = {**section_defaults, **current_global.get(section_name, {})}
+            else:
+                merged[section_name] = current_global.get(section_name, section_defaults)
+        return merged
+
+def _show_cli_spotify_warning(use_ansi_colors=True):
+    """
+    Shows a suspension warning before downloading with Spotify through the CLI.
+    Includes a 10-second countdown that can be bypassed by pressing Enter, or cancelled via Ctrl+C.
+    """
+    import time
+    import threading
+    import sys
+
+    red_start = "\033[91m\033[1m" if use_ansi_colors else ""
+    yellow_start = "\033[93m\033[1m" if use_ansi_colors else ""
+    color_reset = "\033[0m" if use_ansi_colors else ""
+    print(f"\n{red_start}WARNING: Downloading from Spotify may suspend your account.{color_reset}")
+    print(f"{yellow_start}RECOMMENDED: Only download tracks unavailable elsewhere.{color_reset}\n")
+    print("If your account is suspended, contact support via the email you receive.")
+    print("Within 5 days, you should get a password reset email to regain access.")
+    print("(A 3rd suspension is permanent)\n")
+    print("Press Enter to proceed immediately, or Ctrl+C to cancel.\n")
+
+    stop_event = threading.Event()
+
+    def wait_for_enter():
+        try:
+            sys.stdin.readline()
+        except Exception:
+            pass
+        stop_event.set()
+
+    input_thread = threading.Thread(target=wait_for_enter, daemon=True)
+    input_thread.start()
+
+    for count in range(10, 0, -1):
+        if stop_event.is_set():
+            break
+        print(f"\rContinuing in {count}... ", end="", flush=True)
+        time.sleep(1)
+
+    # Clean up the countdown line in terminal
+    print("\r" + " " * 30 + "\r", end="", flush=True)
 
 
 def orpheus_core_download(orpheus_session: Orpheus, media_to_download, third_party_modules, separate_download_module, output_path, use_ansi_colors=True):
-    downloader = Downloader(orpheus_session.settings['global'], orpheus_session.module_controls, oprinter, output_path, use_ansi_colors)
+    # Get global settings merged with defaults to ensure all required keys exist
+    global_settings = orpheus_session.get_merged_global_settings()
+    downloader = Downloader(global_settings, orpheus_session.module_controls, oprinter, output_path, third_party_modules, use_ansi_colors)
     downloader.full_settings = orpheus_session.settings  # Add access to full settings including modules
     os.makedirs('temp', exist_ok=True)
 
+    spotify_warning_shown = False
+
     for mainmodule, items in media_to_download.items():
         total_items_in_batch = len(items)
+
+        # Show suspension warning once per CLI run for Spotify download backend
+        if (mainmodule.lower() == 'spotify' or separate_download_module == 'spotify') and not spotify_warning_shown:
+            _show_cli_spotify_warning(use_ansi_colors)
+            spotify_warning_shown = True
         
         for index, media in enumerate(items, start=1):
             if ModuleModes.download not in orpheus_session.module_settings[mainmodule].module_supported_modes:
@@ -424,13 +545,14 @@ def orpheus_core_download(orpheus_session: Orpheus, media_to_download, third_par
             for i in third_party_modules:
                 moduleselected = third_party_modules[i]
                 if moduleselected:
-                    if moduleselected not in orpheus_session.module_list:
+                    moduleselected_lower = moduleselected.lower()
+                    if moduleselected_lower not in orpheus_session.module_list:
                         raise Exception(f'{moduleselected} does not exist in modules.') # TODO: replace with InvalidModuleError
-                    elif i not in orpheus_session.module_settings[moduleselected].module_supported_modes:
+                    elif i not in orpheus_session.module_settings[moduleselected_lower].module_supported_modes:
                         raise Exception(f'Module {moduleselected} does not support {i}') # TODO: replace with ModuleDoesNotSupportAbility
                     else:
                         # If all checks pass, load up the selected module
-                        orpheus_session.load_module(moduleselected)
+                        orpheus_session.load_module(moduleselected_lower)
 
             downloader.third_party_modules = third_party_modules
 
@@ -465,13 +587,7 @@ def orpheus_core_download(orpheus_session: Orpheus, media_to_download, third_par
                     
                     # Add rate limiting for individual track downloads (like from urls.txt)
                     # Only pause if track was actually downloaded (not skipped) and not the last track
-                    if (mainmodule.lower() == 'spotify' and index < total_items_in_batch and 
-                        download_result is not None and download_result != "RATE_LIMITED"):
-                        pause_seconds = downloader._get_spotify_pause_seconds()
-                        # Don't add extra blank line - track completion already handles spacing
-                        downloader.print(f'Pausing {pause_seconds} seconds to prevent rate limiting...', drop_level=1)
-                        import time
-                        time.sleep(pause_seconds)
+                    downloader._handle_spotify_rate_limit_pause(download_result, index, total_items_in_batch, service_name_override=mainmodule.lower())
                     
                     # Collect rate-limited tracks for retry (only for Spotify and multiple tracks)
                     if (download_result == "RATE_LIMITED" and mainmodule.lower() == 'spotify' and 
@@ -487,6 +603,8 @@ def orpheus_core_download(orpheus_session: Orpheus, media_to_download, third_par
                     downloader.download_playlist(media_id, extra_kwargs=media.extra_kwargs)
                 elif mediatype is DownloadTypeEnum.artist:
                     downloader.download_artist(media_id, extra_kwargs=media.extra_kwargs)
+                elif mediatype is DownloadTypeEnum.label:
+                    downloader.download_label(media_id, extra_kwargs=media.extra_kwargs)
                 else:
                     raise Exception(f'\tUnknown media type "{mediatype}"')
 
@@ -526,4 +644,7 @@ def orpheus_core_download(orpheus_session: Orpheus, media_to_download, third_par
                 downloader.print('No tracks were deferred due to rate limiting.', drop_level=0)
                 print()  # Add blank line after message
 
-    if os.path.exists('temp'): shutil.rmtree('temp', ignore_errors=True)
+    # PR #2: end-of-run download summary (counts + errors)
+    downloader.print_download_summary()
+
+    if os.path.exists('temp'): shutil.rmtree('temp')

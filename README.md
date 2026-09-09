@@ -1,241 +1,272 @@
-# OrpheusDL — np3ir Fork
+<!-- PROJECT INTRO -->
 
-> [!WARNING]
-> **This app is for personal, educational, and archival purposes only.** It is not affiliated with Tidal, Deezer, or Apple Music. Users must ensure their use complies with each platform's terms of service and all applicable local copyright laws. Downloaded content is for personal use and may not be shared or redistributed. The developer assumes no responsibility for misuse of this app.
+<img src='https://github.com/bascurtiz/OrpheusDL/blob/master/icon.svg' title='OrpheusDL icon' height="150">
 
-## Installation
+OrpheusDL
+=========
 
-### Requirements
-- Python 3.10+
-- [ffmpeg](https://ffmpeg.org/download.html) — must be in PATH
-- Git
+This fork enables downloading from Spotify, Apple Music, Beatsource / interacts with the [GUI](https://github.com/bascurtiz/OrpheusDL-GUI)
 
-### Steps
+[Report Bug](https://github.com/bascurtiz/OrpheusDL/issues)
+·
+[Request Feature](https://github.com/bascurtiz/OrpheusDL/issues)
 
-**1. Clone and install core dependencies**
 
-```bash
-git clone https://github.com/np3ir/orpheusdl && cd orpheusdl
-pip install --upgrade --ignore-installed -r requirements.txt
+## Table of content
+
+- [About OrpheusDL](#about-orpheusdl)
+- [Getting Started](#getting-started)
+    - [Prerequisites](#prerequisites)
+    - [Installation](#installation)
+- [Usage](#usage)
+- [Configuration](#configuration)
+    - [Global/Formatting](#globalformatting)
+        - [Format variables](#format-variables)
+- [Contact](#contact)
+- [Acknowledgements](#acknowledgements)
+
+
+
+<!-- ABOUT ORPHEUS -->
+## About OrpheusDL
+OrpheusDL is a modular music archival tool written in Python which allows archiving from multiple different services.
+
+
+<!-- GETTING STARTED -->
+## Getting Started
+
+Follow these steps to get a local copy of Orpheus up and running:
+
+### Prerequisites
+
+* Python 3.11.9 is recommended (but might work fine with older versions)<br>
+   a.   https://www.python.org/downloads/release/python-3119/<br>
+   b.   https://git-scm.com/downloads
+
+### Installation
+
+1. Open up cmd/terminal and cd into a place where you want to save Orpheus<br>
+2. `git clone https://github.com/bascurtiz/OrpheusDL && cd OrpheusDL && pip install --upgrade --ignore-installed -r requirements.txt`<br>
+   <sub>*(use pip3 on macOS)*</sub><br>
+ 
+3. `pip install --no-deps --target vendor/librespot git+https://github.com/kokarare1212/librespot-python`<br>
+   <sub>*(use pip3 on macOS)*</sub><br>
+
+4. a.   `python orpheus.py settings refresh`<br>
+       <sub>*(use python3 on macOS)*</sub><br>
+   b.   `pip install --upgrade certifi`<br>
+       <sub>*(use python3 on macOS)*</sub><br>
+
+5. Install modules:<br>   
+   Amazon Music:
+   `git clone https://github.com/bascurtiz/orpheusdl-amazonmusic modules/amazonmusic`<br>
+   Apple Music:
+   `git clone https://github.com/bascurtiz/orpheusdl-applemusic modules/applemusic`<br>
+   Beatport:
+   `git clone https://github.com/bascurtiz/orpheusdl-beatport modules/beatport`<br>
+   Beatsource: 
+   `git clone https://github.com/bascurtiz/orpheusdl-beatsource modules/beatsource`<br>
+   Deezer: 
+   `git clone https://github.com/bascurtiz/orpheusdl-deezer modules/deezer`<br>
+   Qobuz:
+   `git clone https://github.com/bascurtiz/orpheusdl-qobuz modules/qobuz`<br>
+   SoundCloud:
+   `git clone https://github.com/bascurtiz/orpheusdl-soundcloud modules/soundcloud`<br>
+   Spotify:
+   `git clone https://github.com/bascurtiz/orpheusdl-spotify modules/spotify`<br>
+   Tidal: 
+   `git clone --recurse-submodules https://github.com/bascurtiz/orpheusdl-tidal modules/tidal`<br>
+   YouTube:
+   `git clone https://github.com/bascurtiz/orpheusdl-youtube modules/youtube`<br>
+
+6. Run Orpheus to create settings.json:<br>
+   `python orpheus.py`<br>
+    <sub>*(use python3 on macOS)*</sub><br>
+
+[![Watch how to install](https://i.imgur.com/fgrPgeV.png)](https://youtu.be/AGsYTQuO7nk)
+
+<!-- USAGE EXAMPLES -->
+## Usage
+
+Just call `orpheus.py` with any link you want to archive, for example Qobuz:
+```shell
+python orpheus.py https://open.qobuz.com/album/c9wsrrjh49ftb
 ```
 
-On macOS use `pip3` and `python3` instead of `pip` / `python`.
-
-**2. Install librespot (required for Spotify)**
-
-```bash
-pip install --no-deps --target vendor/librespot git+https://github.com/kokarare1212/librespot-python
+Alternatively do a search:
+```shell
+python orpheus.py search qobuz track darkside alan walker
 ```
 
-**3. Generate settings.json**
+<!-- CONFIGURATION -->
+## Configuration
 
-```bash
-python orpheus.py settings refresh
-```
+You can customize every module from Orpheus individually and also set general/global settings which are active in every
+loaded module. You'll find the configuration file here: `config/settings.json`
 
-**4. Install module dependencies**
-
-> ℹ️ Unlike the upstream fork, **all modules are already included** in this repo — no `git clone` needed per module.
-> Just install the pip dependencies for the services you want to use:
-
-```bash
-# Apple Music
-pip install -r modules/applemusic/gamdl/requirements.txt
-
-# Tidal (no extra deps needed)
-
-# Deezer (no extra deps needed)
-
-# Beatport / Beatsource (no extra deps needed)
-
-# SoundCloud (no extra deps needed)
-
-# Spotify
-pip install -r modules/spotify/requirements.txt
-```
-
-**5. Run Orpheus to create settings.json**
-
-```bash
-python orpheus.py
-```
-
-**6. Configure credentials in `config/settings.json`**
-
-See the **Module Credentials** section below.
-
----
-
-### Module Credentials
-
-#### 🍎 Apple Music
-Authentication is via cookies — no username/password needed.
-1. Log in to [music.apple.com](https://music.apple.com) in your browser
-2. Export cookies using a browser extension (e.g. **Get cookies.txt LOCALLY** for Chrome/Firefox)
-3. Save the file as `config/cookies.txt`
-4. Cookies expire approximately every 30 days — re-export when 401 errors appear
-
-#### 🌊 Tidal
-Requires a Tidal HiFi or HiFi Plus subscription.
-Run `python orpheus.py` once and it will prompt you to authenticate via TV login (open a URL in your browser).
-
-#### 🟠 Deezer
-Get your ARL from the `arl` cookie at [deezer.com](https://www.deezer.com) after logging in, then add it to `settings.json`:
-```json
-"deezer": {
-    "arl": "your_arl_token_here"
+### Global/General
+```json5
+{
+    "download_path": "./downloads/",
+    "download_quality": "hifi",
+    "search_limit": 10
 }
 ```
 
-#### 🟢 Spotify
-Requires Spotify Premium. Authentication is handled automatically on first run.
+`download_path`: Set the absolute or relative output path with `/` as the delimiter
 
-#### ☁️ SoundCloud
-Get your OAuth token from the browser (Network tab → any API request → `Authorization` header), then add it to `settings.json`:
-```json
-"soundcloud": {
-    "web_access_token": "OAuth 2-..."
-}
-```
+`download_quality`: Choose one of the following settings:
+* "atmos": Dolby Atmos (only applicable to Apple Music & TIDAL)
+* "hifi": FLAC higher than 44.1/16 if available
+* "lossless": FLAC with 44.1/16 if available
+* "high": lossy codecs such as MP3, AAC, ... in a higher bitrate
+* "low": lossy codecs such as MP3, AAC, ... in a lower bitrate
 
-### Apple Music — Cookies Setup
+**NOTE: The `download_quality` really depends on the used modules, so check out the modules README.md**
 
-1. Log in to [music.apple.com](https://music.apple.com) in your browser
-2. Export cookies using a browser extension (e.g. **Get cookies.txt LOCALLY** for Chrome)
-3. Save the file as `config/cookies.txt`
-4. Cookies expire every ~30 days — re-export when you start getting 401 errors
+`search_limit`: How many search results are shown
 
-### Usage
 
-```bash
-# Download an artist (all albums, scans 167 storefronts)
-python orpheus.py https://music.apple.com/us/artist/noah-kahan/328583953
+### Global/Formatting:
 
-# Download an album
-python orpheus.py https://music.apple.com/us/album/stick-season/1641076676
-
-# Download a playlist (catalog)
-python orpheus.py https://music.apple.com/us/playlist/dale-play/pl.4b364b8b182f4115acbf6deb83bd5222
-
-# Download a personal library playlist
-python orpheus.py https://music.apple.com/library/playlist/p.ldvAJK1coEp23Y
-
-# Works with Tidal and Deezer too
-python orpheus.py https://tidal.com/album/387249452
-python orpheus.py https://www.deezer.com/album/643003011
-```
-
-On Windows you can also use the `orpheus` command if installed via pip or added to PATH.
-
----
-
-A heavily modified fork of [OrfiDev/OrpheusDL](https://github.com/OrfiDev/OrpheusDL) and [bascurtiz/OrpheusDL](https://github.com/bascurtiz/OrpheusDL) with major improvements to the Apple Music module and cross-platform file organization.
-
----
-
-## Key Improvements Over Upstream
-
-### Apple Music Module (`modules/applemusic/`)
-- **Separated artists** — uses the `artists` relationship from the Apple Music API instead of splitting the `artistName` string (`"A & B"` → `["A", "B"]`)
-- **Correct album artist** — primary artist from catalog relationship, not the combined collaboration string
-- **isSingle/isCompilation detection** — uses boolean fields instead of unreliable `playParams.kind`
-- **Album suffix stripping** — removes ` - Single`, ` - EP` from album names (type goes in `{release}`)
-- **Full tags** — `total_tracks`, `total_discs`, `upc`, `copyright`, `label`, `release_date` from album data
-- **LRC lyrics** — via gamdl TTML→LRC conversion (`ModuleModes.lyrics`)
-- **Credits** — via `/songs/{id}/credits` endpoint (`ModuleModes.credits`)
-- **167-storefront scan** — scans all Apple Music regions in parallel to find region-exclusive releases
-- **Library playlists** — supports `p.xxx` personal library playlist URLs with full pagination (1943+ tracks)
-- **Pre-flight availability check** — skips albums from foreign storefronts that are unavailable for streaming
-- **Race condition fix** — removed `_set_session()` call from concurrent download path (was causing 401 errors)
-
-### Cross-Platform File Organization
-- **`{album_artist}`** template variable — always the primary album artist (consistent across Tidal, Apple Music, Deezer)
-- **`{year}`** in folder names — clean 4-digit year instead of full date
-- **Deezer single detection** — `TYPE=0` with 1 track is correctly identified as `SINGLE`
-- **Fuzzy folder matching** — prevents duplicate folders differing only in diacritics/accents (e.g. `Los Angeles Azules` vs `Los Ángeles Azules` downloaded from different platforms point to the same folder)
-- **Cross-extension file detection** — detects existing `.flac` when downloading `.m4a` and vice versa, preventing re-downloads across platforms
-
-### Core (`orpheus/music_downloader.py`)
-- **Error TrackInfo guard** — no longer creates garbage files when `get_track_info` fails silently
-- **`_check_db` file verification** — if a tracked file was deleted from disk, it re-downloads correctly
-- **Short track threshold** — lowered to 4KB minimum (handles interludes and skits under 1MB)
-- **Playlist download fix** — `m3u_playlist` parameter no longer causes silent failures for all tracks
-- **`{album_artist}` in templates** — populated from `Tags.album_artist` field
-- **`artist_initials` from album artist** — folder initials based on album artist, consistent with Tidal behavior
-- **Inter-album delay** — configurable random pause between albums when downloading an artist, controlled via `inter_album_delay_min` / `inter_album_delay_max` in `settings.json`
-
----
-
-## Recommended Settings
-
-```json
-"general": {
-    "concurrent_downloads": 1,
-    "inter_album_delay_min": 8,
-    "inter_album_delay_max": 20
-},
-"formatting": {
-    "album_format": "{artist_initials}/{album_artist}/({year}) {album_clean} {release}",
-    "track_filename_format": "{track_number}. {artists} - {title_clean}{explicit}{dolby: [atmos]}",
-    "single_full_path_format": "{artist_initials}/{album_artist}/({year}) {album_clean} {release}/{track_number}. {artists} - {title_clean}{explicit}",
-    "playlist_format": "Z:/!playlists/{name} ||| {artists} - {title_clean}{explicit}{dolby: [atmos]}",
+```json5
+{
+    "discography_format": "{name} {quality}",
+    "album_format": "{name}{explicit}",
+    "playlist_format": "{name}{explicit}",
+    "track_filename_format": "{track_number}. {name}",
+    "single_full_path_format": "{name}",
     "enable_zfill": true,
-    "force_album_format": true
+    "force_album_format": false
 }
 ```
 
-The formatting block mirrors the folder structure used by [tiddl](https://github.com/oskvr37/tiddl) for Tidal downloads, keeping multi-platform collections consistent in a single library.
+`track_filename_format`: How tracks are formatted in albums and playlists. The relevant extension is appended to the end.
 
-### `concurrent_downloads`
+`discography_format`: Folder structure for albums when downloading an artist or label discography (albums are placed
+under an artist/label folder already). Use `{name}` when `album_format` includes the artist to avoid duplicated paths.
 
-Number of tracks downloaded in parallel within a single album. `1` is the most conservative value — it mimics sequential listening and is the least likely to trigger rate limiting. Higher values increase speed but make the traffic pattern look automated.
+`album_format`, `playlist_format`, `artist_format`: Base directories for their respective formats - tracks and cover
+art are stored here. May have slashes in it, for instance {artist}/{album}.
 
-### `inter_album_delay_min` / `inter_album_delay_max`
+`single_full_path_format`: How singles are handled, which is separate to how the above work.
+Instead, this has both the folder's name and the track's name.
 
-When downloading an **artist**, Orpheus iterates through all their albums sequentially. These settings insert a random pause (in seconds, uniform distribution) between each album. Set both to `0` to disable.
+`enable_zfill`: Zero-pads `track_number`, `total_tracks`, `disc_number`, and `total_discs` in filenames and
+embedded metadata (minimum two digits, e.g. 01–09; wider padding when an album has 100+ tracks). Use
+`{track_number}` or `{disc_number}` in `track_filename_format` for padded filenames.
 
-- Default in `core.py`: `0` / `0` (disabled)
-- Recommended for stealth: `8` / `20`
+`force_album_format`: Forces the `album_format` for tracks instead of the `single_full_path_format` and also
+uses `album_format` in the `playlist_format` folder 
 
-These keys are registered in `default_global_settings` (`orpheus/core.py`) so they survive any settings regeneration — Orpheus will never overwrite them with blanks.
 
----
+#### Format variables
 
-## Apple Music Setup
+`track_filename_format` variables are `{name}`, `{album}`, `{album_artist}`, `{album_id}`, `{track_number}`,
+`{total_tracks}`, `{disc_number}`, `{total_discs}`, `{release_date}`, `{release_year}`, `{artist_id}`, `{isrc}`,
+`{upc}`, `{explicit}`, `{copyright}`, `{codec}`, `{sample_rate}`, `{bit_depth}`.
 
-1. Install gamdl dependencies (bundled in `modules/applemusic/gamdl/`)
-2. Export your Apple Music cookies to `config/cookies.txt` in Netscape format (use a browser extension)
-3. Cookies expire approximately every 30 days — re-export when 401 errors appear
-4. Configure in `config/settings.json`:
+`discography_format` uses the same variables as `album_format`.
 
-```json
-"applemusic": {
-    "cookies_path": "./config/cookies.txt",
-    "language": "en-US",
-    "codec": "aac",
-    "quality": "high"
+`album_format` variables are `{name}`, `{id}`, `{artist}`, `{artist_id}`, `{release_year}`, `{upc}`, `{explicit}`,
+`{quality}`, `{artist_initials}`, `{album_artist}`.
+
+`playlist_format` variables are `{name}`, `{creator}`, `{tracks}`, `{release_year}`, `{explicit}`, `{creator_id}`
+
+* `{quality}` will add
+    ```
+     [Dolby Atmos]
+     [96kHz 24bit]
+     [M]
+    ```
+ to the corresponding path (depending on the module)
+* `{explicit}` will add
+    ```
+     [E]
+    ```
+  to the corresponding path
+
+### Global/Covers
+
+```json5
+{
+    "embed_cover": true,
+    "main_compression": "high",
+    "main_resolution": 1400,
+    "save_external": false,
+    "external_format": "png",
+    "external_compression": "low",
+    "external_resolution": 3000,
+    "save_animated_cover": true
 }
 ```
 
-> **Note:** ALAC (lossless) requires a device-level Widevine CDM. The bundled generic CDM only supports AAC 256kbps (legacy path).
+| Option               | Info                                                                                     |
+|----------------------|------------------------------------------------------------------------------------------|
+| embed_cover          | Enable it to embed the album cover inside every track                                    |
+| main_compression     | Compression of the main cover                                                            |
+| main_resolution      | Resolution (in pixels) of the cover of the module used                                   |
+| save_external        | Enable it to save the cover from a third party cover module                              |
+| external_format      | Format of the third party cover, supported values: `jpg`, `png`, `webp`                  |
+| external_compression | Compression of the third party cover, supported values: `low`, `high`                    |
+| external_resolution  | Resolution (in pixels) of the third party cover                                          |
+| save_animated_cover  | Enable saving the animated cover when supported from the module (often in MPEG-4 format) |
 
----
+### Global/Codecs
 
-## Supported URLs
+```json5
+{
+    "proprietary_codecs": false,
+    "spatial_codecs": true
+}
+```
 
-| Service | Example |
-|---------|---------|
-| Apple Music artist | `https://music.apple.com/us/artist/noah-kahan/328583953` |
-| Apple Music album | `https://music.apple.com/us/album/stick-season/1641076676` |
-| Apple Music song | `https://music.apple.com/us/song/stick-season/1641076689` |
-| Apple Music playlist (catalog) | `https://music.apple.com/us/playlist/dale-play/pl.4b364b8b...` |
-| Apple Music playlist (library) | `https://music.apple.com/library/playlist/p.ldvAJK1coEp23Y` |
-| Tidal | `https://tidal.com/album/387249452` |
-| Deezer | `https://www.deezer.com/album/643003011` |
+`proprietary_codecs`: Enable it to allow `MQA`, `E-AC-3 JOC` or `AC-4 IMS`
 
----
+`spatial_codecs`: Enable it to allow `MPEG-H 3D`, `E-AC-3 JOC` or `AC-4 IMS`
 
-## Related Tools
+**Note: `spatial_codecs` has priority over `proprietary_codecs` when deciding if a codec is enabled**
 
-- [ammon-cli](https://github.com/np3ir/ammon-cli) — Apple Music Monitor: follow artists and playlists, auto-download new releases via OrpheusDL
-- [odesli-cli](https://github.com/np3ir/odesli-cli) — Cross-platform artist ID lookup (MusicBrainz + Apple Music direct search + Songlink)
+### Global/Module_defaults
+
+```json5
+{
+    "lyrics": "default",
+    "covers": "default",
+    "credits": "default"
+}
+```
+
+Change `default` to the module name under `/modules` in order to retrieve `lyrics`, `covers` or `credits` from the
+selected module
+
+### Global/Lyrics
+```json5
+{
+    "embed_lyrics": true,
+    "embed_synced_lyrics": false,
+    "save_synced_lyrics": true
+}
+```
+
+| Option              | Info                                                                                                                                                                |
+|---------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| embed_lyrics        | Embeds the (unsynced) lyrics inside every track                                                                                                                     |
+| embed_synced_lyrics | Embeds the synced lyrics inside every track (needs `embed_lyrics` to be enabled) (required for [Roon](https://community.roonlabs.com/t/1-7-lyrics-tag-guide/85182)) |
+| save_synced_lyrics  | Saves the synced lyrics inside a  `.lrc` file in the same directory as the track with the same `track_format` variables                                             |
+
+<!-- Contact -->
+## Contact
+
+OrfiDev (Project Lead) - [@OrfiDev](https://github.com/OrfiDev)
+
+Dniel97 (Current Lead Developer) - [@Dniel97](https://github.com/Dniel97)
+
+Original Project Link: [Orpheus Public GitHub Repository](https://github.com/OrfiTeam/OrpheusDL)
+
+
+
+<!-- ACKNOWLEDGEMENTS -->
+## Acknowledgements
+* Chimera by Aesir - the inspiration to the project
+* [Icon modified from a freepik image](https://www.freepik.com/)

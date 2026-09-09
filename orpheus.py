@@ -1,473 +1,412 @@
 #!/usr/bin/env python3
-"""
-OrpheusDL CLI - Command-line interface for music downloading
-Supports searching, downloading, and module management
-"""
-import os
 import sys
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-import re
-import json
-import argparse
-import traceback
-from urllib.parse import urlparse
+import os
 
-# 1. Environment setup must happen before other imports
+# Add script/application directory to sys.path for imports
+if getattr(sys, 'frozen', False):
+    application_path = os.path.dirname(sys.executable)
+else:
+    application_path = os.path.dirname(os.path.abspath(__file__))
+
+if application_path not in sys.path:
+    sys.path.insert(0, application_path)
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
+
+
 os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
 
 from utils.vendor_bootstrap import bootstrap_vendor_paths
-
 bootstrap_vendor_paths()
+
+import argparse
+import re
+import json
+from urllib.parse import urlparse
+# 0. Robust dependency check before starting orpheus core
+try:
+    import requests
+    import urllib3
+    import flask
+except ImportError as e:
+    missing_module = str(e).split("'")[-2] if "'" in str(e) else str(e)
+    print(f"\n[FATAL ERROR] Missing dependency: {missing_module}")
+    print(f"Please install it using: pip install {missing_module}")
+    print("Or run: pip install -r requirements.txt")
+    sys.exit(1)
 
 from orpheus.core import *
 from orpheus.music_downloader import beauty_format_seconds
-
+from utils.models import QualityEnum
+from utils.utils import find_system_ffmpeg
 try:
-    from modules.spotify.spotify_api import SpotifyAuthError, SpotifyRateLimitDetectedError
+    from modules.spotify.spotify_api import SpotifyAuthError, SpotifyConfigError, SpotifyRateLimitDetectedError
 except ModuleNotFoundError:
     SpotifyAuthError = None  # type: ignore
+    SpotifyConfigError = None  # type: ignore
     SpotifyRateLimitDetectedError = None  # type: ignore
 
-# ============================================================================
-# GLOBAL PATTERNS CACHE - Pre-compiled for performance
-# ============================================================================
+try:
+    from modules.amazonmusic.interface import AmazonMusicConfigError
+except ModuleNotFoundError:
+    AmazonMusicConfigError = None  # type: ignore
 
-_compiled_patterns = {}
-
-
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
-
-def sanitize_args(args_list):
-    """
-    Intercepts and cleans specific URLs (like Tidal) in the arguments list
-    before the main parser processes them.
-    """
-    cleaned_args = []
-    # Preserve the script name (args_list[0]) if present
-    if args_list:
-        cleaned_args.append(args_list[0])
-
-    for arg in args_list[1:]:
-        new_arg = arg
-
-        # --- UNIVERSAL TIDAL LINK CLEANER ---
-        # Detects any Tidal URL containing /track/ID and strips everything else.
-        # This handles:
-        # 1. mixed links: tidal.com/album/ID/track/ID_TRACK -> tidal.com/track/ID_TRACK
-        # 2. trailing junk: tidal.com/track/ID/u -> tidal.com/track/ID
-        if 'tidal.com' in arg and '/track/' in arg:
-            match = re.search(r'/track/(\d+)', arg)
-            if match:
-                clean_id = match.group(1)
-                reconstructed_url = f'https://tidal.com/track/{clean_id}'
-
-                # Only update and print if the URL actually changed
-                if reconstructed_url != arg:
-                    print(f'\n✨ Tidal Link automatically cleaned: {reconstructed_url}\n')
-                    new_arg = reconstructed_url
-
-        cleaned_args.append(new_arg)
-
-    return cleaned_args
-
+from utils.module_settings import format_module_config_error
 
 def setup_ffmpeg_path():
-    """Setup FFmpeg path from settings.json to match GUI behavior"""
+    """Setup FFmpeg path from settings.json to match GUI behavior.
+    Also ensures common system paths (Homebrew, etc.) are checked."""
     try:
-        # Construct absolute path to config file based on this script's location
-        # This prevents errors if running the script from a different directory
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        settings_path = os.path.join(base_dir, "config", "settings.json")
+        from utils.utils import locate_ffmpeg
 
+        current_path = os.environ.get("PATH", "")
+        ffmpeg_path_setting = "ffmpeg"
+        settings_path = os.path.join("config", "settings.json")
         if os.path.exists(settings_path):
-            try:
-                with open(settings_path, 'r', encoding='utf-8') as f:
-                    settings = json.load(f)
-            except (json.JSONDecodeError, IOError) as e:
-                print(f"Warning: Could not read settings.json: {e}")
-                return
+            with open(settings_path, 'r', encoding='utf-8') as f:
+                settings = json.load(f)
+            ffmpeg_path_setting = (
+                settings.get("global", {}).get("advanced", {}).get("ffmpeg_path")
+                or settings.get("globals", {}).get("advanced", {}).get("ffmpeg_path", "ffmpeg")
+            )
 
-            # Get FFmpeg path setting
-            ffmpeg_path_setting = settings.get("global", {}).get("advanced", {}).get("ffmpeg_path", "ffmpeg")
-
-            if isinstance(ffmpeg_path_setting, str):
-                ffmpeg_path_setting = ffmpeg_path_setting.strip()
-
-                # If it's a custom path (not just "ffmpeg"), add directory to PATH
-                if ffmpeg_path_setting and ffmpeg_path_setting.lower() != "ffmpeg":
-                    if os.path.isfile(ffmpeg_path_setting):
-                        ffmpeg_dir = os.path.dirname(ffmpeg_path_setting)
-                        if ffmpeg_dir:
-                            current_path = os.environ.get("PATH", "")
-                            if ffmpeg_dir not in current_path.split(os.pathsep):
-                                os.environ["PATH"] = ffmpeg_dir + os.pathsep + current_path
-        else:
-            pass  # Settings file not found, using defaults
+        search_dirs = [
+            os.getcwd(),
+            os.path.dirname(os.path.abspath(__file__)),
+        ]
+        resolved = locate_ffmpeg(ffmpeg_path_setting, extra_search_dirs=search_dirs)
+        if resolved:
+            ffmpeg_dir_added = os.path.dirname(resolved)
+            if ffmpeg_dir_added and ffmpeg_dir_added not in current_path.split(os.pathsep):
+                os.environ["PATH"] = ffmpeg_dir_added + os.pathsep + current_path
     except Exception as e:
-        # Don't fail if we can't setup FFmpeg path, just continue
         print(f"Warning: Could not setup FFmpeg path: {e}")
 
-
-def load_urls_from_file(file_path):
-    """
-    Load URLs from a text file.
-    Each line is treated as a separate URL.
-    Empty lines and comments (starting with #) are ignored.
-
-    Args:
-        file_path: Path to the file containing URLs
-
-    Returns:
-        Tuple of cleaned URLs
-
-    Raises:
-        IOError: If file cannot be read
-        UnicodeDecodeError: If file is not UTF-8 encoded
-    """
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            arguments = tuple(
-                line.strip()
-                for line in f
-                if line.strip() and not line.startswith('#')
-            )
-        return arguments
-    except IOError as e:
-        print(f"Error reading file '{file_path}': {e}")
-        exit(1)
-    except UnicodeDecodeError as e:
-        print(f"File encoding error in '{file_path}'. Please use UTF-8 encoding: {e}")
-        exit(1)
-
-
-def init_compiled_patterns(orpheus):
-    """
-    Pre-compile all netloc regex patterns for better performance.
-    Avoids recompiling patterns in loops.
-    """
-    global _compiled_patterns
-    if not _compiled_patterns:
-        _compiled_patterns = {
-            pattern: re.compile(pattern)
-            for pattern in orpheus.module_netloc_constants.keys()
-        }
-
-
-def validate_arguments(mode, args_list):
-    """
-    Validate that sufficient arguments are provided for each mode.
-
-    Args:
-        mode: The operation mode (search, download, settings, etc.)
-        args_list: List of arguments provided
-
-    Returns:
-        True if valid, False otherwise
-    """
-    required_args = {
-        'search': 4,
-        'luckysearch': 4,
-        'download': 4,
-        'settings': 2,
-        'sessions': 3
-    }
-
-    if mode in required_args:
-        if len(args_list) < required_args[mode]:
-            print(f"Error: '{mode}' requires at least {required_args[mode]} arguments")
-            return False
-
-    return True
-
-
-# ============================================================================
-# MAIN FUNCTION
-# ============================================================================
-
 def main():
-    # 1. Clean arguments immediately
-    sys.argv = sanitize_args(sys.argv)
-
-    # 2. Setup FFmpeg
+    # Setup FFmpeg path from settings.json (same as GUI)
     setup_ffmpeg_path()
-
-    print(r'''
-   ____             _                    _____  _      
-  / __ \           | |                  |  __ \| |     
- | |  | |_ __ _ __ | |__   ___ _   _ ___| |  | | |     
- | |  | | '__| '_ \| '_ \ / _ \ | | / __| |  | | |     
- | |__| | |  | |_) | | | |  __/ |_| \__ \ |__| | |____ 
-  \____/|_|  | .__/|_| |_|\___|\__,_|___/_____/|______|
-             | |                                       
-             |_|                                       
-
-            ''')
-
-    help_text = (
-        'Use "settings [option]" for orpheus controls (coreupdate, fullupdate, modinstall), '
-        '"settings [module][option]" for module specific options (update, test, setup), '
-        'searching by "[search/luckysearch] [module][track/artist/playlist/album] [query]", '
-        'or just putting in URLs (wrap in double quotes if needed)'
-    )
-
+    
+    help_ = 'Use "settings [option]" for orpheus controls (coreupdate, fullupdate, modinstall), "settings [module]' \
+           '[option]" for module specific options (update, test, setup), searching by "[search/luckysearch] [module]' \
+           '[track/artist/playlist/album] [query]", or just putting in URLs. On zsh/macOS, wrap URLs in quotes to avoid "no matches found" (e.g. \'https://...?v=...\').'
     parser = argparse.ArgumentParser(description='Orpheus: modular music archival')
     parser.add_argument('-p', '--private', action='store_true', help=argparse.SUPPRESS)
-    parser.add_argument('-o', '--output',
-                        help='Select a download output path. Default is the provided download path in config/settings.json')
+    parser.add_argument('-o', '--output', help='Select a download output path. Default is the provided download path in config/settings.py')
     parser.add_argument('-lr', '--lyrics', default='default', help='Set module to get lyrics from')
     parser.add_argument('-cv', '--covers', default='default', help='Override module to get covers from')
-    parser.add_argument('-cr', '--credits', default='default', help='Override module to get credits from')
-    parser.add_argument('-sd', '--separatedownload', default='default',
-                        help='Select a different module that will download the playlist instead of the main module. Only for playlists.')
-    parser.add_argument('arguments', nargs='*', help=help_text)
+    parser.add_argument('-cr', '--credits', default='default', help='Override module to get covers from')
+    parser.add_argument('-sd', '--separatedownload', default='default', help='Select a different module that will download the playlist instead of the main module. Only for playlists.')
+    parser.add_argument('-sc', '--song-codec', help='Select song codec for Apple Music (e.g. atmos, alac, aac-legacy)')
+    parser.add_argument('-uw', '--use-wrapper', action='store_true', help='Use wrapper for downloading (Apple Music)')
+    parser.add_argument('-m', '--module', help='Force a specific module to be used for the given URL(s)')
+    parser.add_argument('-q', '--quality', help='Override download quality for this run (lossless, hifi, high, low, atmos, …)')
+    parser.add_argument('-ni', '--non-interactive', action='store_true', help='Skip interactive selection for search results.')
+    parser.add_argument('--progress', action='store_true', default=None, help='Force enable progress bars.')
+    parser.add_argument('--no-progress', action='store_false', dest='progress', help='Force disable progress bars.')
+    parser.add_argument('arguments', nargs='*', help=help_)
     args = parser.parse_args()
 
     orpheus = Orpheus(args.private)
+    explicit_quality_override = bool(args.quality)
 
+    if args.quality:
+        q = args.quality.strip().lower()
+        valid = {m.name.lower() for m in QualityEnum}
+        if q not in valid:
+            raise Exception(f'Invalid --quality "{args.quality}". Choose one of: {", ".join(sorted(valid))}')
+        orpheus.settings.setdefault('global', {}).setdefault('general', {})['download_quality'] = q
+    
+    if args.progress is not None:
+        orpheus.settings.setdefault('global', {}).setdefault('general', {})['progress_bar'] = args.progress
+    
     # Set global progress bar setting for the CLI
     from utils.utils import set_progress_bars_enabled
     progress_bar_setting = orpheus.settings.get('global', {}).get('general', {}).get('progress_bar', False)
     set_progress_bars_enabled(progress_bar_setting)
-
-    # Pre-compile regex patterns for performance
-    init_compiled_patterns(orpheus)
-
     if not args.arguments:
         parser.print_help()
         exit()
 
     orpheus_mode = args.arguments[0].lower()
-
-    # ========================================================================
-    # MODE HANDLERS
-    # ========================================================================
-
-    if orpheus_mode == 'settings':
-        # FIXED: Validate arguments
-        if not validate_arguments('settings', args.arguments):
-            exit(1)
-
+    if orpheus_mode == 'settings': # These should call functions in a separate py file, that does not yet exist
         setting = args.arguments[1].lower()
         if setting == 'refresh':
             print('settings.json has been refreshed successfully.')
-            return
-        elif setting == 'core_update':
-            print("❌ Error: 'core_update' feature is not yet implemented")
-            exit(1)
-        elif setting == 'full_update':
-            print("❌ Error: 'full_update' feature is not yet implemented")
-            exit(1)
-        elif setting == 'module_install':
-            print("❌ Error: 'module_install' feature is not yet implemented")
-            exit(1)
+            return # Actually the only one that should genuinely return here after doing nothing
+        elif setting == 'core_update':  # Updates only Orpheus
+            return  # TODO
+        elif setting == 'full_update':  # Updates Orpheus and all modules
+            return  # TODO
+            orpheus.update_setting_storage()
+        elif setting == 'module_install':  # Installs a module with git
+            return  # TODO
+            orpheus.update_setting_storage()
         elif setting == 'test_modules':
-            print("❌ Error: 'test_modules' feature is not yet implemented")
-            exit(1)
+            return # TODO
         elif setting in orpheus.module_list:
             orpheus.load_module(setting)
-            if len(args.arguments) < 3:
-                print(f"Error: Module '{setting}' requires a sub-option (update, setup, test, adjust_setting)")
-                exit(1)
             modulesetting = args.arguments[2].lower()
             if modulesetting == 'update':
-                print(f"❌ Error: 'update' for module '{setting}' is not yet implemented")
-                exit(1)
+                return  # TODO
+                orpheus.update_setting_storage()
             elif modulesetting == 'setup':
-                print(f"❌ Error: 'setup' for module '{setting}' is not yet implemented")
-                exit(1)
+                return  # TODO
             elif modulesetting == 'adjust_setting':
-                print(f"❌ Error: 'adjust_setting' for module '{setting}' is not yet implemented")
-                exit(1)
-            elif modulesetting == 'test':
-                print(f"❌ Error: 'test' for module '{setting}' is not yet implemented")
-                exit(1)
+                return  # TODO
+            #elif modulesetting in [custom settings function list] TODO (here so test can be replaced)
+            elif modulesetting == 'test': # Almost equivalent to sessions test
+                return  # TODO
             else:
                 raise Exception(f'Unknown setting "{modulesetting}" for module "{setting}"')
         else:
             raise Exception(f'Unknown setting: "{setting}"')
-
     elif orpheus_mode == 'sessions':
-        # FIXED: Validate arguments
-        if not validate_arguments('sessions', args.arguments):
-            exit(1)
-
         module = args.arguments[1].lower()
         if module in orpheus.module_list:
             option = args.arguments[2].lower()
             if option == 'add':
-                print(f"❌ Error: 'add' session for module '{module}' is not yet implemented")
-                exit(1)
+                return  # TODO
             elif option == 'delete':
-                print(f"❌ Error: 'delete' session for module '{module}' is not yet implemented")
-                exit(1)
+                return  # TODO
             elif option == 'list':
-                print(f"❌ Error: 'list' sessions for module '{module}' is not yet implemented")
-                exit(1)
+                return  # TODO
             elif option == 'test':
-                if len(args.arguments) < 4:
-                    print(f"Error: 'test' requires a session name (or 'all')")
-                    exit(1)
                 session_name = args.arguments[3].lower()
                 if session_name == 'all':
-                    print(f"❌ Error: 'test all' sessions for module '{module}' is not yet implemented")
-                    exit(1)
+                    return  # TODO
                 else:
-                    print(f"❌ Error: 'test' session '{session_name}' for module '{module}' is not yet implemented")
-                    exit(1)
+                    return  # TODO, will also have a check for if the requested session actually exists, obviously
             else:
-                raise Exception(f'Unknown option "{option}", choose add/delete/list/test')
+                raise Exception(f'Unknown option {option}, choose add/delete/list/test')
         else:
-            raise Exception(f'Unknown module "{module}"')
-
+            raise Exception(f'Unknown module {module}') # TODO: replace with InvalidModuleError
     else:
-        # ====================================================================
-        # DOWNLOAD / SEARCH LOGIC
-        # ====================================================================
-
         path = args.output if args.output else orpheus.settings['global']['general']['download_path']
-        if path.endswith('/'):
-            path = path.rstrip('/')
+        if path[-1] == '/': path = path[:-1]  # removes '/' from end if it exists
         os.makedirs(path, exist_ok=True)
 
         media_types = '/'.join(i.name for i in DownloadTypeEnum)
 
-        # FIXED: Initialize early to avoid NameError
-        media_to_download = {}
-
         if orpheus_mode == 'search' or orpheus_mode == 'luckysearch':
-            # FIXED: Validate arguments
-            if not validate_arguments(orpheus_mode, args.arguments):
-                exit(1)
-
             if len(args.arguments) > 3:
-                modulename = args.arguments[1].lower()
-                if modulename in orpheus.module_list:
+                modulename_input = args.arguments[1].lower()
+                if modulename_input == 'all':
+                    # All modules currently enabled and not hidden
+                    modules_to_search = [m for m in orpheus.module_list if m != 'musixmatch' and ModuleFlags.hidden not in orpheus.module_settings[m].flags]
+                    
+                    # Filter OUT any platforms found in disabled_search_platforms (Opt-Out model)
+                    disabled_platforms = orpheus.settings.get('global', {}).get('general', {}).get('disabled_search_platforms', [])
+                    if disabled_platforms:
+                        modules_to_search = [m for m in modules_to_search if m not in disabled_platforms]
+                        
+                        # Fallback (safety): if everything was disabled, revert to searching everything
+                        if not modules_to_search:
+                            modules_to_search = [m for m in orpheus.module_list if m != 'musixmatch' and ModuleFlags.hidden not in orpheus.module_settings[m].flags]
+                    # Amazon Music requires a logged-in session in loginstorage.bin
+                    if "amazonmusic" in modules_to_search:
+                        try:
+                            from modules.amazonmusic.interface import ModuleInterface
+                            if not ModuleInterface.has_cached_credentials(orpheus.session_storage_location):
+                                modules_to_search = [m for m in modules_to_search if m != "amazonmusic"]
+                        except Exception:
+                            modules_to_search = [m for m in modules_to_search if m != "amazonmusic"]
+                elif modulename_input in orpheus.module_list:
+                    modules_to_search = [modulename_input]
+                else:
+                    valid_modules = [m for m in orpheus.module_list if ModuleFlags.hidden not in orpheus.module_settings[m].flags]
+                    raise Exception(f'Unknown module name "{modulename_input}". Must select from: {", ".join(valid_modules)}, all')
+                
+                try:
+                    query_type = DownloadTypeEnum[args.arguments[2].lower()]
+                except KeyError:
+                    raise Exception(f'{args.arguments[2].lower()} is not a valid search type! Choose {media_types}')
+                
+                lucky_mode = True if orpheus_mode == 'luckysearch' else False
+                query = ' '.join(args.arguments[3:])
+                
+                print("Searching... Please wait.")
+                global_index = 1
+                search_results_objects = []
+                for modulename in modules_to_search:
                     try:
-                        query_type = DownloadTypeEnum[args.arguments[2].lower()]
-                    except KeyError:
-                        raise Exception(f'{args.arguments[2].lower()} is not a valid search type! Choose {media_types}')
-                    lucky_mode = True if orpheus_mode == 'luckysearch' else False
-
-                    query = ' '.join(args.arguments[3:])
-                    module = orpheus.load_module(modulename)
-                    print("Searching... Please wait.")
-                    items = module.search(query_type, query, limit=(
-                        1 if lucky_mode else orpheus.settings['global']['general']['search_limit']))
-                    if len(items) == 0:
-                        raise Exception(f'No search results for {query_type.name}: {query}')
-
-                    if lucky_mode:
-                        selection = 0
-                    else:
-                        for index, item in enumerate(items, start=1):
-                            additional_details = '[E] ' if item.explicit else ''
+                        module = orpheus.load_module(modulename)
+                        items = module.search(query_type, query, limit=(1 if lucky_mode else orpheus.settings['global']['general']['search_limit']))
+                        if not items:
+                            continue
+                        for item in items:
+                            additional_details = '🅴 ' if item.explicit else ''
                             additional_details += f'[{beauty_format_seconds(item.duration)}] ' if item.duration else ''
                             additional_details += f'[{item.year}] ' if item.year else ''
-                            additional_details += ' '.join(
-                                [f'[{i}]' for i in item.additional]) if item.additional else ''
+                            additional_details += ' '.join([f'[{i}]' for i in item.additional]) if item.additional else ''
+                            
                             if query_type is not DownloadTypeEnum.artist:
-                                # FIXED: Use isinstance instead of is
-                                artists = ', '.join(item.artists) if isinstance(item.artists, list) else item.artists
-                                print(f'{str(index)}. {item.name} - {artists} {additional_details}')
+                                artists_str = ", ".join(item.artists) if isinstance(item.artists, list) else item.artists
+                                line = f'{str(global_index)}. {item.name} |ARTIST|{artists_str}| |PLATFORM|{modulename}| {additional_details}'
                             else:
-                                print(f'{str(index)}. {item.name} {additional_details}')
+                                line = f'{str(global_index)}. {item.name} |PLATFORM|{modulename}| {additional_details}'
+                            
+                            # Append result_id (usually URL) for WebUI parsing
+                            if item.result_id:
+                                line += f' |ID|{item.result_id}|'
+                                
+                            if item.image_url:
+                                line += f' |IMAGE|{item.image_url}|'
+                                
+                            print(line)
+                            search_results_objects.append((modulename, query_type, item))
+                            global_index += 1
+                            
+                    except Exception as e:
+                        err_str = format_module_config_error(modulename, e)
+                        err_lower = err_str.lower()
+                        if modulename_input == 'all':
+                            if "user authentication is required" in err_lower or '"code":401' in err_str.replace(" ", ""):
+                                print(f"Error searching {modulename}: Authentication required (token invalid or expired).")
+                            elif (
+                                err_str.startswith("Amazon Music:")
+                                or "amazon music:" in err_lower
+                                or "amazon music is not set up" in err_lower
+                            ):
+                                print(f"Error searching {modulename}: {err_str}")
+                            elif isinstance(e, PermissionError) and modulename == 'amazonmusic':
+                                print(
+                                    f"Error searching {modulename}: Widevine device file (.wvd) missing or invalid. "
+                                    "Set wvd_path in settings (modules → amazonmusic)."
+                                )
+                            else:
+                                print(f"Error searching {modulename}: {err_str}")
+                            continue
+                        else:
+                            if (
+                                err_str.startswith("Amazon Music:")
+                                or "amazon music:" in err_lower
+                                or "amazon music is not set up" in err_lower
+                                or (AmazonMusicConfigError is not None and isinstance(e, AmazonMusicConfigError))
+                            ):
+                                print(f'\n{err_str}')
+                                exit(1)
+                            if isinstance(e, PermissionError) and modulename == 'amazonmusic':
+                                print(
+                                    "\nAmazon Music: Widevine device file (.wvd) missing or invalid.\n"
+                                    "Set wvd_path in settings (modules → amazonmusic)."
+                                )
+                                exit(1)
+                            raise e
 
-                        selection_input = input('Selection: ').strip('\r\n ')
-                        if selection_input.lower() in ['e', 'q', 'x', 'exit', 'quit']:
-                            exit(0)
-                        if not selection_input.isdigit():
-                            raise Exception('Input a number')
-                        selection = int(selection_input) - 1
-                        if selection < 0 or selection >= len(items):
-                            raise Exception('Invalid selection')
-                        print()
-
-                    selected_item = items[selection]
-                    media_to_download = {modulename: [
-                        MediaIdentification(media_type=query_type, media_id=selected_item.result_id,
-                                            extra_kwargs=selected_item.extra_kwargs or {})]}
-                elif modulename == 'multi':
-                    print("❌ Error: 'multi' module search is not yet implemented")
+                if global_index == 1:
+                    print(f'\nNo search results for {query_type.name}: {query}')
                     exit(1)
+
+                if args.non_interactive:
+                    print("\nNon-interactive mode: Exiting after search.")
+                    exit(0)
+
+                if lucky_mode:
+                    selection_index = 0
                 else:
-                    modules = [i for i in orpheus.module_list if
-                               ModuleFlags.hidden not in orpheus.module_settings[i].flags]
-                    raise Exception(
-                        f'Unknown module name "{modulename}". Must select from: {", ".join(modules)}')
+                    selection_input = input('Selection: ').strip('\r\n ')
+                    try:
+                        selection_index = int(selection_input) - 1
+                    except ValueError:
+                        print("Invalid input. Please enter a number.")
+                        exit(1)
+
+                if 0 <= selection_index < len(search_results_objects):
+                    selected_modulename, selected_type, selected_item = search_results_objects[selection_index]
+                    
+                    # Prepare media_to_download
+                    media_to_download = {
+                        selected_modulename: [
+                            MediaIdentification(
+                                media_type=selected_type,
+                                media_id=selected_item.result_id,
+                                extra_kwargs=selected_item.extra_kwargs
+                            )
+                        ]
+                    }
+                else:
+                    print("Invalid selection.")
+                    exit(1)
             else:
                 print(f'Search must be done as orpheus.py [search/luckysearch] [module] [{media_types}] [query]')
-                exit(1)
-
+                exit() # TODO: replace with InvalidInput
         elif orpheus_mode == 'download':
-            # FIXED: Validate arguments
-            if not validate_arguments('download', args.arguments):
-                exit(1)
-
             if len(args.arguments) > 3:
                 modulename = args.arguments[1].lower()
                 if modulename in orpheus.module_list:
                     try:
                         media_type = DownloadTypeEnum[args.arguments[2].lower()]
                     except KeyError:
-                        raise Exception(
-                            f'{args.arguments[2].lower()} is not a valid download type! Choose {media_types}')
-                    media_to_download = {modulename: [MediaIdentification(media_type=media_type, media_id=i) for i in
-                                                      args.arguments[3:]]}
+                        raise Exception(f'{args.arguments[2].lower()} is not a valid download type! Choose {media_types}')
+                    extra_kwargs = {}
+                    if modulename == 'applemusic':
+                        if args.song_codec: extra_kwargs['song_codec'] = args.song_codec
+                        if args.use_wrapper: extra_kwargs['use_wrapper'] = args.use_wrapper
+                    
+                    media_to_download = {modulename: [MediaIdentification(media_type=media_type, media_id=i, extra_kwargs=extra_kwargs) for i in args.arguments[3:]]}
                 else:
-                    modules = [i for i in orpheus.module_list if
-                               ModuleFlags.hidden not in orpheus.module_settings[i].flags]
-                    raise Exception(
-                        f'Unknown module name "{modulename}". Must select from: {", ".join(modules)}')
+                    modules = [i for i in orpheus.module_list if ModuleFlags.hidden not in orpheus.module_settings[i].flags]
+                    raise Exception(f'Unknown module name "{modulename}". Must select from: {", ".join(modules)}') # TODO: replace with InvalidModuleError
             else:
-                print(
-                    f'Download must be done as orpheus.py [download] [module] [{media_types}] [media ID 1] [media ID 2] ...')
-                exit(1)
-
-        else:  # Automatic URL detection
-            # FIXED: Better file handling with context manager
-            if len(args.arguments) == 1 and os.path.isfile(args.arguments[0]):
-                arguments = load_urls_from_file(args.arguments[0])
-            else:
-                arguments = args.arguments
-
+                print(f'Download must be done as orpheus.py [download] [module] [{media_types}] [media ID 1] [media ID 2] ...')
+                exit() # TODO: replace with InvalidInput
+        else:  # if no specific modes are detected, parse as urls, but first try loading as a list of URLs
+            arguments = tuple(open(args.arguments[0], 'r', encoding='utf-8')) if len(args.arguments) == 1 and os.path.exists(args.arguments[0]) else args.arguments
+            # Strip whitespace from lines read from file
+            if isinstance(arguments, tuple) and len(args.arguments) == 1 and os.path.exists(args.arguments[0]):
+                arguments = tuple(line.strip() for line in arguments if line.strip()) # Also filter out empty lines
+            
+            media_to_download = {}
             for link in arguments:
-                link = link.strip()
-
-                # Remove trailing slash (cleaner way)
-                link = link.rstrip('/')
-
-                if not link:
+                link = link.strip() # Ensure individual link is also stripped if coming from args
+                if not link: # Skip empty lines that might still be present if not from file
                     continue
 
                 if link.startswith('http'):
+                    try:
+                        from utils.utils import resolve_platform_share_url
+                        expanded = resolve_platform_share_url(link)
+                        if expanded and expanded != link:
+                            print(f'Expanded share link to: {expanded}')
+                            link = expanded
+                    except Exception:
+                        pass
                     url = urlparse(link)
                     components = url.path.split('/')
 
-                    # FIXED: Use pre-compiled patterns for better performance
-                    service_name = None
-                    for pattern, module_name in orpheus.module_netloc_constants.items():
-                        if _compiled_patterns[pattern].search(url.netloc):
-                            service_name = module_name
-                            break
-
+                    service_name = args.module.lower() if args.module else None
+                    if not service_name:
+                        for i in orpheus.module_netloc_constants:
+                            if re.findall(i, url.netloc): service_name = orpheus.module_netloc_constants[i]
                     if not service_name:
                         raise Exception(f'URL location "{url.netloc}" is not found in modules!')
-                    if service_name not in media_to_download:
-                        media_to_download[service_name] = []
+                    if service_name not in media_to_download: media_to_download[service_name] = []
 
                     if orpheus.module_settings[service_name].url_decoding is ManualEnum.manual:
                         module = orpheus.load_module(service_name)
-                        media_to_download[service_name].append(module.custom_url_parse(link))
+                        try:
+                            mediamatch = module.custom_url_parse(link)
+                        except Exception as e:
+                            err_str = str(e)
+                            err_lower = err_str.lower()
+                            if service_name == 'soundcloud' and ('unauthorized (401)' in err_lower or 'invalid or expired' in err_lower):
+                                print(
+                                    f'Could not parse SoundCloud URL "{link}": '
+                                    'SoundCloud credentials are required. Please set a valid web_access_token in settings.'
+                                )
+                            else:
+                                print(f'Could not parse URL "{link}": {e}')
+                            continue
+                        if service_name == 'applemusic':
+                            if args.song_codec: mediamatch.extra_kwargs['song_codec'] = args.song_codec
+                            if args.use_wrapper: mediamatch.extra_kwargs['use_wrapper'] = args.use_wrapper
+                        media_to_download[service_name].append(mediamatch)
                     else:
                         if not components or len(components) <= 2:
                             print(f'\tInvalid URL: "{link}"')
-                            exit(1)
-
+                            exit() # TODO: replace with InvalidInput
+                        
                         url_constants = orpheus.module_settings[service_name].url_constants
                         if not url_constants:
                             url_constants = {
@@ -477,19 +416,26 @@ def main():
                                 'artist': DownloadTypeEnum.artist
                             }
 
-                        type_matches = [media_type for url_check, media_type in url_constants.items() if
-                                        url_check in components]
+                        type_matches = [media_type for url_check, media_type in url_constants.items() if url_check in components]
 
                         if not type_matches:
                             print(f'Invalid URL: "{link}"')
-                            exit(1)
+                            exit()
 
-                        media_to_download[service_name].append(
-                            MediaIdentification(media_type=type_matches[-1], media_id=components[-1]))
+
+                        extra_kwargs = {}
+                        if service_name == 'applemusic':
+                            if args.song_codec: extra_kwargs['song_codec'] = args.song_codec
+                            if args.use_wrapper: extra_kwargs['use_wrapper'] = args.use_wrapper
+                        if service_name == 'spotify' and 'episode' in components:
+                            extra_kwargs['is_episode'] = True
+                            extra_kwargs['spotify_media_type'] = 'episode'
+
+                        media_to_download[service_name].append(MediaIdentification(media_type=type_matches[-1], media_id=components[-1], extra_kwargs=extra_kwargs))
                 else:
                     raise Exception(f'Invalid argument: "{link}"')
 
-        # Third-party module setup
+        # Prepare the third-party modules similar to above
         tpm = {ModuleModes.covers: '', ModuleModes.lyrics: '', ModuleModes.credits: ''}
         for i in tpm:
             moduleselected = getattr(args, i.name).lower()
@@ -500,44 +446,90 @@ def main():
             tpm[i] = moduleselected
         sdm = args.separatedownload.lower()
 
-        # FIXED: Check if media_to_download is empty and exit
         if not media_to_download:
             print('No links given')
-            exit(0)
 
-        # Beatport quality override
+        # Beatport quality workaround: high and low quality fail, fallback to lossless FLAC.
+        # Only apply this when quality wasn't explicitly overridden for this run
+        # (GUI/webui use different code paths and expect LOW/HIGH to map to AAC).
         original_quality = None
         beatport_quality_override = False
-        if 'beatport' in media_to_download and orpheus.settings['global']['general']['download_quality'] in ['high',
-                                                                                                             'low']:
+        if (
+            'beatport' in media_to_download
+            and not explicit_quality_override
+            and orpheus.settings['global']['general']['download_quality'] in ['high', 'low']
+        ):
             original_quality = orpheus.settings['global']['general']['download_quality']
             orpheus.settings['global']['general']['download_quality'] = 'lossless'
             beatport_quality_override = True
-            print(f'Beatport: Automatically switching from "{original_quality}" to "lossless" quality')
+            print(f' Beatport: Automatically switching from "{original_quality}" to "lossless" quality')
 
         try:
             orpheus_core_download(orpheus, media_to_download, tpm, sdm, path)
         finally:
+            # Restore original quality setting if we overrode it
             if beatport_quality_override and original_quality:
                 orpheus.settings['global']['general']['download_quality'] = original_quality
 
-
-# ============================================================================
-# SCRIPT ENTRY POINT
-# ============================================================================
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print('\n\t^C pressed - aborting')
-        exit(0)
+        print('\n\t^C pressed - abort')
+        exit()
     except Exception as e:
+        if AmazonMusicConfigError is not None and isinstance(e, AmazonMusicConfigError):
+            print(f'\n{e}')
+            exit(1)
+        if SpotifyConfigError is not None and isinstance(e, SpotifyConfigError):
+            print(f'\n{e}')
+            exit(1)
         if SpotifyAuthError is not None and isinstance(e, SpotifyAuthError):
             print(f'\nSpotify Authentication Error: {e}')
-            print('Please try the command again. If the issue persists, check your Spotify credentials.')
+            print('Please try the command again. If the issue persists, you may need to check your Spotify credentials or network connection.')
+            exit(1) # Exit with a non-zero code to indicate an error
+        # Module credential/config messages: show message only, no traceback (search + download, all types)
+        err_str = str(e)
+        err_lower = err_str.lower()
+        if err_str:
+            if "credentials are missing" in err_lower and "settings.json" in err_lower:
+                print(f'\n{e}')
+                exit(1)
+            if "credentials are required" in err_lower:
+                print(f'\n{e}')
+                exit(1)
+            if " --> " in err_str and ("credentials" in err_lower or "cookies" in err_lower or "settings.json" in err_str):
+                print(f'\n{e}')
+                exit(1)
+            # Friendly auth errors for modules like Qobuz returning JSON 401s
+            if "user authentication is required" in err_lower or '"code":401' in err_str.replace(" ", ""):
+                print(f'\nAuthentication Error: The modular login token is invalid or has expired.')
+                print('Please check your credentials in settings.json or refresh your session.')
+                exit(1)
+        # User-facing guidance (e.g. no modules installed): show message only, no traceback
+        if err_str and "No modules are installed" in err_str:
+            print(f'\n{e}')
             exit(1)
-
+        friendly = format_module_config_error("", e) if err_str else ""
+        if friendly and friendly != err_str:
+            print(f'\n{friendly}')
+            exit(1)
+        if err_str and (
+            err_str.startswith("Amazon Music:")
+            or "amazon music:" in err_lower
+            or "amazon music is not set up" in err_lower
+            or "shaka packager executable not found" in err_lower
+        ):
+            print(f'\n{e}')
+            exit(1)
+        if isinstance(e, PermissionError) and "wvd" in err_lower:
+            print(
+                "\nAmazon Music: Could not read the Widevine device file (.wvd).\n"
+                "Check wvd_path in settings (modules → amazonmusic) and ensure the path points to a .wvd file, not a folder."
+            )
+            exit(1)
+        # Catch-all for other exceptions
+        import traceback
         print("\nAn unexpected error occurred:")
         traceback.print_exc()
-        exit(1)

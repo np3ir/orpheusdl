@@ -4,13 +4,14 @@ import json
 import secrets
 import sys
 import time
-import webbrowser
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, auto
 
 import requests
 import urllib3
+
+from utils.utils import open_url_in_browser
 
 import urllib.parse as urlparse
 from urllib.parse import parse_qs, quote
@@ -52,6 +53,7 @@ class SessionType(Enum):
     TV = auto()
     MOBILE_ATMOS = auto()
     MOBILE_DEFAULT = auto()
+    GUEST = auto()
 
 
 class TidalApi(object):
@@ -59,47 +61,43 @@ class TidalApi(object):
     TIDAL_VIDEO_BASE = 'https://api.tidalhifi.com/v1/'
     TIDAL_CLIENT_VERSION = '2.26.1'
 
-    def __init__(self, sessions: dict, on_token_refresh=None):
+    def __init__(self, sessions: dict):
         self.sessions = sessions
         self.default: SessionType = SessionType.TV  # Change to TV or MOBILE depending on AC-4/360RA
-        self.on_token_refresh = on_token_refresh
 
         self.s = create_requests_session()
 
-    def _get(self, url, params=None, refresh=False):
+    def _get(self, url, params=None, refresh=False, session_override=None):
         if params is None:
             params = {}
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        params['countryCode'] = self.sessions[self.default.name].country_code
-        if 'limit' not in params:
-            params['limit'] = '9999'
+        # Try to get the requested session, fallback to GUEST if missing, or use the first available session
+        session_name = self.default.name
+        if session_override:
+            session = session_override
+        elif session_name in self.sessions:
+            session = self.sessions[session_name]
+        elif SessionType.GUEST.name in self.sessions:
+            session = self.sessions[SessionType.GUEST.name]
+        elif self.sessions:
+            # Absolute fallback to whatever session is available
+            session = next(iter(self.sessions.values()))
+        else:
+            raise TidalError("No sessions available in TidalApi")
 
-        try:
-            resp = self.s.get(
-                self.TIDAL_API_BASE + url,
-                headers=self.sessions[self.default.name].auth_headers(),
-                params=params)
-        except requests.exceptions.RetryError:
-            print('TIDAL Rate Limit (Max Retries)! Waiting 30 seconds...')
-            time.sleep(30)
-            return self._get(url, params, refresh)
-        except requests.exceptions.ConnectionError:
-            print('Connection Error! Waiting 10 seconds...')
-            time.sleep(10)
-            return self._get(url, params, refresh)
+        params['countryCode'] = session.country_code
+        # if 'limit' not in params:
+        #     params['limit'] = '9999'
 
-        # if the request 401s or 403s, try refreshing the TV/Mobile session in case that helps
+        resp = self.s.get(
+            self.TIDAL_API_BASE + url,
+            headers=session.auth_headers(),
+            params=params,
+            timeout=60)
+
+        # if the request 401s or 403s, try refreshing the session in case that helps
         if not refresh and (resp.status_code == 401 or resp.status_code == 403):
-            session_name = self.default.name
-            if self.sessions[session_name].refresh() and self.on_token_refresh:
-                self.on_token_refresh(session_name, self.sessions[session_name].get_storage())
-            return self._get(url, params, True)
-
-        if resp.status_code == 429:
-            retry_after = int(resp.headers.get('Retry-After', 10))
-            print(f'TIDAL Rate Limit! Waiting {retry_after} seconds...')
-            time.sleep(retry_after)
-            return self._get(url, params, refresh)
+            session.refresh()
+            return self._get(url, params, True, session_override)
 
         resp_json = None
         try:
@@ -135,6 +133,85 @@ class TidalApi(object):
             'prefetch': 'false'
         })
 
+    def get_track_preview_url(self, track_id, session_override=None):
+        """Fetch a 30-second preview for a track. Uses PREVIEW assetpresentation.
+        Returns manifest data if available, or None if not accessible.
+        If session_override is given, uses that session instead of the default."""
+        try:
+            return self._get('tracks/' + str(track_id) + '/playbackinfopostpaywall/v4', {
+                'playbackmode': 'STREAM',
+                'assetpresentation': 'PREVIEW',
+                'audioquality': 'LOW',
+                'prefetch': 'false'
+            }, session_override=session_override)
+        except Exception:
+            return None
+
+    def get_track_preview_v2(self, track_id, session_override=None):
+        """Fetch a 30-second preview using Tidal's v2 OpenAPI (same as the web player).
+        Uses openapi.tidal.com/v2/trackManifests — works with client_credentials tokens.
+        Returns a dict with 'manifestMimeType' and 'manifest' keys, or None."""
+        # Safe session lookup
+        session = session_override
+        if not session:
+            session = self.sessions.get(SessionType.GUEST.name)
+        if not session:
+            session = self.sessions.get(self.default.name)
+        if not session and self.sessions:
+            session = next(iter(self.sessions.values()))
+        
+        if not session:
+            return None
+        try:
+            # Ensure token is fresh
+            if hasattr(session, 'expires') and session.expires and datetime.now() > session.expires:
+                session.refresh()
+
+            resp = self.s.get(
+                'https://openapi.tidal.com/v2/trackManifests/' + str(track_id),
+                headers={
+                    'Authorization': 'Bearer {}'.format(session.access_token),
+                    'Accept': 'application/vnd.api+json',
+                },
+                params={
+                    'countryCode': session.country_code or 'US',
+                    'adaptive': 'false',
+                    'formats': 'AACLC',
+                    'manifestType': 'MPEG_DASH',
+                    'uriScheme': 'DATA',
+                    'usage': 'PLAYBACK',
+                },
+                timeout=30
+            )
+
+            if resp.status_code != 200:
+                return None
+
+            data = resp.json()
+            # v2 API returns JSON:API format: data.attributes.uri
+            # The uri is a data URI like "data:application/dash+xml;base64,XXXX"
+            attrs = data.get('data', {}).get('attributes', {})
+            raw_uri = attrs.get('uri', '')
+            if not raw_uri:
+                return None
+
+            # Strip data URI prefix to get raw base64 content
+            # Format: "data:<mime>;base64,<data>"
+            manifest_b64 = raw_uri
+            if raw_uri.startswith('data:'):
+                # Extract MIME type and base64 data
+                comma_idx = raw_uri.find(',')
+                if comma_idx != -1:
+                    manifest_b64 = raw_uri[comma_idx + 1:]
+
+            # Return in the same format as v1 for compatibility
+            return {
+                'manifestMimeType': 'application/dash+xml',
+                'manifest': manifest_b64,
+            }
+        except Exception:
+            return None
+
     def get_search_data(self, search_term, limit=20):
         return self._get('search', params={
             'query': str(search_term),
@@ -142,6 +219,46 @@ class TidalApi(object):
             'limit': limit,
             'includeContributors': 'true'
         })
+
+    def authenticated_session(self):
+        """First logged-in session (guest sessions have no user_id), or None."""
+        preferred = (
+            SessionType.TV.name,
+            SessionType.MOBILE_ATMOS.name,
+            SessionType.MOBILE_DEFAULT.name,
+        )
+        for name in preferred:
+            session = self.sessions.get(name)
+            if session and getattr(session, 'user_id', None):
+                return session
+        for session in self.sessions.values():
+            if getattr(session, 'user_id', None):
+                return session
+        return None
+
+    def get_user_playlists_and_favorites(self, user_id, offset=0, limit=50):
+        auth = self.authenticated_session()
+        if not auth:
+            raise TidalAuthError('User login required to list personal playlists')
+        return self._get(
+            f'users/{user_id}/playlistsAndFavoritePlaylists',
+            params={'offset': offset, 'limit': limit},
+            session_override=auth,
+        )
+
+    def iter_user_playlist_entries(self, user_id):
+        """Yield USER_CREATED / favorite playlist wrapper objects from the user's library."""
+        offset = 0
+        page_size = 50  # API returns 400 if limit > 50 ("Too big page, max page size is [50]")
+        while True:
+            page = self.get_user_playlists_and_favorites(user_id, offset=offset, limit=page_size)
+            items = page.get('items') or []
+            for item in items:
+                yield item
+            offset += len(items)
+            total = page.get('totalNumberOfItems', 0)
+            if not items or offset >= total:
+                break
 
     def get_page(self, pageurl, params=None):
         local_params = {
@@ -154,6 +271,21 @@ class TidalApi(object):
             local_params.update(params)
 
         return self._get('pages/' + pageurl, params=local_params)
+
+    def get_path(self, path, params=None):
+        """Call an arbitrary API path relative to TIDAL_API_BASE (e.g. showMore.apiPath or dataApiPath after stripping /v1/).
+        For paths starting with 'pages/', merges in deviceType, locale, and mediaFormats so the API does not return 400."""
+        if params is None:
+            params = {}
+        if path.startswith('pages/'):
+            page_params = {
+                'deviceType': 'TV',
+                'locale': 'en_US',
+                'mediaFormats': 'SONY_360',
+            }
+            page_params.update(params)
+            params = page_params
+        return self._get(path, params=params)
 
     def get_playlist_items(self, playlist_id):
         result = self._get('playlists/' + playlist_id + '/items', {
@@ -184,6 +316,39 @@ class TidalApi(object):
     def get_album_tracks(self, album_id):
         return self._get('albums/' + str(album_id) + '/tracks')
 
+    def get_album_items(self, album_id, offset: int = 0, limit: int = 100):
+        return self._get('albums/' + str(album_id) + '/items', params={
+            'offset': offset,
+            'limit': limit,
+        })
+
+    def _paginate_album_items(self, album_id, path_suffix: str, extra_params=None):
+        """Paginate albums/{id}/items or albums/{id}/tracks."""
+        params = {'offset': 0, 'limit': 100}
+        if extra_params:
+            params.update(extra_params)
+        result = self._get(f'albums/{album_id}/{path_suffix}', params)
+        if result.get('totalNumberOfItems', 0) <= 100:
+            return result
+        offset = len(result.get('items') or [])
+        while offset < result.get('totalNumberOfItems', 0):
+            page_params = {'offset': offset, 'limit': 100}
+            if extra_params:
+                page_params.update(extra_params)
+            buf = self._get(f'albums/{album_id}/{path_suffix}', page_params)
+            page_items = buf.get('items') or []
+            if not page_items:
+                break
+            result['items'] = (result.get('items') or []) + page_items
+            offset += len(page_items)
+        return result
+
+    def get_album_items_all(self, album_id):
+        return self._paginate_album_items(album_id, 'items')
+
+    def get_album_tracks_all(self, album_id):
+        return self._paginate_album_items(album_id, 'tracks')
+
     def get_track(self, track_id):
         return self._get('tracks/' + str(track_id))
 
@@ -192,14 +357,6 @@ class TidalApi(object):
 
     def get_video(self, video_id):
         return self._get('videos/' + str(video_id))
-
-    def get_video_stream_url(self, video_id, quality):
-        return self._get('videos/' + str(video_id) + '/playbackinfopostpaywall/v4', {
-            'playbackmode': 'STREAM',
-            'assetpresentation': 'FULL',
-            'videoquality': quality,
-            'prefetch': 'false'
-        })
     
     def get_tracks_by_isrc(self, isrc):
         return self._get('tracks', params={
@@ -231,29 +388,43 @@ class TidalApi(object):
             'limit': 50
         })
 
+    def get_video_stream_url(self, video_id):
+        return self._get('videos/' + str(video_id) + '/streamurl')
+
     def get_artist(self, artist_id):
         return self._get('artists/' + str(artist_id))
 
+    def _get_all_artist_albums(self, artist_id, params=None):
+        # Tidal defaults to 20 items per page when no limit is supplied, which previously
+        # capped an artist's album list. Paginate via limit/offset to return every album.
+        base_params = dict(params or {})
+        page_size = 50
+        url = 'artists/' + str(artist_id) + '/albums'
+
+        first = self._get(url, params={**base_params, 'limit': page_size, 'offset': 0})
+        items = list(first.get('items') or [])
+        total = first.get('totalNumberOfItems')
+        if total is None:
+            total = len(items)
+
+        offset = page_size
+        while len(items) < total:
+            page = self._get(url, params={**base_params, 'limit': page_size, 'offset': offset})
+            page_items = page.get('items') or []
+            if not page_items:
+                break
+            items += page_items
+            offset += page_size
+
+        result = dict(first)
+        result['items'] = items
+        return result
+
     def get_artist_albums(self, artist_id):
-        return self._get('artists/' + str(artist_id) + '/albums')
+        return self._get_all_artist_albums(artist_id)
 
     def get_artist_albums_ep_singles(self, artist_id):
-        return self._get('artists/' + str(artist_id) + '/albums', params={'filter': 'EPSANDSINGLES'})
-
-    def get_artist_videos(self, artist_id, limit=100, offset=0):
-        return self._get('artists/' + str(artist_id) + '/videos', params={'limit': limit, 'offset': offset})
-
-    def post_events(self, events: list) -> bool:
-        try:
-            resp = self.s.post(
-                self.TIDAL_API_BASE + 'events',
-                headers={**self.sessions[self.default.name].auth_headers(), 'Content-Type': 'application/json'},
-                json={'events': events},
-                timeout=5
-            )
-            return resp.status_code in (200, 201, 202, 204)
-        except Exception:
-            return False
+        return self._get_all_artist_albums(artist_id, params={'filter': 'EPSANDSINGLES'})
 
     def get_type_from_id(self, id_):
         result = None
@@ -274,7 +445,7 @@ class TidalApi(object):
             pass
         try:
             result = self.get_video(id_)
-            return 't'
+            return 'v'
         except TidalError:
             pass
 
@@ -335,8 +506,10 @@ class TidalSession(ABC):
         """
         Checks if session is still valid and returns True/False
         """
-        if self.access_token is None or self.expires is None or datetime.now() > self.expires:
-            return False
+        if not isinstance(self, TidalSession):
+            if self.access_token is None or datetime.now() > self.expires:
+                return False
+
         r = requests.get('https://api.tidal.com/v1/sessions', headers=self.auth_headers())
         return r.status_code == 200
 
@@ -558,8 +731,9 @@ class TidalTvSession(TidalSession):
         else:
             device_code = r.json()['deviceCode']
             user_code = r.json()['userCode']
-            print('Opening https://link.tidal.com/{}, log in or sign up to TIDAL.'.format(user_code))
-            webbrowser.open('https://link.tidal.com/' + user_code, new=2)
+            link_url = 'https://link.tidal.com/' + user_code
+            print('Opening {}, log in or sign up to TIDAL.'.format(link_url))
+            open_url_in_browser(link_url)
 
         data = {
             'client_id': self.client_id,
@@ -634,4 +808,52 @@ class TidalTvSession(TidalSession):
             'Connection': 'Keep-Alive',
             'Accept-Encoding': 'gzip',
             'User-Agent': 'TIDAL_ANDROID/1039 okhttp/3.14.9'
+        }
+
+
+class TidalGuestSession(TidalSession):
+    """
+    Tidal session object for guest/unauthenticated access
+    """
+
+    def __init__(self, client_id: str, client_secret: str):
+        super().__init__()
+        self.TIDAL_AUTH_BASE = 'https://auth.tidal.com/v1/'
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+
+    def auth(self):
+        r = requests.post(self.TIDAL_AUTH_BASE + 'oauth2/token', data={
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+            'grant_type': 'client_credentials'
+        }, headers={
+            'User-Agent': self.user_agent,
+            'Origin': 'https://tidal.com',
+            'Referer': 'https://tidal.com/'
+        })
+
+        if r.status_code != 200:
+            raise TidalAuthError(f"Guest authorization failed: {r.text}")
+
+        data = r.json()
+        self.access_token = data['access_token']
+        self.expires = datetime.now() + timedelta(seconds=data['expires_in'])
+        # Guest sessions don't have user_id, but country_code can be defaulted or fetched
+        # For search, US or a common code is usually fine if not provided
+        self.country_code = 'US'
+
+    def refresh(self):
+        return self.auth()
+
+    @staticmethod
+    def session_type():
+        return 'Guest'
+
+    def auth_headers(self):
+        return {
+            'X-Tidal-Token': self.client_id,
+            'Authorization': 'Bearer {}'.format(self.access_token),
+            'User-Agent': self.user_agent
         }
