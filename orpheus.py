@@ -499,52 +499,71 @@ def _spotify_isrc_only(orpheus, media_list, path):
     (Deezer -> Tidal) via isrc_recover.py. Protects the Spotify account from
     ripping-detection while still yielding lossless files."""
     import os, sys, subprocess, tempfile
-    from utils.models import QualityEnum, CodecOptions, DownloadTypeEnum
+    from utils.models import DownloadTypeEnum
     mod = orpheus.load_module('spotify') or orpheus.loaded_modules.get('spotify')
-    gs = orpheus.settings['global']
-    try:
-        quality = QualityEnum[gs['general']['download_quality'].upper()]
-    except Exception:
-        quality = QualityEnum.HIFI
-    codec = CodecOptions(
-        spatial_codecs=gs.get('codecs', {}).get('spatial_codecs', False),
-        proprietary_codecs=gs.get('codecs', {}).get('proprietary_codecs', False),
-    )
 
-    def track_isrc(tid):
+    api = mod.spotify_api
+
+    def isrc_by_id(tid):
+        """ISRC via the Web API (Client Credentials = a Spotify *app*'s client_id/
+        secret, NOT the user's login). The anonymous embed GraphQL does not expose
+        ISRC, and get_track_info would trigger OAuth — so neither is used."""
         try:
-            ti = mod.get_track_info(str(tid), quality, codec)
-            if ti and getattr(ti, 'tags', None) and getattr(ti.tags, 'isrc', None):
-                arts = ', '.join(ti.artists) if getattr(ti, 'artists', None) else ''
-                name = f'{arts} - {ti.name}' if arts else (ti.name or str(tid))
-                return ti.tags.isrc, name
+            if api._init_web_api_client() and getattr(api, 'client', None):
+                tr = api.client.track(str(tid)) or {}
+                return (tr.get('external_ids') or {}).get('isrc')
         except Exception:
             pass
-        return None, None
+        return None
+
+    def _name_of(t, fallback):
+        arts = ', '.join(t.artists) if getattr(t, 'artists', None) else ''
+        nm = getattr(t, 'name', None) or fallback
+        return f'{arts} - {nm}' if arts else nm
 
     entries = []
     for m in media_list:
         mt, mid = m.media_type, m.media_id
         try:
             if mt == DownloadTypeEnum.track:
-                isrc, name = track_isrc(mid)
-                entries.append((str(mid), isrc, name or str(mid)))
+                # single-track URL: media_id is the bare Spotify id
+                isrc = isrc_by_id(mid)
+                name = str(mid)
+                try:
+                    if api._init_web_api_client() and getattr(api, 'client', None):
+                        tr = api.client.track(str(mid)) or {}
+                        a = [x.get('name') for x in (tr.get('artists') or []) if x.get('name')]
+                        nm = tr.get('name') or str(mid)
+                        name = f"{', '.join(a)} - {nm}" if a else nm
+                except Exception:
+                    pass
+                entries.append((str(mid), isrc, name))
             elif mt in (DownloadTypeEnum.playlist, DownloadTypeEnum.album):
                 info = (mod.get_playlist_info(str(mid)) if mt == DownloadTypeEnum.playlist
                         else mod.get_album_info(str(mid)))
+                # get_playlist_info/get_album_info return TrackInfo objects (metadata only)
                 tracks = list(getattr(info, 'tracks', None) or [])
-                print(f'Spotify (metadata only): reading ISRC for {len(tracks)} tracks...')
-                for tid in tracks:
-                    isrc, name = track_isrc(tid)
-                    entries.append((str(tid), isrc, name or str(tid)))
+                print(f'Spotify (metadata only): reading ISRC for {len(tracks)} tracks (Web API, no account login)...')
+                for t in tracks:
+                    tid = getattr(t, 'id', None)
+                    isrc = getattr(getattr(t, 'tags', None), 'isrc', None) or (isrc_by_id(tid) if tid else None)
+                    entries.append((str(tid or _name_of(t, '?')), isrc, _name_of(t, str(tid))))
             else:
                 print(f'Spotify metadata-only: unsupported type {getattr(mt, "name", mt)} for {mid} (skipped)')
         except Exception as e:
             print(f'Spotify metadata error for {mid}: {e}')
 
     have = [(i, s, n) for i, s, n in entries if s]
+    missing = len(entries) - len(have)
     print(f'\nSpotify metadata-only: {len(have)}/{len(entries)} tracks have an ISRC; '
           f'downloading the exact recordings as FLAC from other services...')
+    if missing:
+        cfg = getattr(api, 'config', {}) or {}
+        if not (str(cfg.get('client_id', '')).strip() and str(cfg.get('client_secret', '')).strip()):
+            print(f'  ({missing} track(s) had no ISRC from the free embed API. For full coverage '
+                  f'WITHOUT logging into your Spotify account, set a Spotify app client_id/client_secret '
+                  f'in config/settings.json > modules > spotify — that uses the Web API (metadata only, '
+                  f'app-level, no account access).)')
     if not have:
         print('No ISRCs found - nothing to download.')
         return
