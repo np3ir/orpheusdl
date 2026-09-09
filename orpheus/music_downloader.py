@@ -146,6 +146,26 @@ def truncate_utf8_bytes_keep_suffix(value: str, max_bytes: int) -> str:
     return f'{trimmed_prefix}{suffix}'
 
 
+def _dedup_artist_names(names):
+    """Remove duplicate artist names (case- and accent-insensitive), preserving order
+    and the first spelling. Fixes sources that repeat the main/album artist in the
+    track artist list (e.g. ['Omar Marquez', 'Omar Marquez', 'Edgar Oceransky'])."""
+    import unicodedata
+
+    def _key(n):
+        d = unicodedata.normalize('NFKD', str(n))
+        d = ''.join(c for c in d if not unicodedata.combining(c))
+        return ' '.join(d.casefold().split())
+
+    seen, out = set(), []
+    for n in names:
+        k = _key(n)
+        if k and k not in seen:
+            seen.add(k)
+            out.append(n)
+    return out
+
+
 def simplify_error_message(error_str: str) -> str:
     """Convert complex error messages into user-friendly one-liners"""
     error_lower = error_str.lower()
@@ -607,6 +627,7 @@ class Downloader:
         number_of_tracks=None,
         track_number=None,
         disc_number=None,
+        isrc=None,
         simplify_reason=True,
     ) -> str:
         position = ''
@@ -639,6 +660,8 @@ class Downloader:
             track_url = platform_track_url(self.service_name, track_id)
             if track_url:
                 id_part += f' | {track_url}'
+        if isrc:
+            id_part += f' [ISRC:{isrc}]'
 
         reason_text = str(reason).strip() if reason else 'Download failed'
         if simplify_reason:
@@ -686,9 +709,11 @@ class Downloader:
 
         track_number = None
         disc_number = None
+        isrc = None
         if isinstance(track_info, TrackInfo) and track_info.tags:
             track_number = track_info.tags.track_number
             disc_number = track_info.tags.disc_number
+            isrc = getattr(track_info.tags, 'isrc', None)
 
         line = self._format_track_error_log_line(
             reason=reason,
@@ -699,6 +724,7 @@ class Downloader:
             number_of_tracks=number_of_tracks,
             track_number=track_number,
             disc_number=disc_number,
+            isrc=isrc,
             simplify_reason=True,
         )
         self._append_download_error_log_line(line)
@@ -4774,6 +4800,12 @@ class Downloader:
                 track_info = self.service.get_track_info(track_id, quality_tier, codec_options, **track_info_kwargs)
                 track_info = self._ensure_track_info_id(track_info, track_id)
                 self._apply_album_context_to_track(track_info, safe_extra_kwargs)
+
+                # Drop duplicate artist names (e.g. the album/main artist repeated in
+                # the track artist list) — case/accent-insensitive, order preserved — so
+                # neither the ARTIST tag nor the filename shows "Artist / Artist / Other".
+                if getattr(track_info, 'artists', None):
+                    track_info.artists = _dedup_artist_names(track_info.artists)
 
                 # PR #2: count failed tracks (not-streamable vs other failures).
                 # Printing/failing is handled by the existing error checks below.

@@ -446,30 +446,163 @@ def main():
             tpm[i] = moduleselected
         sdm = args.separatedownload.lower()
 
-        if not media_to_download:
+        # Spotify = metadata only: never stream audio via librespot (protects the
+        # account). Fetch each track's ISRC and download the exact recording as
+        # FLAC from other services. Controlled by formatting.spotify_metadata_only.
+        spotify_handled = False
+        if ('spotify' in media_to_download
+                and orpheus.settings['global'].get('formatting', {}).get('spotify_metadata_only', True)):
+            spotify_handled = True
+            try:
+                _spotify_isrc_only(orpheus, media_to_download.pop('spotify'), path)
+            except Exception as _sp_e:
+                print(f'Spotify metadata-only handling failed: {_sp_e}')
+
+        if not media_to_download and not spotify_handled:
             print('No links given')
 
-        # Beatport quality workaround: high and low quality fail, fallback to lossless FLAC.
-        # Only apply this when quality wasn't explicitly overridden for this run
-        # (GUI/webui use different code paths and expect LOW/HIGH to map to AAC).
-        original_quality = None
-        beatport_quality_override = False
-        if (
-            'beatport' in media_to_download
-            and not explicit_quality_override
-            and orpheus.settings['global']['general']['download_quality'] in ['high', 'low']
-        ):
-            original_quality = orpheus.settings['global']['general']['download_quality']
-            orpheus.settings['global']['general']['download_quality'] = 'lossless'
-            beatport_quality_override = True
-            print(f' Beatport: Automatically switching from "{original_quality}" to "lossless" quality')
+        if media_to_download:
+            # Beatport quality workaround: high and low quality fail, fallback to lossless FLAC.
+            # Only apply this when quality wasn't explicitly overridden for this run
+            # (GUI/webui use different code paths and expect LOW/HIGH to map to AAC).
+            original_quality = None
+            beatport_quality_override = False
+            if (
+                'beatport' in media_to_download
+                and not explicit_quality_override
+                and orpheus.settings['global']['general']['download_quality'] in ['high', 'low']
+            ):
+                original_quality = orpheus.settings['global']['general']['download_quality']
+                orpheus.settings['global']['general']['download_quality'] = 'lossless'
+                beatport_quality_override = True
+                print(f' Beatport: Automatically switching from "{original_quality}" to "lossless" quality')
 
+            try:
+                orpheus_core_download(orpheus, media_to_download, tpm, sdm, path)
+            finally:
+                # Restore original quality setting if we overrode it
+                if beatport_quality_override and original_quality:
+                    orpheus.settings['global']['general']['download_quality'] = original_quality
+
+            # Automatic ISRC fallback: re-download failed tracks from other services,
+            # matched by ISRC (the exact recording). Enabled via formatting.isrc_fallback.
+            if orpheus.settings['global'].get('formatting', {}).get('isrc_fallback', False):
+                try:
+                    _run_isrc_fallback(path)
+                except Exception as _isrc_e:
+                    print(f'ISRC fallback skipped: {_isrc_e}')
+
+
+def _spotify_isrc_only(orpheus, media_list, path):
+    """Spotify = metadata only. Read each track's ISRC via the Web API (no librespot
+    audio) and download the exact recordings as FLAC from other services
+    (Deezer -> Tidal) via isrc_recover.py. Protects the Spotify account from
+    ripping-detection while still yielding lossless files."""
+    import os, sys, subprocess, tempfile
+    from utils.models import QualityEnum, CodecOptions, DownloadTypeEnum
+    mod = orpheus.load_module('spotify') or orpheus.loaded_modules.get('spotify')
+    gs = orpheus.settings['global']
+    try:
+        quality = QualityEnum[gs['general']['download_quality'].upper()]
+    except Exception:
+        quality = QualityEnum.HIFI
+    codec = CodecOptions(
+        spatial_codecs=gs.get('codecs', {}).get('spatial_codecs', False),
+        proprietary_codecs=gs.get('codecs', {}).get('proprietary_codecs', False),
+    )
+
+    def track_isrc(tid):
         try:
-            orpheus_core_download(orpheus, media_to_download, tpm, sdm, path)
-        finally:
-            # Restore original quality setting if we overrode it
-            if beatport_quality_override and original_quality:
-                orpheus.settings['global']['general']['download_quality'] = original_quality
+            ti = mod.get_track_info(str(tid), quality, codec)
+            if ti and getattr(ti, 'tags', None) and getattr(ti.tags, 'isrc', None):
+                arts = ', '.join(ti.artists) if getattr(ti, 'artists', None) else ''
+                name = f'{arts} - {ti.name}' if arts else (ti.name or str(tid))
+                return ti.tags.isrc, name
+        except Exception:
+            pass
+        return None, None
+
+    entries = []
+    for m in media_list:
+        mt, mid = m.media_type, m.media_id
+        try:
+            if mt == DownloadTypeEnum.track:
+                isrc, name = track_isrc(mid)
+                entries.append((str(mid), isrc, name or str(mid)))
+            elif mt in (DownloadTypeEnum.playlist, DownloadTypeEnum.album):
+                info = (mod.get_playlist_info(str(mid)) if mt == DownloadTypeEnum.playlist
+                        else mod.get_album_info(str(mid)))
+                tracks = list(getattr(info, 'tracks', None) or [])
+                print(f'Spotify (metadata only): reading ISRC for {len(tracks)} tracks...')
+                for tid in tracks:
+                    isrc, name = track_isrc(tid)
+                    entries.append((str(tid), isrc, name or str(tid)))
+            else:
+                print(f'Spotify metadata-only: unsupported type {getattr(mt, "name", mt)} for {mid} (skipped)')
+        except Exception as e:
+            print(f'Spotify metadata error for {mid}: {e}')
+
+    have = [(i, s, n) for i, s, n in entries if s]
+    print(f'\nSpotify metadata-only: {len(have)}/{len(entries)} tracks have an ISRC; '
+          f'downloading the exact recordings as FLAC from other services...')
+    if not have:
+        print('No ISRCs found - nothing to download.')
+        return
+    fd, tmp = tempfile.mkstemp(suffix='.txt', prefix='spotify_isrc_')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write('# OrpheusDL - Spotify metadata-only ISRC recovery\n# Service: spotify\n#\n')
+            for i, s, n in have:
+                f.write(f'[track 1/1] {n} (id={i}) [ISRC:{s}]\n  Reason: spotify metadata-only\n\n')
+        tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'isrc_recover.py')
+        if os.path.isfile(tool):
+            env = dict(os.environ, ORPHEUS_ISRC_RECOVERING='1')
+            subprocess.run([sys.executable, tool, tmp], env=env)
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _run_isrc_fallback(path):
+    """After a download, re-download the tracks that failed (listed in error.txt)
+    from other services matched by ISRC. Delegates to isrc_recover.py.
+
+    Walks the download base for error.txt files carrying ``[ISRC:...]`` so it covers
+    every link type: playlists / single tracks (base) and albums / artist
+    discographies (nested folders). Only files touched by this run are used (mtime
+    cutoff), and an env guard prevents recursion when the recovery invokes orpheus.py."""
+    import os, sys, subprocess, time
+    if os.environ.get('ORPHEUS_ISRC_RECOVERING'):
+        return
+    base = str(path).rstrip('/\\')
+    if not os.path.isdir(base):
+        return
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'isrc_recover.py')
+    if not os.path.isfile(tool):
+        return
+    cutoff = time.time() - 6 * 3600  # only error.txt files from this run (last 6h)
+    targets = []
+    for dirpath, _dirs, files in os.walk(base):
+        if 'error.txt' not in files:
+            continue
+        err = os.path.join(dirpath, 'error.txt')
+        try:
+            if os.path.getmtime(err) < cutoff:
+                continue
+            with open(err, encoding='utf-8', errors='ignore') as f:
+                if '[ISRC:' not in f.read():
+                    continue
+        except Exception:
+            continue
+        targets.append(err)
+    if not targets:
+        return
+    print('\n=== ISRC fallback: recovering failed tracks from other services (by ISRC) ===')
+    env = dict(os.environ, ORPHEUS_ISRC_RECOVERING='1')
+    for err in targets:
+        subprocess.run([sys.executable, tool, err], stdin=subprocess.DEVNULL, env=env)
 
 
 if __name__ == "__main__":
