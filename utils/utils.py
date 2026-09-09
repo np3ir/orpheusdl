@@ -73,8 +73,26 @@ def create_aiohttp_session():
     )
 
 
-sanitise_name = lambda name: re.sub(r'[:]', ' - ', re.sub(r'[\\/*?"<>|$]', '', re.sub(r'[\x00-\x1F\x7F]', '',
-                                                                                      str(name).strip()))) if name else ''
+# Special-character handling is delegated to the ported strings.py so this fork
+# sanitises names exactly like tiddl-elvigilante: the Windows-forbidden characters
+# < > : " / \ | ? * are mapped to their full-width Unicode look-alikes
+# (＜＞：＂／＼｜？＊) instead of being deleted, plus zalgo removal, NFC
+# normalisation, dash-look-alike folding, reserved-name guarding and per-component
+# byte truncation. Kept as a thin wrapper so the historical contract holds: one
+# path component in, a non-empty component out, callable on a str or a list of
+# names, applied per component (folders and files separately). The whole-path
+# byte cap stays with fix_byte_limit().
+from .strings import sanitize_filename as _sanitize_filename, MAX_COMPONENT_LEN as _MAX_COMPONENT_LEN
+
+
+def sanitise_name(name):
+    if not name:
+        return ''
+    s = ", ".join(map(str, name)) if isinstance(name, list) else str(name)
+    # max_len == tiddl's per-component limit (255) with no download-suffix reserve;
+    # long-path safety stays with fix_byte_limit(). Falls back to '_' only if the
+    # ported sanitiser yields an empty component.
+    return _sanitize_filename(s, max_len=_MAX_COMPONENT_LEN, reserve_bytes=0) or '_'
 
 
 # --- INICIO DE FUNCIÓN QUE ARREGLA EL SLASH FINAL ---
