@@ -1526,8 +1526,8 @@ class Downloader:
     def create_temp_filename(self):
         """Create a temporary filename in the temp directory"""
         if not self.temp_dir:
-            # If temp_dir is not set, create it in the current directory
-            self.temp_dir = os.path.join(os.getcwd(), 'temp')
+            # Per-process temp dir so concurrent runs don't clobber each other.
+            self.temp_dir = os.path.join(os.getcwd(), 'temp', str(os.getpid()))
         os.makedirs(self.temp_dir, exist_ok=True)
         return os.path.join(self.temp_dir, str(uuid.uuid4()))
 

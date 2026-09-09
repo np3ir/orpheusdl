@@ -570,7 +570,12 @@ def remove_module_from_storage(settings_location, module):
         with open(settings_location, 'wb') as f:
             pickle.dump(temporary_settings, f)
 
-create_temp_filename = lambda : f'temp/{os.urandom(16).hex()}'
+def create_temp_filename():
+    """Per-process temp path so concurrent OrpheusDL runs don't share or clobber
+    each other's temp files (fixes WinError 32 on the end-of-run temp cleanup)."""
+    d = os.path.join('temp', str(os.getpid()))
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, os.urandom(16).hex())
 
 def save_to_temp(input: bytes):
     location = create_temp_filename()

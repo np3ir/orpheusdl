@@ -523,7 +523,11 @@ def orpheus_core_download(orpheus_session: Orpheus, media_to_download, third_par
     global_settings = orpheus_session.get_merged_global_settings()
     downloader = Downloader(global_settings, orpheus_session.module_controls, oprinter, output_path, third_party_modules, use_ansi_colors)
     downloader.full_settings = orpheus_session.settings  # Add access to full settings including modules
-    os.makedirs('temp', exist_ok=True)
+    # Per-process temp dir so multiple OrpheusDL windows running at once don't share
+    # or delete each other's temp files (was a fixed 'temp' -> WinError 32 on cleanup).
+    _run_temp = os.path.join('temp', str(os.getpid()))
+    os.makedirs(_run_temp, exist_ok=True)
+    downloader.temp_dir = os.path.abspath(_run_temp)
 
     spotify_warning_shown = False
 
@@ -649,4 +653,4 @@ def orpheus_core_download(orpheus_session: Orpheus, media_to_download, third_par
     # PR #2: end-of-run download summary (counts + errors)
     downloader.print_download_summary()
 
-    if os.path.exists('temp'): shutil.rmtree('temp')
+    shutil.rmtree(_run_temp, ignore_errors=True)  # only this run's temp; tolerate locked files
