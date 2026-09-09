@@ -136,6 +136,7 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
         tagger.tags.RegisterTXXXKey('major_brand', 'major_brand')
         tagger.tags.RegisterTXXXKey('minor_version', 'minor_version')
         tagger.tags.RegisterTXXXKey('Rating', 'Rating')
+        tagger.tags.RegisterTXXXKey('itunesadvisory', 'ITUNESADVISORY')
         tagger.tags.RegisterTXXXKey('track_url', 'TRACK_URL')
 
         tagger.tags.pop('encoded', None)
@@ -267,12 +268,15 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
                 tagger['COMPOSER'] = track_info.tags.composer
 
     if track_info.explicit is not None:
+        # Standard explicit/advisory tag: iTunes convention 1 = explicit, 2 = not explicit.
+        # MP4/M4A uses the native `rtng` atom; MP3 (ID3) and Vorbis (FLAC/OGG) use ITUNESADVISORY.
+        advisory = 1 if track_info.explicit else 2
         if container == ContainerEnum.m4a or container == ContainerEnum.mp4:
-            tagger['rtng'] = [1 if track_info.explicit else 0]
+            tagger['rtng'] = [advisory]
         elif container == ContainerEnum.mp3:
-            tagger['Rating'] = 'Explicit' if track_info.explicit else 'Clean'
+            tagger['itunesadvisory'] = str(advisory)
         else:
-            tagger['Rating'] = 'Explicit' if track_info.explicit else 'Clean'
+            tagger['ITUNESADVISORY'] = str(advisory)
 
     if track_info.tags.genres:
         if container == ContainerEnum.m4a or container == ContainerEnum.mp4:

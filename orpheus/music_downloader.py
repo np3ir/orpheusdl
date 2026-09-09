@@ -2186,7 +2186,7 @@ class Downloader:
 
         playlist_tags = {k: sanitise_name(v) for k, v in asdict(playlist_info).items()}
         playlist_tags['name'] = safe_playlist_name # Use the safe name for path formatting
-        playlist_tags['explicit'] = ' 🅴' if playlist_info.explicit else ''
+        playlist_tags['explicit'] = ' (explicit)' if playlist_info.explicit else ''
         playlist_tags['platform'] = self._platform_folder_name()
         playlist_path_formatted_name = _format_path_template(
             self.global_settings['formatting']['playlist_format'], playlist_tags, 'Playlist folder format'
@@ -3200,7 +3200,7 @@ class Downloader:
         quality_source = self._resolve_album_quality_source(album_info, extra_kwargs)
         quality_label = self._quality_path_label(quality_source)
         album_tags['quality'] = f'[{quality_label}]' if quality_label else ''
-        album_tags['explicit'] = ' 🅴' if album_info.explicit else ''
+        album_tags['explicit'] = ' (explicit)' if album_info.explicit else ''
         album_tags['artist_initials'] = self._get_artist_initials_from_name(album_info)
         album_tags['name'] = self._compact_path_tag(album_tags.get('name', ''))
         
@@ -3310,7 +3310,7 @@ class Downloader:
         # Filter asdict to only include top-level strings for basic formatting, then explicitly handle complex fields
         raw_tags = asdict(track_info)
         track_tags = {k: sanitise_name(v) for k, v in raw_tags.items() if isinstance(v, (str, int, float, bool))}
-        track_tags['explicit'] = ' 🅴' if track_info.explicit else ''
+        track_tags['explicit'] = ' (explicit)' if track_info.explicit else ''
         track_tags['platform'] = self._platform_folder_name()
         
         # Add commonly used format variables
