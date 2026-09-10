@@ -1,4 +1,5 @@
-import importlib, json, logging, os, pickle, requests, urllib3, base64, shutil, sys
+from utils.atomic_io import session_transaction
+import importlib, json, logging, os, pickle, requests, urllib3, base64, shutil, sys, time
 from datetime import datetime
 
 from orpheus.music_downloader import Downloader
@@ -70,7 +71,9 @@ class Orpheus:
                 "force_album_format": False,
                 "use_album_artist_for_discography": False,
                 "use_playlist_position": False,
-                "use_album_position": False
+                "use_album_position": False,
+                "isrc_fallback": True,
+                "spotify_metadata_only": True
             },
             "codecs": {
                 "proprietary_codecs": False,
@@ -396,66 +399,63 @@ class Orpheus:
         new_settings['modules'] = module_settings
 
         ## Sessions
-        try:
-            sessions = pickle.load(open(self.session_storage_location, 'rb')) if os.path.exists(self.session_storage_location) else {}
-        except (pickle.UnpicklingError, EOFError, AttributeError):
-            logging.warning("Orpheus: loginstorage.bin was corrupted. Resetting session storage.")
-            sessions = {}
+        with session_transaction(self.session_storage_location) as stored_sessions:
+            sessions = stored_sessions
+            if not ('advancedmode' in sessions and 'modules' in sessions and sessions['advancedmode'] == advanced_login_mode):
+                sessions = {'advancedmode': advanced_login_mode, 'modules':{}}
 
-        if not ('advancedmode' in sessions and 'modules' in sessions and sessions['advancedmode'] == advanced_login_mode):
-            sessions = {'advancedmode': advanced_login_mode, 'modules':{}}
+            # in format {advancedmode, modules: {modulename: {default, type, custom_data, sessions: [sessionname: {##}]}}}
+            # where ## is 'custom_session' plus if jwt 'access, refresh' (+ emailhash in simple)
+            # in the special case of simple mode, session is always called default
+            new_module_sessions = {}
+            for i in self.module_list:
+                # Clear storage if type changed
+                new_module_sessions[i] = sessions['modules'][i] if i in sessions['modules'] else {'selected':'default', 'sessions':{'default':{}}}
 
-        # in format {advancedmode, modules: {modulename: {default, type, custom_data, sessions: [sessionname: {##}]}}}
-        # where ## is 'custom_session' plus if jwt 'access, refresh' (+ emailhash in simple)
-        # in the special case of simple mode, session is always called default
-        new_module_sessions = {}
-        for i in self.module_list:
-            # Clear storage if type changed
-            new_module_sessions[i] = sessions['modules'][i] if i in sessions['modules'] else {'selected':'default', 'sessions':{'default':{}}}
+                if self.module_settings[i].global_storage_variables: new_module_sessions[i]['custom_data'] = \
+                    {j:new_module_sessions[i]['custom_data'][j] for j in self.module_settings[i].global_storage_variables \
+                        if 'custom_data' in new_module_sessions[i] and j in new_module_sessions[i]['custom_data']}
 
-            if self.module_settings[i].global_storage_variables: new_module_sessions[i]['custom_data'] = \
-                {j:new_module_sessions[i]['custom_data'][j] for j in self.module_settings[i].global_storage_variables \
-                    if 'custom_data' in new_module_sessions[i] and j in new_module_sessions[i]['custom_data']}
+                # Migration/Fix for list-based sessions (legacy or corrupted)
+                if isinstance(new_module_sessions[i]['sessions'], list):
+                     first_session = new_module_sessions[i]['sessions'][0] if new_module_sessions[i]['sessions'] else {}
+                     new_module_sessions[i]['sessions'] = {'default': first_session}
+                     new_module_sessions[i]['selected'] = 'default'
 
-            # Migration/Fix for list-based sessions (legacy or corrupted)
-            if isinstance(new_module_sessions[i]['sessions'], list):
-                 first_session = new_module_sessions[i]['sessions'][0] if new_module_sessions[i]['sessions'] else {}
-                 new_module_sessions[i]['sessions'] = {'default': first_session}
-                 new_module_sessions[i]['selected'] = 'default'
-
-            for current_session in new_module_sessions[i]['sessions'].values():
-                # For simple login type only, as it does not apply to advanced login
-                if self.module_settings[i].login_behaviour is ManualEnum.orpheus and not advanced_login_mode:
-                    hashes = {k:hash_string(str(v)) for k,v in module_settings.get(i, {}).items()}
-                    if current_session.get('hashes'):
-                        clear_session = any(k not in hashes or hashes[k] != v for k,v in current_session['hashes'].items() if k in self.module_settings[i].session_settings)
+                for current_session in new_module_sessions[i]['sessions'].values():
+                    # For simple login type only, as it does not apply to advanced login
+                    if self.module_settings[i].login_behaviour is ManualEnum.orpheus and not advanced_login_mode:
+                        hashes = {k:hash_string(str(v)) for k,v in module_settings.get(i, {}).items()}
+                        if current_session.get('hashes'):
+                            clear_session = any(k not in hashes or hashes[k] != v for k,v in current_session['hashes'].items() if k in self.module_settings[i].session_settings)
+                        else:
+                            clear_session = True
                     else:
-                        clear_session = True
-                else:
-                    clear_session = False
-                current_session['clear_session'] = clear_session
+                        clear_session = False
+                    current_session['clear_session'] = clear_session
 
-                if ModuleFlags.enable_jwt_system in self.module_settings[i].flags:
-                    if 'bearer' in current_session and current_session['bearer'] and not clear_session:
-                        # Clears bearer token if it's expired
-                        try:
-                            time_left_until_refresh = json.loads(base64.b64decode(current_session['bearer'].split('.')[0]))['exp'] - true_current_utc_timestamp()
-                            current_session['bearer'] = current_session['bearer'] if time_left_until_refresh > 0 else ''
-                        except:
-                            pass
+                    if ModuleFlags.enable_jwt_system in self.module_settings[i].flags:
+                        if 'bearer' in current_session and current_session['bearer'] and not clear_session:
+                            # Clears bearer token if it's expired
+                            try:
+                                time_left_until_refresh = json.loads(base64.b64decode(current_session['bearer'].split('.')[0]))['exp'] - true_current_utc_timestamp()
+                                current_session['bearer'] = current_session['bearer'] if time_left_until_refresh > 0 else ''
+                            except:
+                                pass
+                        else:
+                            current_session['bearer'] = ''
+                            current_session['refresh'] = ''
                     else:
-                        current_session['bearer'] = ''
-                        current_session['refresh'] = ''
-                else:
-                    if 'bearer' in current_session: current_session.pop('bearer')
-                    if 'refresh' in current_session: current_session.pop('refresh')
+                        if 'bearer' in current_session: current_session.pop('bearer')
+                        if 'refresh' in current_session: current_session.pop('refresh')
 
-                if self.module_settings[i].session_storage_variables: current_session['custom_data'] = \
-                    {j:current_session['custom_data'][j] for j in self.module_settings[i].session_storage_variables \
-                        if 'custom_data' in current_session and j in current_session['custom_data'] and not clear_session}
-                elif 'custom_data' in current_session: current_session.pop('custom_data')
+                    if self.module_settings[i].session_storage_variables: current_session['custom_data'] = \
+                        {j:current_session['custom_data'][j] for j in self.module_settings[i].session_storage_variables \
+                            if 'custom_data' in current_session and j in current_session['custom_data'] and not clear_session}
+                    elif 'custom_data' in current_session: current_session.pop('custom_data')
 
-        pickle.dump({'advancedmode': advanced_login_mode, 'modules': new_module_sessions}, open(self.session_storage_location, 'wb'))
+            stored_sessions.clear()
+            stored_sessions.update({'advancedmode': advanced_login_mode, 'modules': new_module_sessions})
         open(self.settings_location, 'w', encoding='utf-8').write(json.dumps(new_settings, indent = 4, sort_keys = False))
 
         if new_setting_detected:
@@ -517,11 +517,16 @@ def _show_cli_spotify_warning(use_ansi_colors=True):
 
 
 def orpheus_core_download(orpheus_session: Orpheus, media_to_download, third_party_modules, separate_download_module, output_path, use_ansi_colors=True):
+    run_start = time.perf_counter()
     # Get global settings merged with defaults to ensure all required keys exist
     global_settings = orpheus_session.get_merged_global_settings()
     downloader = Downloader(global_settings, orpheus_session.module_controls, oprinter, output_path, third_party_modules, use_ansi_colors)
     downloader.full_settings = orpheus_session.settings  # Add access to full settings including modules
-    os.makedirs('temp', exist_ok=True)
+    # Per-process temp dir so multiple OrpheusDL windows running at once don't share
+    # or delete each other's temp files (was a fixed 'temp' -> WinError 32 on cleanup).
+    _run_temp = os.path.join('temp', str(os.getpid()))
+    os.makedirs(_run_temp, exist_ok=True)
+    downloader.temp_dir = os.path.abspath(_run_temp)
 
     spotify_warning_shown = False
 
@@ -634,7 +639,6 @@ def orpheus_core_download(orpheus_session: Orpheus, media_to_download, third_par
                     if i < len(downloader.rate_limited_tracks) - 1:
                         print()  # Add blank line before pause message
                         downloader.print('Pausing 30 seconds to prevent rate limiting...', drop_level=1)
-                        import time
                         time.sleep(30)
                 
                 # Clear the rate-limited tracks list after retry
@@ -644,7 +648,12 @@ def orpheus_core_download(orpheus_session: Orpheus, media_to_download, third_par
                 downloader.print('No tracks were deferred due to rate limiting.', drop_level=0)
                 print()  # Add blank line after message
 
+    # Some single-track paths do not pass through the concurrent batch timer.
+    # Keep the summary meaningful without replacing a more detailed batch timer.
+    if downloader.total_download_time <= 0:
+        downloader.total_download_time = time.perf_counter() - run_start
+
     # PR #2: end-of-run download summary (counts + errors)
     downloader.print_download_summary()
 
-    if os.path.exists('temp'): shutil.rmtree('temp')
+    shutil.rmtree(_run_temp, ignore_errors=True)  # only this run's temp; tolerate locked files

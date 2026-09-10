@@ -2,6 +2,8 @@ import base64
 import logging
 import os
 import subprocess
+import re
+import unicodedata
 import tempfile
 from dataclasses import asdict
 
@@ -110,6 +112,24 @@ def _ogg_tags_appear_written(file_path: str) -> bool:
 
 
 def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_list: list, embedded_lyrics: str, container: ContainerEnum, metadata_separator: str = ', ', split_metadata: bool = False, enable_zfill: bool = False, _repair_retry: bool = False, service_name: str = ''):
+    # Keep featured artists in ARTIST, but avoid duplicating them in TITLE.
+    artist_names = []
+    for artist in (track_info.artists if isinstance(track_info.artists, list) else [track_info.artists]):
+        artist_names.extend(re.split(r'\s*(?:/|／|;|\||,)\s*', str(artist or '')))
+    known = set()
+    for artist in artist_names:
+        folded = unicodedata.normalize('NFKD', artist)
+        folded = ''.join(c for c in folded.casefold() if not unicodedata.combining(c))
+        known.add(' '.join(folded.split()))
+    def _clean_title(title):
+        pattern = re.compile(r'\s*(?:\((?:feat\.?|featuring|with|con|y)\s+([^)]*)\)|\[(?:feat\.?|featuring|with|con|y)\s+([^]]*)\])', re.I)
+        def repl(match):
+            content = match.group(1) or match.group(2) or ''
+            parts = [p.strip() for p in re.split(r'\s*(?:,|&|\+| and | y | con | with )\s*', content, flags=re.I) if p.strip()]
+            keys = {' '.join(unicodedata.normalize('NFKD', p).casefold().split()) for p in parts}
+            return '' if parts and keys <= known else match.group(0)
+        return pattern.sub(repl, str(title or '')).strip()
+    track_info.name = _clean_title(track_info.name)
     if container == ContainerEnum.flac:
         tagger = FLAC(file_path)
     elif container == ContainerEnum.opus:
@@ -136,6 +156,7 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
         tagger.tags.RegisterTXXXKey('major_brand', 'major_brand')
         tagger.tags.RegisterTXXXKey('minor_version', 'minor_version')
         tagger.tags.RegisterTXXXKey('Rating', 'Rating')
+        tagger.tags.RegisterTXXXKey('itunesadvisory', 'ITUNESADVISORY')
         tagger.tags.RegisterTXXXKey('track_url', 'TRACK_URL')
 
         tagger.tags.pop('encoded', None)
@@ -267,12 +288,15 @@ def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_lis
                 tagger['COMPOSER'] = track_info.tags.composer
 
     if track_info.explicit is not None:
+        # Standard explicit/advisory tag: iTunes convention 1 = explicit, 2 = not explicit.
+        # MP4/M4A uses the native `rtng` atom; MP3 (ID3) and Vorbis (FLAC/OGG) use ITUNESADVISORY.
+        advisory = 1 if track_info.explicit else 2
         if container == ContainerEnum.m4a or container == ContainerEnum.mp4:
-            tagger['rtng'] = [1 if track_info.explicit else 0]
+            tagger['rtng'] = [advisory]
         elif container == ContainerEnum.mp3:
-            tagger['Rating'] = 'Explicit' if track_info.explicit else 'Clean'
+            tagger['itunesadvisory'] = str(advisory)
         else:
-            tagger['Rating'] = 'Explicit' if track_info.explicit else 'Clean'
+            tagger['ITUNESADVISORY'] = str(advisory)
 
     if track_info.tags.genres:
         if container == ContainerEnum.m4a or container == ContainerEnum.mp4:

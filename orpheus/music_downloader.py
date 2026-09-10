@@ -146,6 +146,61 @@ def truncate_utf8_bytes_keep_suffix(value: str, max_bytes: int) -> str:
     return f'{trimmed_prefix}{suffix}'
 
 
+def _dedup_artist_names(names):
+    """Remove duplicate artist names (case- and accent-insensitive), preserving order
+    and the first spelling. Fixes sources that repeat the main/album artist in the
+    track artist list (e.g. ['Omar Marquez', 'Omar Marquez', 'Edgar Oceransky'])."""
+    import unicodedata
+
+    def _key(n):
+        d = unicodedata.normalize('NFKD', str(n))
+        d = ''.join(c for c in d if not unicodedata.combining(c))
+        return ' '.join(d.casefold().split())
+
+    seen, out = set(), []
+    for n in names:
+        k = _key(n)
+        if k and k not in seen:
+            seen.add(k)
+            out.append(n)
+    return out
+
+
+def _clean_track_title_for_artists(title, artists):
+    """Remove only featured-artist suffixes already represented in ``artists``.
+
+    This keeps the complete artist list in metadata while avoiding duplicated
+    ``(feat. Artist)`` text in TITLE and generated filenames. Unknown names and
+    ordinary title text are preserved.
+    """
+    import re
+    import unicodedata
+
+    known = set()
+    for artist in artists or []:
+        # Services may return collaborators as one display string.
+        artist_parts = re.split(r'\s*(?:/|／|;|\||,)\s*', str(artist))
+        for part in artist_parts:
+            folded = unicodedata.normalize('NFKD', part)
+            folded = ''.join(c for c in folded if not unicodedata.combining(c))
+            known.add(' '.join(folded.casefold().split()))
+
+    def is_known(value):
+        folded = unicodedata.normalize('NFKD', value)
+        folded = ''.join(c for c in folded if not unicodedata.combining(c))
+        key = ' '.join(folded.casefold().split())
+        return key in known
+
+    pattern = re.compile(r'\s*(?:\((?:feat\.?|featuring|with|con|y)\s+([^)]*)\)|\[(?:feat\.?|featuring|with|con|y)\s+([^]]*)\])', re.IGNORECASE)
+
+    def replace(match):
+        content = match.group(1) or match.group(2) or ''
+        parts = [part.strip() for part in re.split(r'\s*(?:,|&|\+| and | y | con | with )\s*', content, flags=re.IGNORECASE) if part.strip()]
+        return '' if parts and all(is_known(part) for part in parts) else match.group(0)
+
+    return pattern.sub(replace, str(title or '')).strip()
+
+
 def simplify_error_message(error_str: str) -> str:
     """Convert complex error messages into user-friendly one-liners"""
     error_lower = error_str.lower()
@@ -607,6 +662,7 @@ class Downloader:
         number_of_tracks=None,
         track_number=None,
         disc_number=None,
+        isrc=None,
         simplify_reason=True,
     ) -> str:
         position = ''
@@ -639,6 +695,8 @@ class Downloader:
             track_url = platform_track_url(self.service_name, track_id)
             if track_url:
                 id_part += f' | {track_url}'
+        if isrc:
+            id_part += f' [ISRC:{isrc}]'
 
         reason_text = str(reason).strip() if reason else 'Download failed'
         if simplify_reason:
@@ -686,9 +744,11 @@ class Downloader:
 
         track_number = None
         disc_number = None
+        isrc = None
         if isinstance(track_info, TrackInfo) and track_info.tags:
             track_number = track_info.tags.track_number
             disc_number = track_info.tags.disc_number
+            isrc = getattr(track_info.tags, 'isrc', None)
 
         line = self._format_track_error_log_line(
             reason=reason,
@@ -699,6 +759,7 @@ class Downloader:
             number_of_tracks=number_of_tracks,
             track_number=track_number,
             disc_number=disc_number,
+            isrc=isrc,
             simplify_reason=True,
         )
         self._append_download_error_log_line(line)
@@ -1500,8 +1561,8 @@ class Downloader:
     def create_temp_filename(self):
         """Create a temporary filename in the temp directory"""
         if not self.temp_dir:
-            # If temp_dir is not set, create it in the current directory
-            self.temp_dir = os.path.join(os.getcwd(), 'temp')
+            # Per-process temp dir so concurrent runs don't clobber each other.
+            self.temp_dir = os.path.join(os.getcwd(), 'temp', str(os.getpid()))
         os.makedirs(self.temp_dir, exist_ok=True)
         return os.path.join(self.temp_dir, str(uuid.uuid4()))
 
@@ -1660,8 +1721,11 @@ class Downloader:
             return results
         
         # Use asyncio + aiohttp for concurrent downloads
+        # NOTE: `time` is imported at module level (see top of file). Importing it
+        # locally here would make `time` a function-local name for the WHOLE function,
+        # breaking the sequential branch above (`concurrent_downloads <= 1`), which uses
+        # time.time() before this point -> UnboundLocalError.
         import asyncio
-        import time
         from utils.utils import create_aiohttp_session, download_file_async
         
         # Store original print method
@@ -2160,7 +2224,7 @@ class Downloader:
 
         playlist_tags = {k: sanitise_name(v) for k, v in asdict(playlist_info).items()}
         playlist_tags['name'] = safe_playlist_name # Use the safe name for path formatting
-        playlist_tags['explicit'] = ' 🅴' if playlist_info.explicit else ''
+        playlist_tags['explicit'] = ' (explicit)' if playlist_info.explicit else ''
         playlist_tags['platform'] = self._platform_folder_name()
         playlist_path_formatted_name = _format_path_template(
             self.global_settings['formatting']['playlist_format'], playlist_tags, 'Playlist folder format'
@@ -2231,7 +2295,7 @@ class Downloader:
             context_type='playlist',
         )
         
-        if playlist_info.cover_url:
+        if playlist_info.cover_url and self.global_settings['covers']['save_external']:
             self.print('Downloading playlist cover')
             download_file(playlist_info.cover_url, f'{playlist_path}cover.{playlist_info.cover_type.name}', artwork_settings=self._get_artwork_settings(is_external=True))
         
@@ -2246,7 +2310,7 @@ class Downloader:
             self.print('Downloading animated playlist cover')
             download_file(playlist_info.animated_cover_url, playlist_path + 'cover.mp4', enable_progress_bar=self.global_settings['general'].get('progress_bar', False))
         
-        if playlist_info.description:
+        if playlist_info.description and self.global_settings['covers']['save_external']:
             with open(playlist_path + 'description.txt', 'w', encoding='utf-8') as f: f.write(playlist_info.description)
 
         m3u_playlist_path = None
@@ -3174,7 +3238,7 @@ class Downloader:
         quality_source = self._resolve_album_quality_source(album_info, extra_kwargs)
         quality_label = self._quality_path_label(quality_source)
         album_tags['quality'] = f'[{quality_label}]' if quality_label else ''
-        album_tags['explicit'] = ' 🅴' if album_info.explicit else ''
+        album_tags['explicit'] = ' (explicit)' if album_info.explicit else ''
         album_tags['artist_initials'] = self._get_artist_initials_from_name(album_info)
         album_tags['name'] = self._compact_path_tag(album_tags.get('name', ''))
         
@@ -3284,7 +3348,7 @@ class Downloader:
         # Filter asdict to only include top-level strings for basic formatting, then explicitly handle complex fields
         raw_tags = asdict(track_info)
         track_tags = {k: sanitise_name(v) for k, v in raw_tags.items() if isinstance(v, (str, int, float, bool))}
-        track_tags['explicit'] = ' 🅴' if track_info.explicit else ''
+        track_tags['explicit'] = ' (explicit)' if track_info.explicit else ''
         track_tags['platform'] = self._platform_folder_name()
         
         # Add commonly used format variables
@@ -4774,6 +4838,15 @@ class Downloader:
                 track_info = self.service.get_track_info(track_id, quality_tier, codec_options, **track_info_kwargs)
                 track_info = self._ensure_track_info_id(track_info, track_id)
                 self._apply_album_context_to_track(track_info, safe_extra_kwargs)
+
+                # Drop duplicate artist names (e.g. the album/main artist repeated in
+                # the track artist list) — case/accent-insensitive, order preserved — so
+                # neither the ARTIST tag nor the filename shows "Artist / Artist / Other".
+                if getattr(track_info, 'artists', None):
+                    track_info.artists = _dedup_artist_names(track_info.artists)
+                    track_info.name = _clean_track_title_for_artists(
+                        track_info.name, track_info.artists
+                    )
 
                 # PR #2: count failed tracks (not-streamable vs other failures).
                 # Printing/failing is handled by the existing error checks below.

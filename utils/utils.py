@@ -1,3 +1,4 @@
+from utils.atomic_io import (file_lock, read_pickle, session_transaction, temporary_sibling, remove_temporary, publish_download)
 import pickle, requests, errno, hashlib, math, os, re, operator, asyncio
 import aiohttp
 import aiofiles
@@ -62,22 +63,25 @@ def create_aiohttp_session():
     )
 
 def sanitise_name(name):
-    """Make a string safe for file paths; normalize punctuation so colons do not become spaced hyphens."""
+    """Make a string safe for file paths, matching tiddl-elvigilante's handling.
+
+    Special-character handling is delegated to the ported strings.py so the
+    Windows-forbidden characters < > : " / \\ | ? * are mapped to their full-width
+    Unicode look-alikes (\uff1c\uff1e\uff1a\uff02\uff0f\uff3c\uff5c\uff1f\uff0a) instead of being deleted, plus zalgo
+    removal, NFC normalisation, dash-look-alike folding, reserved-name guarding and
+    per-component byte truncation. Kept as a thin wrapper so the historical contract
+    holds: one path component in, a non-empty component out, callable on a str or a
+    list of names, applied per component. The whole-path byte cap stays with
+    fix_byte_limit() (where present).
+    """
     if not name:
         return ''
     s = ", ".join(map(str, name)) if isinstance(name, list) else str(name)
-    s = s.strip()
-    s = re.sub(r'[\x00-\x1F\x7F]', '', s)
-    s = re.sub(r'[\\/*?"<>|$]', '', s)
-    # ':' is illegal on Windows paths; replacing with " - " stacked with ": " and produced " -  " gaps.
-    s = re.sub(r'\s*:\s*', ' \u00b7 ', s)
-    # Qobuz-style "Composer - Work" (spaces around hyphen); keep compact tokens like "24B-96kHz" untouched.
-    s = re.sub(r'\s+-\s+', ' \u00b7 ', s)
-    s = re.sub(r'\s+', ' ', s).strip()
-    # Windows forbids trailing spaces/periods in path components (e.g. "In The Woods...").
-    # Also strip Unicode ellipsis, which triggers the same WinError 3 on nested makedirs.
-    s = s.rstrip(' .\u2026')
-    return s or '_'
+    # max_len == tiddl's per-component limit (255) with no download-suffix reserve.
+    return _sanitize_filename(s, max_len=_MAX_COMPONENT_LEN, reserve_bytes=0) or '_'
+
+
+from .strings import sanitize_filename as _sanitize_filename, MAX_COMPONENT_LEN as _MAX_COMPONENT_LEN
 
 
 def zfill_number(value, total=None, min_digits=2):
@@ -267,7 +271,7 @@ def fix_byte_limit(path: str, byte_limit=250):
 
 r_session = create_requests_session()
 
-async def download_file_async(session, url, file_location, headers={}, enable_progress_bar=False, indent_level=0, artwork_settings=None, max_retries=3, skip_if_exists=True):
+async def _download_file_async_into(session, url, file_location, headers={}, enable_progress_bar=False, indent_level=0, artwork_settings=None, max_retries=3, skip_if_exists=True):
     """Async version of download_file using aiohttp - returns (file_location, bytes_downloaded)"""
     if skip_if_exists and os.path.isfile(file_location):
         # File already exists - return 0 bytes downloaded
@@ -281,8 +285,9 @@ async def download_file_async(session, url, file_location, headers={}, enable_pr
     bytes_downloaded = 0
 
     for attempt in range(max_retries):
+        bytes_downloaded = 0
         try:
-            async with session.get(url, headers=headers, ssl=False) as response:
+            async with session.get(url, headers=headers) as response:
                 response.raise_for_status()
                 
                 total = None
@@ -335,6 +340,9 @@ async def download_file_async(session, url, file_location, headers={}, enable_pr
                             await f.write(chunk)
                             bytes_downloaded += len(chunk)
 
+                if total is not None and response.headers.get("content-encoding", "identity").lower() == "identity" and bytes_downloaded != total:
+                    raise aiohttp.ClientPayloadError("Incomplete download: content length mismatch")
+
                 # Handle artwork resizing if needed
                 if artwork_settings and artwork_settings.get('should_resize', False):
                     new_resolution = artwork_settings.get('resolution', 1400)
@@ -352,6 +360,8 @@ async def download_file_async(session, url, file_location, headers={}, enable_pr
                 
                 return (file_location, bytes_downloaded)
                 
+        except (aiohttp.ClientConnectorCertificateError, aiohttp.ClientSSLError):
+            raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             if attempt < max_retries - 1:
                 await asyncio.sleep(2 ** attempt)  # Exponential backoff
@@ -379,8 +389,8 @@ async def download_file_async(session, url, file_location, headers={}, enable_pr
                     pass
             raise
 
-def download_file(url, file_location, headers={}, enable_progress_bar=False, indent_level=0, artwork_settings=None, skip_if_exists=True):
-    """Synchronous wrapper for the async download function for backward compatibility"""
+def _download_file_into(url, file_location, headers={}, enable_progress_bar=False, indent_level=0, artwork_settings=None, skip_if_exists=True):
+    """Transfer into a private temporary file; publication belongs to the caller."""
     if skip_if_exists and os.path.isfile(file_location):
         return None
 
@@ -389,55 +399,66 @@ def download_file(url, file_location, headers={}, enable_progress_bar=False, ind
     if directory and not os.path.exists(directory):
         os.makedirs(directory, exist_ok=True)
 
-    r = r_session.get(url, stream=True, headers=headers, verify=False)
-    r.raise_for_status()
-
-    total = None
-    if 'content-length' in r.headers:
-        total = int(r.headers['content-length'])
-
+    # TLS validation restored (verify defaults to enabled). Explicit (connect, read) timeouts and a
+    # context manager so the response/connection is always closed.
     try:
-        with open(file_location, 'wb') as f:
-            if enable_progress_bar and total:
-                # Create indented progress bar with proper formatting
-                import sys
-                from io import StringIO
-                
-                class IndentedOutput:
-                    def __init__(self, indent_level):
-                        self.indent_level = indent_level
-                        
-                    def write(self, text):
-                        # Add indentation to each line
-                        lines = text.split('\n')
-                        indented_lines = []
-                        for line in lines:
-                            if line.strip():  # Only indent non-empty lines
-                                indented_lines.append(' ' * self.indent_level + line)
-                            else:
-                                indented_lines.append(line)
-                        sys.stdout.write('\n'.join(indented_lines))
-                        
-                    def flush(self):
-                        sys.stdout.flush()
-                
-                bar = tqdm(
-                    total=total, 
-                    unit='B', 
-                    unit_scale=True, 
-                    unit_divisor=1024, 
-                    initial=0, 
-                    miniters=1,
-                    leave=False,
-                    file=IndentedOutput(indent_level)
-                )
-                for chunk in r.iter_content(chunk_size=1024):
-                    if chunk:  # filter out keep-alive new chunks
-                        f.write(chunk)
-                        bar.update(len(chunk))
-                bar.close()
-            else:
-                [f.write(chunk) for chunk in r.iter_content(chunk_size=1024) if chunk]
+        with r_session.get(url, stream=True, headers=headers, timeout=(10, 60)) as r:
+            r.raise_for_status()
+
+            total = None
+            if 'content-length' in r.headers:
+                total = int(r.headers['content-length'])
+
+            bytes_downloaded = 0
+            with open(file_location, 'wb') as f:
+                if enable_progress_bar and total:
+                    # Create indented progress bar with proper formatting
+                    import sys
+                    from io import StringIO
+
+                    class IndentedOutput:
+                        def __init__(self, indent_level):
+                            self.indent_level = indent_level
+
+                        def write(self, text):
+                            # Add indentation to each line
+                            lines = text.split('\n')
+                            indented_lines = []
+                            for line in lines:
+                                if line.strip():  # Only indent non-empty lines
+                                    indented_lines.append(' ' * self.indent_level + line)
+                                else:
+                                    indented_lines.append(line)
+                            sys.stdout.write('\n'.join(indented_lines))
+
+                        def flush(self):
+                            sys.stdout.flush()
+
+                    bar = tqdm(
+                        total=total,
+                        unit='B',
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        initial=0,
+                        miniters=1,
+                        leave=False,
+                        file=IndentedOutput(indent_level)
+                    )
+                    for chunk in r.iter_content(chunk_size=1024):
+                        if chunk:  # filter out keep-alive new chunks
+                            f.write(chunk)
+                            bytes_downloaded += len(chunk)
+                            bar.update(len(chunk))
+                    bar.close()
+                else:
+                    # Explicit loop instead of a throwaway list comprehension.
+                    for chunk in r.iter_content(chunk_size=1024):
+                        if chunk:  # filter out keep-alive new chunks
+                            f.write(chunk)
+                            bytes_downloaded += len(chunk)
+            if total is not None and r.headers.get("content-encoding", "identity").lower() == "identity" and bytes_downloaded != total:
+                raise requests.exceptions.ChunkedEncodingError("Incomplete download: content length mismatch")
+
         if artwork_settings and artwork_settings.get('should_resize', False):
             new_resolution = artwork_settings.get('resolution', 1400)
             new_format = artwork_settings.get('format', 'jpeg')
@@ -462,9 +483,50 @@ def download_file(url, file_location, headers={}, enable_progress_bar=False, ind
         if os.path.isfile(file_location):
             silentremove(file_location)
         raise
-    
+
     # Return the file location on successful download
     return file_location
+
+
+def download_file(url, file_location, headers=None, enable_progress_bar=False, indent_level=0,
+                  artwork_settings=None, skip_if_exists=True):
+    if skip_if_exists and os.path.isfile(file_location):
+        return None
+    temporary = temporary_sibling(file_location)
+    try:
+        _download_file_into(url, temporary, headers or {}, enable_progress_bar, indent_level,
+                            artwork_settings, skip_if_exists=False)
+        if publish_download(temporary, file_location, skip_if_exists):
+            return file_location
+        return None
+    finally:
+        remove_temporary(temporary)
+
+
+async def download_file_async(session, url, file_location, headers=None, enable_progress_bar=False,
+                              indent_level=0, artwork_settings=None, max_retries=3,
+                              skip_if_exists=True):
+    if max_retries < 1:
+        raise ValueError('max_retries must be at least 1')
+    if skip_if_exists and os.path.isfile(file_location):
+        return (file_location, 0)
+    temporary = temporary_sibling(file_location)
+    try:
+        _, downloaded = await _download_file_async_into(
+            session, url, temporary, headers or {}, enable_progress_bar, indent_level,
+            artwork_settings, max_retries, skip_if_exists=False)
+        # Keep a potentially contended process lock off the event loop. Once commit
+        # starts, finish it before handling cancellation so cleanup cannot race it.
+        commit = asyncio.create_task(asyncio.to_thread(
+            publish_download, temporary, file_location, skip_if_exists))
+        try:
+            published = await asyncio.shield(commit)
+        except asyncio.CancelledError:
+            await commit
+            raise
+        return (file_location, downloaded if published else 0)
+    finally:
+        remove_temporary(temporary)
 
 # root mean square code by Charlie Clark: https://code.activestate.com/recipes/577630-comparing-two-images/
 def compare_images(image_1, image_2):
@@ -485,11 +547,8 @@ def silentremove(filename):
 def read_temporary_setting(settings_location, module, root_setting=None, setting=None, global_mode=False):
     # Standardize module name to lowercase (as used by orpheus core)
     module = module.lower()
-    try:
-        with open(settings_location, 'rb') as f:
-            temporary_settings = pickle.load(f)
-    except (FileNotFoundError, EOFError):
-        temporary_settings = {'modules': {}}
+    with file_lock(settings_location):
+        temporary_settings = read_pickle(settings_location)
 
     module_settings = temporary_settings['modules'].get(module)
     
@@ -514,60 +573,51 @@ def read_temporary_setting(settings_location, module, root_setting=None, setting
 def set_temporary_setting(settings_location, module, root_setting, setting=None, value=None, global_mode=False):
     # Standardize module name to lowercase (as used by orpheus core)
     module = module.lower()
-    try:
-        with open(settings_location, 'rb') as f:
-            temporary_settings = pickle.load(f)
-    except (FileNotFoundError, EOFError):
-        temporary_settings = {'modules': {}}
+    with session_transaction(settings_location) as temporary_settings:
+        if module not in temporary_settings['modules']:
+            # Initialize default structure if missing
+            temporary_settings['modules'][module] = {'sessions': {'default': {'clear_session': False, 'hashes': {}, 'custom_data': {}}}, 'selected': 'default'}
 
-    if module not in temporary_settings['modules']:
-        # Initialize default structure if missing
-        temporary_settings['modules'][module] = {'sessions': {'default': {'clear_session': False, 'hashes': {}, 'custom_data': {}}}, 'selected': 'default'}
+        module_settings = temporary_settings['modules'][module]
 
-    module_settings = temporary_settings['modules'][module]
-
-    if module_settings:
-        if global_mode:
-            session = module_settings
+        if module_settings:
+            if global_mode:
+                session = module_settings
+            else:
+                if 'sessions' not in module_settings or not module_settings['sessions']:
+                    module_settings['sessions'] = {'default': {'clear_session': False, 'hashes': {}, 'custom_data': {}}}
+                    module_settings['selected'] = 'default'
+                session = module_settings['sessions'][module_settings['selected']]
         else:
-            if 'sessions' not in module_settings or not module_settings['sessions']:
-                module_settings['sessions'] = {'default': {'clear_session': False, 'hashes': {}, 'custom_data': {}}}
-                module_settings['selected'] = 'default'
-            session = module_settings['sessions'][module_settings['selected']]
-    else:
-        session = None
+            session = None
 
-    if not session:
-        # Should be unreachable with above init, but safety fallback
-        temporary_settings['modules'][module] = {'sessions': {'default': {'clear_session': False, 'hashes': {}, 'custom_data': {}}}, 'selected': 'default'}
-        session = temporary_settings['modules'][module]['sessions']['default']
+        if not session:
+            # Should be unreachable with above init, but safety fallback
+            temporary_settings['modules'][module] = {'sessions': {'default': {'clear_session': False, 'hashes': {}, 'custom_data': {}}}, 'selected': 'default'}
+            session = temporary_settings['modules'][module]['sessions']['default']
 
-    if setting:
-        if root_setting not in session:
-            session[root_setting] = {}
-        session[root_setting][setting] = value
-    else:
-        session[root_setting] = value
-        
-    with open(settings_location, 'wb') as f:
-        pickle.dump(temporary_settings, f)
+        if setting:
+            if root_setting not in session:
+                session[root_setting] = {}
+            session[root_setting][setting] = value
+        else:
+            session[root_setting] = value
+
 
 def remove_module_from_storage(settings_location, module):
     """Removes a module's entire entry from storage."""
     # Standardize module name to lowercase (as used by orpheus core)
     module = module.lower()
-    try:
-        with open(settings_location, 'rb') as f:
-            temporary_settings = pickle.load(f)
-    except (FileNotFoundError, EOFError):
-        return
+    with session_transaction(settings_location) as temporary_settings:
+        temporary_settings['modules'].pop(module, None)
 
-    if 'modules' in temporary_settings and module in temporary_settings['modules']:
-        del temporary_settings['modules'][module]
-        with open(settings_location, 'wb') as f:
-            pickle.dump(temporary_settings, f)
 
-create_temp_filename = lambda : f'temp/{os.urandom(16).hex()}'
+def create_temp_filename():
+    """Per-process temp path so concurrent OrpheusDL runs don't share or clobber
+    each other's temp files (fixes WinError 32 on the end-of-run temp cleanup)."""
+    d = os.path.join('temp', str(os.getpid()))
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, os.urandom(16).hex())
 
 def save_to_temp(input: bytes):
     location = create_temp_filename()
