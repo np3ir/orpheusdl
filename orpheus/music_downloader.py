@@ -1,3 +1,4 @@
+from utils.audio_policy import flac_only
 import logging, os
 import sys
 import shutil
@@ -417,6 +418,12 @@ def _format_path_template(template, tags, setting_name):
 
 
 class Downloader:
+    @staticmethod
+    def _require_native_flac(track_info):
+        # Local installation policy, also covers direct and concurrent downloads.
+        if flac_only() and getattr(track_info, 'codec', None) is not CodecEnum.FLAC:
+            raise ValueError('FLAC only: track omitted before audio transfer (non-FLAC or unknown codec)')
+
     def __init__(self, settings, module_controls, oprinter, path, third_party_modules=None, use_ansi_colors=True):
         self.global_settings = settings
         self.module_controls = module_controls
@@ -525,6 +532,32 @@ class Downloader:
             pass
         return None
 
+    def _get_audio_isrc(self, file_path: str):
+        """ISRC tag of an existing audio file (upper-case), or None if unreadable."""
+        if not file_path or not os.path.isfile(file_path):
+            return None
+        try:
+            import mutagen
+            mf = mutagen.File(file_path)
+            tags = getattr(mf, 'tags', None)
+            if not tags:
+                return None
+            for key in ('isrc', 'ISRC', 'TSRC', '----:com.apple.iTunes:ISRC'):
+                if key in tags:
+                    val = tags[key]
+                    v = val[0] if isinstance(val, (list, tuple)) and val else val
+                    if hasattr(v, 'text'):
+                        t = v.text
+                        v = t[0] if isinstance(t, (list, tuple)) and t else t
+                    if isinstance(v, bytes):
+                        v = v.decode('utf-8', 'ignore')
+                    v = str(v).strip().upper()
+                    if v:
+                        return v
+        except Exception:
+            pass
+        return None
+
     def _existing_file_is_stale(self, track_location: str, track_info) -> bool:
         """With reverify-by-duration enabled, an existing file is stale when its
         audio duration doesn't match the track's expected duration (e.g. an
@@ -560,6 +593,21 @@ class Downloader:
             return track_location
         if not track_location or not os.path.isfile(track_location):
             return track_location
+
+        # Same recording (same ISRC) is a true duplicate regardless of the
+        # metadata-duration noise Qobuz reports across editions -> skip instead
+        # of creating (2)/(3) copies of the identical track.
+        new_isrc = getattr(getattr(track_info, 'tags', None), 'isrc', None)
+        if new_isrc:
+            new_isrc = str(new_isrc).strip().upper()
+            if self._get_audio_isrc(track_location) == new_isrc:
+                return None  # duplicate recording already on disk
+            base_i, ext_i = os.path.splitext(track_location)
+            n_i = 2
+            while os.path.isfile(f'{base_i} ({n_i}){ext_i}'):
+                if self._get_audio_isrc(f'{base_i} ({n_i}){ext_i}') == new_isrc:
+                    return None  # a numbered variant already holds this recording
+                n_i += 1
 
         new_duration = getattr(track_info, 'duration', None)
         if new_duration is None:
@@ -1859,6 +1907,7 @@ class Downloader:
                     
                     # SINGLE API CALL: Get download info once - IN THREAD POOL
                     def get_download_info_wrapper():
+                        self._require_native_flac(track_info)
                         # Check if track_info has download_extra_kwargs (like Qobuz, TIDAL, Deezer)
                         if hasattr(track_info, 'download_extra_kwargs') and track_info.download_extra_kwargs:
                             return self.service.get_track_download(**track_info.download_extra_kwargs)
@@ -3220,6 +3269,120 @@ class Downloader:
             return catalog
         return 'FLAC'
 
+    _AUDIO_EXTS = ('.flac', '.m4a', '.mp3', '.ogg', '.opus', '.wav')
+
+    @staticmethod
+    def _strip_year_prefix(name):
+        """'(YYYY) Album' -> 'Album'; other names unchanged."""
+        if len(name) > 7 and name[0] == '(' and name[5] == ')' and name[6] == ' ' and name[1:5].isdigit():
+            return name[7:]
+        return name
+
+    def _cheap_track_isrc(self, track, extra_kwargs=None):
+        """ISRC of a track WITHOUT any network fetch (tags or cached data-map only)."""
+        tags = getattr(track, 'tags', None)
+        if tags is not None:
+            isrc = getattr(tags, 'isrc', None)
+            if isrc:
+                return str(isrc).strip().upper()
+        if isinstance(extra_kwargs, dict):
+            data_map = extra_kwargs.get('data') if isinstance(extra_kwargs.get('data'), dict) else extra_kwargs
+            if isinstance(data_map, dict):
+                entry = data_map.get(str(track))
+                if isinstance(entry, dict) and entry.get('isrc'):
+                    return str(entry['isrc']).strip().upper()
+        return None
+
+    def _folder_isrcs(self, folder):
+        """Set of ISRCs read from the audio files already in a folder (local I/O)."""
+        out = set()
+        try:
+            import mutagen
+            for name in os.listdir(folder):
+                if os.path.splitext(name)[1].lower() not in self._AUDIO_EXTS:
+                    continue
+                try:
+                    mf = mutagen.File(os.path.join(folder, name))
+                    tags = getattr(mf, 'tags', None)
+                    if not tags:
+                        continue
+                    for k in ('isrc', 'ISRC', 'TSRC', '----:com.apple.iTunes:ISRC'):
+                        if k in tags:
+                            v = tags[k]
+                            v = v[0] if isinstance(v, (list, tuple)) and v else v
+                            if hasattr(v, 'text'):
+                                t = v.text
+                                v = t[0] if isinstance(t, (list, tuple)) and t else t
+                            if isinstance(v, bytes):
+                                v = v.decode('utf-8', 'ignore')
+                            v = str(v).strip().upper()
+                            if v:
+                                out.add(v)
+                            break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
+
+    def _folder_audio_count(self, folder):
+        try:
+            return sum(1 for n in os.listdir(folder)
+                       if os.path.splitext(n)[1].lower() in self._AUDIO_EXTS)
+        except OSError:
+            return 0
+
+    def _reuse_existing_album_folder(self, album_path, album_info, extra_kwargs=None):
+        """Cross-service album-folder reuse: the SAME album from different services
+        reports different years, so a new '(2020) X' should MERGE into an existing
+        '(2019) X' when their tracks match by ISRC, instead of creating a second
+        folder. Genuinely different same-named albums (different ISRCs) keep their
+        own year folder. Fully guarded: any error -> the original path is used."""
+        try:
+            if not self._merge_same_name_albums_enabled():
+                return album_path
+            sep = '/' + chr(92)
+            target = album_path.rstrip(sep)
+            parent = os.path.dirname(target)
+            folder = os.path.basename(target)
+            if not parent or not os.path.isdir(parent) or os.path.isdir(target):
+                return album_path
+            stripped = self._strip_year_prefix(folder)
+            candidates = []
+            for name in os.listdir(parent):
+                if name == folder:
+                    continue
+                full = os.path.join(parent, name)
+                if os.path.isdir(full) and self._strip_year_prefix(name) == stripped:
+                    candidates.append(full)
+            if not candidates:
+                return album_path
+            new_isrcs = set()
+            tek = getattr(album_info, 'track_extra_kwargs', None) or extra_kwargs
+            for t in (getattr(album_info, 'tracks', None) or []):
+                i = self._cheap_track_isrc(t, tek)
+                if i:
+                    new_isrcs.add(i)
+            new_count = len(getattr(album_info, 'tracks', None) or [])
+            for cand in candidates:
+                cand_isrcs = self._folder_isrcs(cand)
+                if new_isrcs and cand_isrcs:
+                    inter = len(new_isrcs & cand_isrcs)
+                    _min = min(len(new_isrcs), len(cand_isrcs))
+                    # small albums (1-2 tracks, e.g. singles) need FULL ISRC overlap;
+                    # larger albums keep the 50% rule. A flat floor of 2 wrongly never
+                    # merged 1-track dupes (max shared = 1 < 2).
+                    if inter >= (_min if _min <= 2 else max(2, 0.5 * _min)):
+                        self.print('\u21aa Reusing existing album folder (same album, different service date): '
+                                   + os.path.basename(cand))
+                        return cand.rstrip(sep) + '/'
+                elif len(candidates) == 1 and new_count and self._folder_audio_count(cand) == new_count:
+                    self.print('\u21aa Reusing existing album folder (same track count): ' + os.path.basename(cand))
+                    return cand.rstrip(sep) + '/'
+        except Exception:
+            pass
+        return album_path
+
     def _create_album_location(
         self,
         path: str,
@@ -3278,6 +3441,7 @@ class Downloader:
             album_info,
             quality_source=quality_source,
         )
+        album_path = self._reuse_existing_album_folder(album_path, album_info, extra_kwargs)
         os.makedirs(album_path, exist_ok=True)
 
         return album_path
@@ -3693,9 +3857,19 @@ class Downloader:
 
             if album_info.booklet_url and not os.path.exists(album_path + 'Booklet.pdf'):
                 self.print('Downloading booklet')
-                download_file(album_info.booklet_url, album_path + 'Booklet.pdf')
+                try:
+                    download_file(album_info.booklet_url, album_path + 'Booklet.pdf')
+                except Exception as e:
+                    # A missing/forbidden booklet (e.g. Qobuz goodies 403) is a non-essential
+                    # extra and must never abort the album/artist download.
+                    self.print(f'[!] Booklet skipped ({e})')
             
-            cover_temp_location = download_to_temp(album_info.all_track_cover_jpg_url) if album_info.all_track_cover_jpg_url else ''
+            try:
+                cover_temp_location = download_to_temp(album_info.all_track_cover_jpg_url) if album_info.all_track_cover_jpg_url else ''
+            except Exception as e:
+                # A forbidden/missing album cover must not abort the album; tracks still download.
+                self.print(f'[!] Album cover skipped ({e})')
+                cover_temp_location = ''
 
             # Download booklet, animated album cover and album cover if present
             self._download_album_files(album_path, album_info)
@@ -4436,6 +4610,7 @@ class Downloader:
                     return self.service.get_track_info(track_id, quality_tier, codec_options, **extra_kwargs)
                 
                 def get_download_info_fallback(track_info_for_download):
+                    self._require_native_flac(track_info_for_download)
                     # Check if track_info has download_extra_kwargs (like Qobuz, TIDAL)
                     if hasattr(track_info_for_download, 'download_extra_kwargs') and track_info_for_download.download_extra_kwargs:
                         return self.service.get_track_download(**track_info_for_download.download_extra_kwargs)
@@ -4473,6 +4648,10 @@ class Downloader:
         if not track_info or not download_info:
             return None
             
+        self._require_native_flac(track_info)
+        if flac_only() and getattr(download_info, "different_codec", None) not in (None, CodecEnum.FLAC):
+            raise ValueError("FLAC only: refused non-FLAC output")
+
         # Extract track_id from track_info if not provided
         if track_id is None:
             track_id = track_info.id
@@ -5113,6 +5292,11 @@ class Downloader:
 
                 return return_with_blank_line("SKIPPED")
 
+        if flac_only() and getattr(track_info, 'codec', None) is not CodecEnum.FLAC:
+            d_print('FLAC only: track omitted; native FLAC unavailable')
+            self.track_skipped_count += 1
+            return return_with_blank_line("SKIPPED")
+
         # Audio is downloaded below - lyrics now handled after tagging to ensure they are fetched
 
         # Download audio
@@ -5298,6 +5482,8 @@ class Downloader:
             return return_with_blank_line(None, failure_reason='No download info available')
 
         # Use actual container when module converts (e.g. Tidal Atmos AC4 -> FLAC)
+        if flac_only() and getattr(download_info, "different_codec", None) not in (None, CodecEnum.FLAC):
+            return return_with_blank_line("SKIPPED")
         if getattr(download_info, 'different_codec', None):
             track_location = self._create_track_location(album_location, track_info, override_codec=download_info.different_codec, extra_kwargs=extra_kwargs)
             if force_redownload:
@@ -5528,6 +5714,8 @@ class Downloader:
 
     def _convert_file_if_needed(self, file_path, track_info, d_print):
         """Convert file based on codec_conversions settings - based on old working version"""
+        if flac_only():
+            return (file_path, None, None)
         try:
             # Parse the conversion table entry-by-entry so one bad row can't disable the rest.
             try:

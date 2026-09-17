@@ -7,6 +7,76 @@ from utils.models import *
 from utils.utils import *
 from utils.exceptions import *
 from utils.module_settings import merge_module_settings
+import tempfile
+
+
+def _atomic_write_text(path, text):
+    """Write text to path atomically (temp file in the same dir + os.replace),
+    so a concurrent/interrupted write can never leave a truncated/corrupt file."""
+    directory = os.path.dirname(path) or '.'
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.settings-', suffix='.tmp', dir=directory)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _load_settings_safe(path):
+    """Load settings.json. If it is corrupt/empty, RECOVER the last-good backup
+    (settings.json.bak) instead of silently resetting to defaults (which would
+    lose the whole configuration). Returns {} only when nothing is recoverable."""
+    backup = path + '.bak'
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.loads(f.read())
+            if isinstance(data, dict) and data:
+                return data
+    except (json.JSONDecodeError, ValueError, OSError):
+        pass
+    # live file missing/corrupt -> recover the backup
+    try:
+        if os.path.exists(backup) and os.path.getsize(backup) > 0:
+            with open(backup, 'r', encoding='utf-8') as f:
+                data = json.loads(f.read())
+            if isinstance(data, dict) and data.get('global'):
+                try:
+                    if os.path.exists(path):
+                        os.replace(path, path + '.corrupt')
+                except OSError:
+                    pass
+                _atomic_write_text(path, json.dumps(data, indent=4, sort_keys=False))
+                logging.warning('Orpheus: settings.json was corrupt/empty; recovered from settings.json.bak.')
+                return data
+    except (json.JSONDecodeError, ValueError, OSError):
+        pass
+    return {}
+
+
+def _save_settings_safe(path, settings):
+    """Atomically write settings.json and refresh the last-good backup. The backup
+    is only refreshed with a real config (non-empty, has 'global'), so an empty or
+    reset write can never clobber a good backup."""
+    text = json.dumps(settings, indent=4, sort_keys=False)
+    _atomic_write_text(path, text)
+    try:
+        if isinstance(settings, dict) and settings.get('global'):
+            _atomic_write_text(path + '.bak', text)
+    except OSError:
+        pass
 
 os.environ['CURL_CA_BUNDLE'] = ''  # Hack to disable SSL errors for requests module for easier debugging
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # Make SSL warnings hidden
@@ -76,6 +146,7 @@ class Orpheus:
                 "spotify_metadata_only": True
             },
             "codecs": {
+                "flac_only": True,
                 "proprietary_codecs": False,
                 "spatial_codecs": True,
                 "include_dolby_atmos": False,
@@ -142,15 +213,7 @@ class Orpheus:
         self.session_storage_location = os.path.join(self.data_folder_base, 'loginstorage.bin')
 
         os.makedirs('config', exist_ok=True)
-        try:
-            if os.path.exists(self.settings_location):
-                with open(self.settings_location, "r", encoding="utf-8") as f:
-                    self.settings = json.loads(f.read())
-            else:
-                self.settings = {}
-        except (json.JSONDecodeError, FileNotFoundError):
-            logging.warning("Orpheus: settings.json was corrupted or empty. Resetting to defaults.")
-            self.settings = {}
+        self.settings = _load_settings_safe(self.settings_location)
 
         try:
             if self.settings['global']['advanced']['debug_mode']: 
@@ -456,7 +519,7 @@ class Orpheus:
 
             stored_sessions.clear()
             stored_sessions.update({'advancedmode': advanced_login_mode, 'modules': new_module_sessions})
-        open(self.settings_location, 'w', encoding='utf-8').write(json.dumps(new_settings, indent = 4, sort_keys = False))
+        _save_settings_safe(self.settings_location, new_settings)
 
         if new_setting_detected:
             if self.settings.get('global', {}).get('advanced', {}).get('debug_mode', False):
