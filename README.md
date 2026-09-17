@@ -36,8 +36,9 @@ services never see bursts (which is what gets an account flagged). Configured pe
   run-wide 429 circuit breaker (`ORPHEUS_TIDAL_429_ABORT`).
 
 ### FLAC-only policy
-`utils/audio_policy.py` (`global.codecs.flac_only`, default `true`) makes the Deezer/Qobuz
-modules refuse non-FLAC transfers, so the library stays lossless.
+`utils/audio_policy.py` (`global.codecs.flac_only`, default `true`) makes the Deezer, Qobuz and
+Tidal modules refuse non-FLAC transfers, so the library stays lossless. (Spotify is metadata-only
+and never streams audio, so the policy doesn't apply there.)
 
 ### Cross-service ISRC de-duplication
 The same album reported with **different release years** by Deezer/Tidal/Qobuz used to land in
