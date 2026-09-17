@@ -1,272 +1,131 @@
-<!-- PROJECT INTRO -->
+# OrpheusDL (np3ir fork)
 
-<img src='https://github.com/bascurtiz/OrpheusDL/blob/master/icon.svg' title='OrpheusDL icon' height="150">
+A hardened, quality-first fork of [OrpheusDL](https://github.com/bascurtiz/OrpheusDL)
+(itself based on OrfiTeam/OrpheusDL) — a modular music archival tool that downloads
+from Tidal, Deezer, Qobuz and Spotify.
 
-OrpheusDL
-=========
+This fork is tuned for **building a large, clean, high-quality library automatically**,
+where correctness and account safety matter more than raw speed.
 
-This fork enables downloading from Spotify, Apple Music, Beatsource / interacts with the [GUI](https://github.com/bascurtiz/OrpheusDL-GUI)
+> ℹ️ Los módulos de servicio viven en repos separados (ver más abajo). El código de los
+> módulos **no** está incluido en este repo — clónalos dentro de `modules/`.
 
-[Report Bug](https://github.com/bascurtiz/OrpheusDL/issues)
-·
-[Request Feature](https://github.com/bascurtiz/OrpheusDL/issues)
+---
 
+## What this fork adds
 
-## Table of content
+### Gentle, per-service rate limiting
+A shared proactive request gate (`utils/rate_limit.py`) spaces **every** API request so the
+services never see bursts (which is what gets an account flagged). Configured per service in
+`config/settings.json`:
 
-- [About OrpheusDL](#about-orpheusdl)
-- [Getting Started](#getting-started)
-    - [Prerequisites](#prerequisites)
-    - [Installation](#installation)
-- [Usage](#usage)
-- [Configuration](#configuration)
-    - [Global/Formatting](#globalformatting)
-        - [Format variables](#format-variables)
-- [Contact](#contact)
-- [Acknowledgements](#acknowledgements)
-
-
-
-<!-- ABOUT ORPHEUS -->
-## About OrpheusDL
-OrpheusDL is a modular music archival tool written in Python which allows archiving from multiple different services.
-
-
-<!-- GETTING STARTED -->
-## Getting Started
-
-Follow these steps to get a local copy of Orpheus up and running:
-
-### Prerequisites
-
-* Python 3.11.9 is recommended (but might work fine with older versions)<br>
-   a.   https://www.python.org/downloads/release/python-3119/<br>
-   b.   https://git-scm.com/downloads
-
-### Installation
-
-1. Open up cmd/terminal and cd into a place where you want to save Orpheus<br>
-2. `git clone https://github.com/bascurtiz/OrpheusDL && cd OrpheusDL && pip install --upgrade --ignore-installed -r requirements.txt`<br>
-   <sub>*(use pip3 on macOS)*</sub><br>
- 
-3. `pip install --no-deps --target vendor/librespot git+https://github.com/kokarare1212/librespot-python`<br>
-   <sub>*(use pip3 on macOS)*</sub><br>
-
-4. a.   `python orpheus.py settings refresh`<br>
-       <sub>*(use python3 on macOS)*</sub><br>
-   b.   `pip install --upgrade certifi`<br>
-       <sub>*(use python3 on macOS)*</sub><br>
-
-5. Install modules:<br>   
-   Amazon Music:
-   `git clone https://github.com/bascurtiz/orpheusdl-amazonmusic modules/amazonmusic`<br>
-   Apple Music:
-   `git clone https://github.com/bascurtiz/orpheusdl-applemusic modules/applemusic`<br>
-   Beatport:
-   `git clone https://github.com/bascurtiz/orpheusdl-beatport modules/beatport`<br>
-   Beatsource: 
-   `git clone https://github.com/bascurtiz/orpheusdl-beatsource modules/beatsource`<br>
-   Deezer: 
-   `git clone https://github.com/bascurtiz/orpheusdl-deezer modules/deezer`<br>
-   Qobuz:
-   `git clone https://github.com/bascurtiz/orpheusdl-qobuz modules/qobuz`<br>
-   SoundCloud:
-   `git clone https://github.com/bascurtiz/orpheusdl-soundcloud modules/soundcloud`<br>
-   Spotify:
-   `git clone https://github.com/bascurtiz/orpheusdl-spotify modules/spotify`<br>
-   Tidal: 
-   `git clone --recurse-submodules https://github.com/bascurtiz/orpheusdl-tidal modules/tidal`<br>
-   YouTube:
-   `git clone https://github.com/bascurtiz/orpheusdl-youtube modules/youtube`<br>
-
-6. Run Orpheus to create settings.json:<br>
-   `python orpheus.py`<br>
-    <sub>*(use python3 on macOS)*</sub><br>
-
-[![Watch how to install](https://i.imgur.com/fgrPgeV.png)](https://youtu.be/AGsYTQuO7nk)
-
-<!-- USAGE EXAMPLES -->
-## Usage
-
-Just call `orpheus.py` with any link you want to archive, for example Qobuz:
-```shell
-python orpheus.py https://open.qobuz.com/album/c9wsrrjh49ftb
-```
-
-Alternatively do a search:
-```shell
-python orpheus.py search qobuz track darkside alan walker
-```
-
-<!-- CONFIGURATION -->
-## Configuration
-
-You can customize every module from Orpheus individually and also set general/global settings which are active in every
-loaded module. You'll find the configuration file here: `config/settings.json`
-
-### Global/General
-```json5
-{
-    "download_path": "./downloads/",
-    "download_quality": "hifi",
-    "search_limit": 10
+```jsonc
+"modules": {
+  "qobuz":  { ..., "rate_limit_rpm": 120 },   // requests per minute
+  "deezer": { ..., "rate_limit_rpm": 60  },
+  "tidal":  { ..., "rate_limit_rpm": 45  }
 }
 ```
 
-`download_path`: Set the absolute or relative output path with `/` as the delimiter
+- Lower number = gentler / slower. `0` = **disabled** (no gate). A negative/invalid value
+  falls back to the default so a typo can't silently drop the protection.
+- Env override (one-off, wins over settings): `ORPHEUS_QOBUZ_RPM`, `ORPHEUS_DEEZER_RPM`,
+  `ORPHEUS_TIDAL_RPM`.
+- The gate only paces the **API/metadata** traffic — the audio itself streams from each
+  service's CDN at full speed. Tidal additionally honours `Retry-After` on a 429 and has a
+  run-wide 429 circuit breaker (`ORPHEUS_TIDAL_429_ABORT`).
 
-`download_quality`: Choose one of the following settings:
-* "atmos": Dolby Atmos (only applicable to Apple Music & TIDAL)
-* "hifi": FLAC higher than 44.1/16 if available
-* "lossless": FLAC with 44.1/16 if available
-* "high": lossy codecs such as MP3, AAC, ... in a higher bitrate
-* "low": lossy codecs such as MP3, AAC, ... in a lower bitrate
+### FLAC-only policy
+`utils/audio_policy.py` (`global.codecs.flac_only`, default `true`) makes the Deezer/Qobuz
+modules refuse non-FLAC transfers, so the library stays lossless.
 
-**NOTE: The `download_quality` really depends on the used modules, so check out the modules README.md**
+### Cross-service ISRC de-duplication
+The same album reported with **different release years** by Deezer/Tidal/Qobuz used to land in
+separate `(YYYY) Album` folders. `orpheus/music_downloader.py` now reuses an existing album
+folder when the tracks match by **ISRC** (with a small-album-aware threshold so 1–2 track
+singles dedup correctly too). Numbered `(2)/(3)` copies of the same recording (same ISRC) are
+avoided.
 
-`search_limit`: How many search results are shown
+### Crash-safe configuration
+`orpheus/core.py` writes `settings.json` atomically and keeps a `settings.json.bak`, recovering
+from it if the file is ever emptied/corrupted (e.g. a power loss or a concurrent run), so the
+whole config is never reset to defaults.
 
+### Tooling
+| Script | What it does |
+|---|---|
+| `merge_dupe_albums.py` | One-time cleanup: merge existing duplicate album folders by ISRC (keeps the folder with most tracks, drops same-ISRC dups). `--dir "Z:\\"` dry-run, add `--apply`. |
+| `dedup_numbered.py` | Remove `<name> (N).ext` files that are ISRC-identical to `<name>.ext`. |
+| `isrc_recover.py` | Recover failed playlist tracks by ISRC across services (Deezer → Tidal). |
+| `qobuz_delete_empty.py` | Delete the authenticated user's **own** empty Qobuz playlists (dry-run by default; never touches followed/editorial ones). |
+| `playlist_artists.py`, `merge_artists.py`, `qobuz_playlists.py`, `list_playlists.py`, `spotify_playlists.py`, `qobuz_artists.py` | Export playlists / extract artist name+URL lists via public/app-level APIs. |
 
-### Global/Formatting:
+---
 
-```json5
-{
-    "discography_format": "{name} {quality}",
-    "album_format": "{name}{explicit}",
-    "playlist_format": "{name}{explicit}",
-    "track_filename_format": "{track_number}. {name}",
-    "single_full_path_format": "{name}",
-    "enable_zfill": true,
-    "force_album_format": false
-}
+## Service modules (separate repos)
+
+Each service module is its own git repository. Clone them into `modules/`. The forks below
+carry this fork's rate-limit + FLAC-only changes on the `feat/rate-limit-flac-only` branch:
+
+| Module | Repo | Branch |
+|---|---|---|
+| Qobuz  | [np3ir/orpheusdl-qobuz](https://github.com/np3ir/orpheusdl-qobuz)   | `feat/rate-limit-flac-only` |
+| Deezer | [np3ir/OrpheusDL-deezer](https://github.com/np3ir/OrpheusDL-deezer) | `feat/rate-limit-flac-only` |
+| Tidal  | [np3ir/orpheusdl-tidal](https://github.com/np3ir/orpheusdl-tidal)   | `feat/rate-limit-flac-only` |
+| Spotify | [bascurtiz/orpheusdl-spotify](https://github.com/bascurtiz/orpheusdl-spotify) | (upstream; metadata-only) |
+
+> The module changes import `utils.rate_limit` / `utils.audio_policy` from this repo, so they
+> are meant to run **inside** an OrpheusDL checkout (not as standalone module clones).
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/np3ir/orpheusdl.git
+cd orpheusdl
+
+# service modules (into modules/)
+git clone -b feat/rate-limit-flac-only https://github.com/np3ir/orpheusdl-qobuz.git  modules/qobuz
+git clone -b feat/rate-limit-flac-only https://github.com/np3ir/OrpheusDL-deezer.git modules/deezer
+git clone -b feat/rate-limit-flac-only https://github.com/np3ir/orpheusdl-tidal.git  modules/tidal
+git clone https://github.com/bascurtiz/orpheusdl-spotify.git modules/spotify
+
+pip install -r requirements.txt
+# plus each module's own requirements (see the module READMEs)
+
+python orpheus.py <url>            # first run generates config/settings.json
 ```
 
-`track_filename_format`: How tracks are formatted in albums and playlists. The relevant extension is appended to the end.
+Fill in your credentials in `config/settings.json` (git-ignored — never committed).
 
-`discography_format`: Folder structure for albums when downloading an artist or label discography (albums are placed
-under an artist/label folder already). Use `{name}` when `album_format` includes the artist to avoid duplicated paths.
-
-`album_format`, `playlist_format`, `artist_format`: Base directories for their respective formats - tracks and cover
-art are stored here. May have slashes in it, for instance {artist}/{album}.
-
-`single_full_path_format`: How singles are handled, which is separate to how the above work.
-Instead, this has both the folder's name and the track's name.
-
-`enable_zfill`: Zero-pads `track_number`, `total_tracks`, `disc_number`, and `total_discs` in filenames and
-embedded metadata (minimum two digits, e.g. 01–09; wider padding when an album has 100+ tracks). Use
-`{track_number}` or `{disc_number}` in `track_filename_format` for padded filenames.
-
-`force_album_format`: Forces the `album_format` for tracks instead of the `single_full_path_format` and also
-uses `album_format` in the `playlist_format` folder 
-
-
-#### Format variables
-
-`track_filename_format` variables are `{name}`, `{album}`, `{album_artist}`, `{album_id}`, `{track_number}`,
-`{total_tracks}`, `{disc_number}`, `{total_discs}`, `{release_date}`, `{release_year}`, `{artist_id}`, `{isrc}`,
-`{upc}`, `{explicit}`, `{copyright}`, `{codec}`, `{sample_rate}`, `{bit_depth}`.
-
-`discography_format` uses the same variables as `album_format`.
-
-`album_format` variables are `{name}`, `{id}`, `{artist}`, `{artist_id}`, `{release_year}`, `{upc}`, `{explicit}`,
-`{quality}`, `{artist_initials}`, `{album_artist}`.
-
-`playlist_format` variables are `{name}`, `{creator}`, `{tracks}`, `{release_year}`, `{explicit}`, `{creator_id}`
-
-* `{quality}` will add
-    ```
-     [Dolby Atmos]
-     [96kHz 24bit]
-     [M]
-    ```
- to the corresponding path (depending on the module)
-* `{explicit}` will add
-    ```
-     [E]
-    ```
-  to the corresponding path
-
-### Global/Covers
-
-```json5
-{
-    "embed_cover": true,
-    "main_compression": "high",
-    "main_resolution": 1400,
-    "save_external": false,
-    "external_format": "png",
-    "external_compression": "low",
-    "external_resolution": 3000,
-    "save_animated_cover": true
-}
+### Download to a different location per run
+```bash
+python orpheus.py -o "D:\OtherPlace" <url>
 ```
+`-o/--output` overrides `download_path` without touching the config, so you can run two
+instances to two destinations (each process has its own per-PID temp dir and its own rate gate).
 
-| Option               | Info                                                                                     |
-|----------------------|------------------------------------------------------------------------------------------|
-| embed_cover          | Enable it to embed the album cover inside every track                                    |
-| main_compression     | Compression of the main cover                                                            |
-| main_resolution      | Resolution (in pixels) of the cover of the module used                                   |
-| save_external        | Enable it to save the cover from a third party cover module                              |
-| external_format      | Format of the third party cover, supported values: `jpg`, `png`, `webp`                  |
-| external_compression | Compression of the third party cover, supported values: `low`, `high`                    |
-| external_resolution  | Resolution (in pixels) of the third party cover                                          |
-| save_animated_cover  | Enable saving the animated cover when supported from the module (often in MPEG-4 format) |
+---
 
-### Global/Codecs
+## Configuration highlights (`config/settings.json`)
 
-```json5
-{
-    "proprietary_codecs": false,
-    "spatial_codecs": true
-}
-```
+- `general.download_path` — library root (e.g. `Z:\\`).
+- `general.download_quality` — `lossless`.
+- `artist_downloading.merge_same_name_albums` — enables the cross-service ISRC folder reuse.
+- `artist_downloading.explicit_content` — `both` downloads the clean and explicit editions.
+- `codecs.flac_only` — refuse non-FLAC transfers.
+- `formatting.album_format` — e.g. `{album_artist}/({release_year}) {name}`.
+- `modules.<service>.rate_limit_rpm` — per-service request pacing (see above).
 
-`proprietary_codecs`: Enable it to allow `MQA`, `E-AC-3 JOC` or `AC-4 IMS`
+`config/settings.json` is git-ignored so **credentials never reach GitHub**. It is written
+atomically with a `.bak` recovery copy.
 
-`spatial_codecs`: Enable it to allow `MPEG-H 3D`, `E-AC-3 JOC` or `AC-4 IMS`
+---
 
-**Note: `spatial_codecs` has priority over `proprietary_codecs` when deciding if a codec is enabled**
+## Credits
 
-### Global/Module_defaults
-
-```json5
-{
-    "lyrics": "default",
-    "covers": "default",
-    "credits": "default"
-}
-```
-
-Change `default` to the module name under `/modules` in order to retrieve `lyrics`, `covers` or `credits` from the
-selected module
-
-### Global/Lyrics
-```json5
-{
-    "embed_lyrics": true,
-    "embed_synced_lyrics": false,
-    "save_synced_lyrics": true
-}
-```
-
-| Option              | Info                                                                                                                                                                |
-|---------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| embed_lyrics        | Embeds the (unsynced) lyrics inside every track                                                                                                                     |
-| embed_synced_lyrics | Embeds the synced lyrics inside every track (needs `embed_lyrics` to be enabled) (required for [Roon](https://community.roonlabs.com/t/1-7-lyrics-tag-guide/85182)) |
-| save_synced_lyrics  | Saves the synced lyrics inside a  `.lrc` file in the same directory as the track with the same `track_format` variables                                             |
-
-<!-- Contact -->
-## Contact
-
-OrfiDev (Project Lead) - [@OrfiDev](https://github.com/OrfiDev)
-
-Dniel97 (Current Lead Developer) - [@Dniel97](https://github.com/Dniel97)
-
-Original Project Link: [Orpheus Public GitHub Repository](https://github.com/OrfiTeam/OrpheusDL)
-
-
-
-<!-- ACKNOWLEDGEMENTS -->
-## Acknowledgements
-* Chimera by Aesir - the inspiration to the project
-* [Icon modified from a freepik image](https://www.freepik.com/)
+- Upstream: [bascurtiz/OrpheusDL](https://github.com/bascurtiz/OrpheusDL) and
+  [OrfiTeam/OrpheusDL](https://github.com/OrfiTeam/OrpheusDL).
+- This fork's additions are for personal, lossless, quality-first archival use. Respect the
+  terms of service of each streaming platform.
