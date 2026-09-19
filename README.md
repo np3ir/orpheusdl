@@ -4,6 +4,8 @@ A hardened, quality-first fork of [OrpheusDL](https://github.com/bascurtiz/Orphe
 (itself based on OrfiTeam/OrpheusDL) — a modular music archival tool that downloads
 from Tidal, Deezer, Qobuz and Spotify.
 
+**Instalar en otra computadora:** [guía paso a paso en español](docs/INSTALL_WINDOWS.md).
+
 This fork is tuned for **building a large, clean, high-quality library automatically**,
 where correctness and account safety matter more than raw speed.
 
@@ -37,8 +39,8 @@ services never see bursts (which is what gets an account flagged). Configured pe
 
 ### FLAC-only policy
 `utils/audio_policy.py` (`global.codecs.flac_only`, default `true`) makes the Deezer, Qobuz and
-Tidal modules refuse non-FLAC transfers, so the library stays lossless. (Spotify is metadata-only
-and never streams audio, so the policy doesn't apply there.)
+Tidal modules refuse non-FLAC transfers, so the library stays lossless. (The Spotify fork refuses lossy track/episode transfers while FLAC-only is enabled;
+metadata remains available.)
 
 ### Cross-service ISRC de-duplication
 The same album reported with **different release years** by Deezer/Tidal/Qobuz used to land in
@@ -73,7 +75,7 @@ carry this fork's rate-limit + FLAC-only changes on the `feat/rate-limit-flac-on
 | Qobuz  | [np3ir/orpheusdl-qobuz](https://github.com/np3ir/orpheusdl-qobuz)   | `feat/rate-limit-flac-only` |
 | Deezer | [np3ir/OrpheusDL-deezer](https://github.com/np3ir/OrpheusDL-deezer) | `feat/rate-limit-flac-only` |
 | Tidal  | [np3ir/orpheusdl-tidal](https://github.com/np3ir/orpheusdl-tidal)   | `feat/rate-limit-flac-only` |
-| Spotify | [bascurtiz/orpheusdl-spotify](https://github.com/bascurtiz/orpheusdl-spotify) | (upstream; metadata-only) |
+| Spotify | [np3ir/orpheusdl-spotify](https://github.com/np3ir/orpheusdl-spotify) | `codex/flac-only` |
 
 > The module changes import `utils.rate_limit` / `utils.audio_policy` from this repo, so they
 > are meant to run **inside** an OrpheusDL checkout (not as standalone module clones).
@@ -89,11 +91,14 @@ cd orpheusdl
 # service modules (into modules/)
 git clone -b feat/rate-limit-flac-only https://github.com/np3ir/orpheusdl-qobuz.git  modules/qobuz
 git clone -b feat/rate-limit-flac-only https://github.com/np3ir/OrpheusDL-deezer.git modules/deezer
-git clone -b feat/rate-limit-flac-only https://github.com/np3ir/orpheusdl-tidal.git  modules/tidal
-git clone https://github.com/bascurtiz/orpheusdl-spotify.git modules/spotify
+git clone --recurse-submodules -b feat/rate-limit-flac-only https://github.com/np3ir/orpheusdl-tidal.git  modules/tidal
+git clone -b codex/flac-only https://github.com/np3ir/orpheusdl-spotify.git modules/spotify
 
-pip install -r requirements.txt
-# plus each module's own requirements (see the module READMEs)
+python -m venv .venv
+# Bash on Linux/macOS (Windows commands are in the guide above):
+source .venv/bin/activate
+python -m pip install -r requirements-core.txt
+# See the Windows guide for commands that always select the correct interpreter.
 
 python orpheus.py <url>            # first run generates config/settings.json
 ```
@@ -119,7 +124,7 @@ instances to two destinations (each process has its own per-PID temp dir and its
 - `formatting.album_format` — e.g. `{album_artist}/({release_year}) {name}`.
 - `modules.<service>.rate_limit_rpm` — per-service request pacing (see above).
 
-`config/settings.json` is git-ignored so **credentials never reach GitHub**. It is written
+`config/settings.json` is git-ignored to exclude credentials from normal Git commits. It is written
 atomically with a `.bak` recovery copy.
 
 ---
@@ -130,3 +135,11 @@ atomically with a `.bak` recovery copy.
   [OrfiTeam/OrpheusDL](https://github.com/OrfiTeam/OrpheusDL).
 - This fork's additions are for personal, lossless, quality-first archival use. Respect the
   terms of service of each streaming platform.
+
+## Library-wide ISRC deduplication (2026-09-19)
+
+The opt-in library index now coordinates synchronous/asynchronous downloads on this PC,
+verifies on-disk tags, and registers only completed audio. Index refresh is explicit.
+Cleanup requires a saved plan and supports a durable quarantine journal and rollback.
+See [operating instructions](docs/DEDUPE_OPERATIONS.md) and
+[design and limitations](docs/DEDUPE_DESIGN.md).

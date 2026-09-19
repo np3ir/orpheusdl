@@ -9,3 +9,15 @@ temp/
 .python-version
 modules/
 extensions/
+# Local environments, reports and backups (never publish credentials/library data)
+.venv/
+.pytest_cache/
+*.bak
+*.bak-*
+*.log
+*.db
+*.db-*
+*.journal.jsonl
+docs/DEDUPE_HANDOFF.md
+docs/DEDUPE_VALIDATION.json
+docs/DEDUPE_CHANGESET.json

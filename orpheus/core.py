@@ -119,6 +119,8 @@ class Orpheus:
                 "disable_subscription_checks": False,
                 "ignore_existing_files": False,
                 "reverify_existing_files": False,
+                "isrc_library_dedup": False,
+                "isrc_library_upgrade": False,
             },
             "artist_downloading":{
                 "return_credited_albums": True,
