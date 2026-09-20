@@ -1,5 +1,18 @@
 # Instalar OrpheusDL en otra computadora (Windows)
 
+**Opción recomendada:** usa [el instalador de Windows](WINDOWS_COMMAND.md) para
+crear el entorno, instalar los módulos y dejar disponible `orpheus URL` desde
+cualquier carpeta. Los pasos siguientes son la alternativa manual.
+
+Si ya seguiste esta guía, basta con actualizar y registrar el comando:
+
+```powershell
+git pull --ff-only
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -RegisterCommandOnly
+```
+
+Cierra y abre la terminal antes de usar `orpheus "URL"`.
+
 Esta guía instala el fork de **np3ir**, sus módulos compatibles y las herramientas
 ISRC. No hace falta copiar la instalación anterior ni sus credenciales.
 

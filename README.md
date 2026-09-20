@@ -4,7 +4,25 @@ A hardened, quality-first fork of [OrpheusDL](https://github.com/bascurtiz/Orphe
 (itself based on OrfiTeam/OrpheusDL) — a modular music archival tool that downloads
 from Tidal, Deezer, Qobuz and Spotify.
 
-**Instalar en otra computadora:** [guía paso a paso en español](docs/INSTALL_WINDOWS.md).
+**Windows: instala y usa `orpheus URL` desde cualquier carpeta.**
+
+```powershell
+git clone https://github.com/np3ir/orpheusdl.git
+cd orpheusdl
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Requiere Git, Python 3.13 y FFmpeg. Configura tus credenciales locales y abre una
+terminal nueva al terminar:
+
+```powershell
+orpheus "https://open.qobuz.com/track/441053229"
+```
+
+Para una instalación existente con `.venv`, ejecuta `git pull --ff-only` y luego
+el instalador con `-RegisterCommandOnly`.
+[Guía del instalador y solución de problemas](docs/WINDOWS_COMMAND.md).
+[Instalación manual alternativa](docs/INSTALL_WINDOWS.md).
 
 This fork is tuned for **building a large, clean, high-quality library automatically**,
 where correctness and account safety matter more than raw speed.
@@ -82,7 +100,9 @@ carry this fork's rate-limit + FLAC-only changes on the `feat/rate-limit-flac-on
 
 ---
 
-## Installation
+## Manual installation (alternative)
+
+Windows users can use `install.ps1` above instead of these manual steps.
 
 ```bash
 git clone https://github.com/np3ir/orpheusdl.git
