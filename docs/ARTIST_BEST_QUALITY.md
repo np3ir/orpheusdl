@@ -1,19 +1,26 @@
-# Artist best-quality FLAC across services (by ISRC)
+# Best-quality FLAC across services (by ISRC)
 
-`artist_best_quality.py` takes **one** artist link from Tidal, Deezer or Qobuz and
-downloads that artist as the **best FLAC available across all three services**,
-matching recordings by **ISRC** (the code that identifies the exact recording, so
-there is no wrong-match guessing).
+`artist_best_quality.py` takes **one** link from Tidal, Deezer or Qobuz — an
+**artist, album, playlist or track** — and downloads it as the **best FLAC
+available across all three services**, matching recordings by **ISRC** (the code
+that identifies the exact recording, so there is no wrong-match guessing).
 
 ## What it does
 
+**For an artist link:**
 1. Reads the artist's whole discography from the service in the link.
 2. Finds the **same artist** on the other two services by matching ISRCs
-   (falls back to a name search if needed).
+   (falls back to a name search, verified by ISRC overlap).
 3. Builds the **union** of every recording across the three services, deduplicated
    by ISRC — so a track that only exists on one service is still captured.
-4. **Skips what you already own**, checked against the library ISRC index.
-5. For each remaining recording, picks the service with the **best FLAC**
+
+**For an album / playlist / track link:**
+1. Reads the ISRCs contained in that album, playlist or track.
+2. Looks each recording up on all three services directly by ISRC.
+
+**Then, in both cases:**
+3. **Skips what you already own**, checked against the library ISRC index.
+4. For each remaining recording, picks the service with the **best FLAC**
    (24-bit hi-res > 16-bit) — or the quality you ask for — and downloads it there.
    If the requested quality isn't available, it falls back to the best FLAC that
    *is* available instead of skipping the track (unless `--exact`).
@@ -28,8 +35,11 @@ The install folder is on PATH, so from **any** directory use the short launcher
 `abq` (Windows). It forwards all flags to the script:
 
 ```powershell
-# Best FLAC anywhere (hi-res if it exists)
+# Any link type works: artist, album, playlist or track
 abq "https://tidal.com/artist/10411"
+abq "https://www.deezer.com/album/1603029"
+abq "https://www.deezer.com/playlist/908622995"
+abq "https://tidal.com/browse/track/96594261"
 
 # Ask for a specific quality
 abq "https://www.deezer.com/en/artist/221" -q 16

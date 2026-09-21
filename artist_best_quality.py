@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Artist cross-service best-quality FLAC downloader (matched by ISRC).
+"""Cross-service best-quality FLAC downloader (matched by ISRC).
 
-Give it ONE artist URL from Tidal, Deezer or Qobuz, e.g.
+Give it ONE link from Tidal, Deezer or Qobuz -- artist, album, playlist or track:
 
     python artist_best_quality.py https://tidal.com/artist/10411
-    python artist_best_quality.py https://www.deezer.com/en/artist/221 -q 16
-    python artist_best_quality.py https://play.qobuz.com/artist/29674 --dry
+    python artist_best_quality.py https://www.deezer.com/album/1603029 -q 16
+    python artist_best_quality.py https://tidal.com/browse/track/96594261 --dry
 
 and it will:
 
-  1. Read that artist's whole discography from the service in the link.
-  2. Find the SAME artist on the other two services by matching ISRCs
-     (the ISRC identifies the exact recording, so no wrong-match guessing).
-  3. Build the UNION of every recording across the three services (deduplicated
-     by ISRC), so a track that only exists on one service is still captured.
-  4. Skip anything you already own (checked against the library ISRC index).
-  5. For every remaining recording, pick the service that offers the best FLAC
+  1. Collect the recordings' ISRCs from the link:
+     - artist  -> the whole discography, plus the SAME artist on the other two
+       services (matched by ISRC; the union captures service-exclusive tracks);
+     - album/playlist/track -> the ISRCs in that album, playlist or track.
+  2. Look each recording up on all three services by ISRC (the ISRC identifies the
+     exact recording, so no wrong-match guessing).
+  3. Skip anything you already own (checked against the library ISRC index).
+  4. For every remaining recording, pick the service that offers the best FLAC
      (24-bit hi-res > 16-bit) -- or the quality you ask for -- and download it
      from there. If the requested quality is not available, it falls back to the
      best FLAC that IS available instead of skipping the track (unless --exact).
@@ -160,8 +161,12 @@ def abq_config(settings):
 # --------------------------------------------------------------------------- #
 # URL parsing
 # --------------------------------------------------------------------------- #
-def parse_artist_url(url):
-    """Return (service, artist_id) for a Tidal/Deezer/Qobuz artist URL."""
+MEDIA_SEGMENTS = ('artist', 'album', 'playlist', 'track')
+
+
+def parse_media_url(url):
+    """Return (service, media_type, media_id) for a Tidal/Deezer/Qobuz link.
+    media_type is one of artist/album/playlist/track."""
     u = urlparse(url if '://' in url else 'https://' + url)
     service = None
     for netloc_sub, svc in NETLOC_MAP.items():
@@ -171,19 +176,19 @@ def parse_artist_url(url):
     if not service:
         raise SystemExit(f'Unrecognised service in URL netloc: "{u.netloc}"')
     parts = [p for p in u.path.split('/') if p]
-    if 'artist' not in parts:
-        raise SystemExit(f'Not an artist URL (no /artist/ segment): {url}')
-    # id is the segment right after 'artist', else the last numeric segment
-    idx = parts.index('artist')
-    artist_id = None
-    if idx + 1 < len(parts):
-        artist_id = parts[idx + 1]
-    if not (artist_id and artist_id.isdigit()):
+    seg = next((p for p in parts if p in MEDIA_SEGMENTS), None)
+    if not seg:
+        raise SystemExit(
+            f'Unsupported link: {url}\n'
+            f'Use an artist, album, playlist or track URL.')
+    idx = parts.index(seg)
+    mid = parts[idx + 1] if idx + 1 < len(parts) else None
+    if not (mid and mid.isdigit()):
         nums = [p for p in parts if p.isdigit()]
-        artist_id = nums[-1] if nums else artist_id
-    if not artist_id:
-        raise SystemExit(f'Could not extract an artist id from: {url}')
-    return service, str(artist_id)
+        mid = nums[-1] if nums else mid
+    if not mid:
+        raise SystemExit(f'Could not extract a {seg} id from: {url}')
+    return service, seg, str(mid)
 
 
 # --------------------------------------------------------------------------- #
@@ -193,21 +198,9 @@ class Core:
     """Loads the Orpheus core and caches service modules (with raw .session)."""
 
     def __init__(self):
-        self._example_moved = False
-        ex = os.path.join(SCRIPT_DIR, 'modules', 'example')
-        off = os.path.join(SCRIPT_DIR, 'modules', '_example_off')
-        # self-heal: a previous run killed mid-way may have left it renamed
-        if os.path.isdir(off) and not os.path.isdir(ex):
-            try:
-                os.rename(off, ex)
-            except Exception:
-                pass
-        if os.path.isdir(ex):
-            try:
-                os.rename(ex, off)
-                self._example_moved = True
-            except Exception:
-                pass
+        # NB: Orpheus loads fine with modules/example present, and we only ever
+        # load_module() the services we need, so we do NOT rename example aside
+        # (doing so would race with a second abq/orpheus running concurrently).
         from orpheus.core import Orpheus
         self.orpheus = Orpheus()
         self._modules = {}
@@ -223,14 +216,7 @@ class Core:
         return getattr(self.module(name), 'session', None)
 
     def close(self):
-        if self._example_moved:
-            ex = os.path.join(SCRIPT_DIR, 'modules', 'example')
-            off = os.path.join(SCRIPT_DIR, 'modules', '_example_off')
-            if os.path.isdir(off):
-                try:
-                    os.rename(off, ex)
-                except Exception:
-                    pass
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -429,6 +415,140 @@ def _artist_id_by_isrc(core, service, isrc):
 
 
 # --------------------------------------------------------------------------- #
+# Per-ISRC probe: does `service` have this recording, and at what FLAC quality?
+# --------------------------------------------------------------------------- #
+def probe_isrc(core, service, isrc):
+    """Return (track_id, bit_depth, sample_rate) if `service` has this ISRC as a
+    FLAC candidate, else None. Used for track/album/playlist links, where there
+    is no artist to enumerate -- each recording is looked up directly by ISRC."""
+    up = isrc.strip().upper()
+    if service == 'tidal':
+        res = call_timeout(lambda: core.session('tidal').get_tracks_by_isrc(isrc),
+                           15, default=None, label=f'tidal isrc {isrc}')
+        items = res.get('items') if isinstance(res, dict) else res
+        for it in items or []:
+            bd, sr = tidal_quality(it.get('audioQuality'))
+            if it.get('id') is not None and bd:
+                return (str(it['id']), bd, sr)
+        return None
+    if service == 'deezer':
+        try:
+            r = requests.get(f'https://api.deezer.com/track/isrc:{isrc}', timeout=20).json()
+            if r.get('id'):
+                return (str(r['id']), 16, 44.1)  # Deezer FLAC = 16/44.1
+        except Exception:
+            return None
+        return None
+    if service == 'qobuz':
+        res = call_timeout(lambda: core.session('qobuz').search('track', isrc, limit=3),
+                           15, default=None, label=f'qobuz isrc {isrc}')
+        tracks = (res.get('tracks') or {}).get('items') if isinstance(res, dict) else None
+        for tr in tracks or []:
+            if (tr.get('isrc') or '').strip().upper() != up:
+                continue
+            alb = tr.get('album') or {}
+            bd = tr.get('maximum_bit_depth') or alb.get('maximum_bit_depth') or 16
+            sr = tr.get('maximum_sampling_rate') or alb.get('maximum_sampling_rate') or 44.1
+            if tr.get('id') is not None:
+                return (str(tr['id']), int(bd), float(sr))
+        return None
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Source ISRC extraction for track / album / playlist links (no artist needed)
+# --------------------------------------------------------------------------- #
+def _u(x):
+    return (x or '').strip().upper()
+
+
+def source_isrcs(core, service, mtype, mid):
+    """Return the set of ISRCs contained in a track/album/playlist link."""
+    s = core.session(service)
+    out = set()
+    if mtype == 'track':
+        if service == 'deezer':
+            try:
+                r = requests.get(f'https://api.deezer.com/track/{mid}', timeout=20).json()
+                if _u(r.get('isrc')):
+                    out.add(_u(r.get('isrc')))
+            except Exception:
+                pass
+        else:  # tidal / qobuz: track object carries isrc
+            t = call_timeout(lambda: s.get_track(str(mid)), 20, default=None,
+                             label=f'{service} track {mid}') or {}
+            if _u(t.get('isrc')):
+                out.add(_u(t.get('isrc')))
+    elif mtype == 'album':
+        out |= _album_isrcs(core, service, mid)
+    elif mtype == 'playlist':
+        out |= _playlist_isrcs(core, service, mid)
+    return out
+
+
+def _album_isrcs(core, service, album_id):
+    s = core.session(service)
+    out = set()
+    if service == 'qobuz':
+        d = call_timeout(lambda: s.get_album(str(album_id)), 45, default=None,
+                         label=f'qobuz album {album_id}') or {}
+        for tr in (d.get('tracks') or {}).get('items') or []:
+            if _u(tr.get('isrc')):
+                out.add(_u(tr.get('isrc')))
+    elif service == 'tidal':
+        r = call_timeout(lambda: s.get_album_items_all(str(album_id)), 60, default=None,
+                         label=f'tidal album {album_id}') or {}
+        for row in r.get('items') or []:
+            it = row.get('item') if isinstance(row, dict) and 'item' in row else row
+            if isinstance(it, dict) and _u(it.get('isrc')):
+                out.add(_u(it.get('isrc')))
+    elif service == 'deezer':
+        d = call_timeout(lambda: s.get_album(str(album_id)), 30, default=None,
+                         label=f'deezer album {album_id}') or {}
+        for tr in (d.get('SONGS') or {}).get('data') or []:
+            if _u(tr.get('ISRC')):
+                out.add(_u(tr.get('ISRC')))
+    return out
+
+
+def _playlist_isrcs(core, service, playlist_id):
+    s = core.session(service)
+    out = set()
+    if service == 'qobuz':
+        off = 0
+        while True:
+            d = call_timeout(lambda off=off: s.get_playlist(str(playlist_id), limit=500, offset=off),
+                             45, default=None, label=f'qobuz playlist {playlist_id}') or {}
+            items = (d.get('tracks') or {}).get('items') or []
+            for tr in items:
+                if _u(tr.get('isrc')):
+                    out.add(_u(tr.get('isrc')))
+            if len(items) < 500:
+                break
+            off += len(items)
+    elif service == 'tidal':
+        r = call_timeout(lambda: s.get_playlist_items(str(playlist_id)), 90, default=None,
+                         label=f'tidal playlist {playlist_id}') or {}
+        for row in r.get('items') or []:
+            it = row.get('item') if isinstance(row, dict) and 'item' in row else row
+            if isinstance(it, dict) and _u(it.get('isrc')):
+                out.add(_u(it.get('isrc')))
+    elif service == 'deezer':
+        start = 0
+        while True:
+            d = call_timeout(lambda start=start: s.get_playlist(str(playlist_id), 500, start),
+                             45, default=None, label=f'deezer playlist {playlist_id}') or {}
+            items = (d.get('SONGS') or {}).get('data') or []
+            for tr in items:
+                if _u(tr.get('ISRC')):
+                    out.add(_u(tr.get('ISRC')))
+            if len(items) < 500:
+                break
+            start += len(items)
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Selection
 # --------------------------------------------------------------------------- #
 def choose_service(cands, target, prefer):
@@ -494,8 +614,9 @@ def main():
     cfg = abq_config(settings)
 
     ap = argparse.ArgumentParser(
-        description='Download an artist as best-quality FLAC across Tidal/Deezer/Qobuz (matched by ISRC).')
-    ap.add_argument('url', help='Artist URL (tidal.com/artist/.., deezer.com/.../artist/.., play.qobuz.com/artist/..)')
+        description='Download an artist/album/playlist/track as best-quality FLAC across '
+                    'Tidal/Deezer/Qobuz (matched by ISRC).')
+    ap.add_argument('url', help='Tidal/Deezer/Qobuz URL: artist, album, playlist or track.')
     ap.add_argument('-q', '--quality', default=None,
                     help='best|max | hires|24|hifi | lossless|16  (default from settings.json: %(default)s)')
     ap.add_argument('--exact', action='store_true',
@@ -536,59 +657,75 @@ def main():
     if out_path:
         out_path = out_path.rstrip('/\\') or out_path
 
-    src_service, src_artist = parse_artist_url(args.url)
+    src_service, mtype, mid = parse_media_url(args.url)
     if src_service not in active:
         active = [src_service] + active
         prefer = [src_service] + [s for s in prefer if s != src_service]
-    log(f'Source: {src_service} artist {src_artist}')
+    log(f'Source: {src_service} {mtype} {mid}')
     log(f'Target quality: {target} (download @ {dlq}); services: {", ".join(active)}; '
-        f'credited={credited}; dedup={not args.no_dedup and cfg["dedup_with_library"]}')
+        f'{"credited=" + str(credited) + "; " if mtype == "artist" else ""}'
+        f'dedup={not args.no_dedup and cfg["dedup_with_library"]}')
 
     os.chdir(SCRIPT_DIR)
     core = Core()
     try:
-        # ---- artist name (cheap; for logging + name-search fallback) ----
-        artist_name = artist_name_of(core, src_service, src_artist)
-        if artist_name:
-            log(f'Artist: {artist_name}')
-
-        # ---- enumerate the source discography ----
-        log(f'\nEnumerating {src_service} discography...')
-        per_service = {src_service: ENUMERATORS[src_service](
-            core.session(src_service), src_artist, credited, args.max_albums)}
-        log(f'  {src_service}: {len(per_service[src_service])} recordings with ISRC')
-
-        source_isrcs = set(per_service[src_service].keys())
-        sample_isrcs = list(source_isrcs)[:12]
-
-        # ---- resolve + enumerate the other services ----
-        for svc in active:
-            if svc == src_service:
-                continue
-            log(f'\nResolving artist on {svc}...')
-            aid, method = resolve_artist(core, svc, sample_isrcs, artist_name)
-            if not aid:
-                continue
-            log(f'Enumerating {svc} discography...')
-            mp = ENUMERATORS[svc](core.session(svc), aid, credited, args.max_albums)
-            # Verify a name-resolved artist really is the same person: its ISRCs
-            # must overlap the source. Guards the union against a same-name match.
-            if method == 'name' and source_isrcs and mp:
-                overlap = len(source_isrcs & set(mp.keys()))
-                if overlap == 0:
-                    log(f'  {svc}: 0 ISRC overlap with source -> likely the wrong '
-                        f'"{artist_name}"; discarding {len(mp)} tracks.')
-                    continue
-                log(f'  {svc}: {overlap} shared ISRC(s) with source (name match verified)')
-            per_service[svc] = mp
-            log(f'  {svc}: {len(mp)} recordings with ISRC')
-
-        # ---- union by ISRC ----
         union = {}  # isrc -> {service: (id, bd, sr)}
-        for svc, mp in per_service.items():
-            for isrc, cand in mp.items():
-                union.setdefault(isrc, {})[svc] = cand
-        log(f'\nUnion: {len(union)} unique recordings across {", ".join(per_service)}')
+
+        if mtype == 'artist':
+            # ---- artist name (cheap; for logging + name-search fallback) ----
+            artist_name = artist_name_of(core, src_service, mid)
+            if artist_name:
+                log(f'Artist: {artist_name}')
+
+            # ---- enumerate the source discography ----
+            log(f'\nEnumerating {src_service} discography...')
+            per_service = {src_service: ENUMERATORS[src_service](
+                core.session(src_service), mid, credited, args.max_albums)}
+            log(f'  {src_service}: {len(per_service[src_service])} recordings with ISRC')
+
+            src_set = set(per_service[src_service].keys())
+            sample_isrcs = list(src_set)[:12]
+
+            # ---- resolve + enumerate the other services ----
+            for svc in active:
+                if svc == src_service:
+                    continue
+                log(f'\nResolving artist on {svc}...')
+                aid, method = resolve_artist(core, svc, sample_isrcs, artist_name)
+                if not aid:
+                    continue
+                log(f'Enumerating {svc} discography...')
+                mp = ENUMERATORS[svc](core.session(svc), aid, credited, args.max_albums)
+                # Verify a name-resolved artist really is the same person: its ISRCs
+                # must overlap the source. Guards the union against a same-name match.
+                if method == 'name' and src_set and mp:
+                    overlap = len(src_set & set(mp.keys()))
+                    if overlap == 0:
+                        log(f'  {svc}: 0 ISRC overlap with source -> likely the wrong '
+                            f'"{artist_name}"; discarding {len(mp)} tracks.')
+                        continue
+                    log(f'  {svc}: {overlap} shared ISRC(s) with source (name match verified)')
+                per_service[svc] = mp
+                log(f'  {svc}: {len(mp)} recordings with ISRC')
+
+            for svc, mp in per_service.items():
+                for isrc, cand in mp.items():
+                    union.setdefault(isrc, {})[svc] = cand
+            log(f'\nUnion: {len(union)} unique recordings across {", ".join(per_service)}')
+        else:
+            # ---- track / album / playlist: read the source ISRCs, then look each
+            # recording up on every service and keep the best FLAC ----
+            log(f'\nReading {mtype} {mid} from {src_service}...')
+            isrcs = source_isrcs(core, src_service, mtype, mid)
+            log(f'  {len(isrcs)} recording(s) with ISRC in the {mtype}')
+            for i, isrc in enumerate(sorted(isrcs), 1):
+                for svc in active:
+                    cand = probe_isrc(core, svc, isrc)
+                    if cand:
+                        union.setdefault(isrc, {})[svc] = cand
+                if len(isrcs) > 25 and i % 25 == 0:
+                    log(f'  probed {i}/{len(isrcs)} ISRCs across services...')
+            log(f'\nChecked {len(union)}/{len(isrcs)} recording(s) available on {", ".join(active)}')
 
         # ---- library dedup ----
         idx = None
@@ -648,7 +785,9 @@ def main():
             for isrc, order in plan[:200]:
                 svc = order[0]
                 tid, bd, sr = union[isrc][svc]
-                log(f'  {isrc}  -> {svc} ({bd}bit/{sr}kHz)  {track_url(svc, tid)}')
+                # target=lossless always downloads 16-bit even if the catalog is hi-res
+                shown = '16bit/44.1kHz' if target == 'lossless' else f'{bd}bit/{sr}kHz'
+                log(f'  {isrc}  -> {svc} @ {dlq} ({shown})  {track_url(svc, tid)}')
             if len(plan) > 200:
                 log(f'  ... and {len(plan) - 200} more')
             return

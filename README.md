@@ -56,10 +56,14 @@ Deezer y/o Spotify. Guarda y cierra. (Ese archivo es privado y **no** se sube a 
 orpheus "https://open.qobuz.com/track/441053229"
 ```
 
-**`abq`** — baja el **artista completo** al mejor FLAC, buscando en los 3 servicios por ISRC:
+**`abq`** — baja **artista, álbum, playlist o track** al mejor FLAC, buscando en los
+3 servicios por ISRC (elige, tema por tema, dónde está la mejor calidad):
 
 ```powershell
-abq "https://tidal.com/artist/10411"
+abq "https://tidal.com/artist/10411"          # artista completo
+abq "https://www.deezer.com/album/1603029"    # un álbum
+abq "https://www.deezer.com/playlist/123456"  # una playlist
+abq "https://tidal.com/browse/track/96594261" # un solo tema
 ```
 
 Truco: añade `--dry` para **ver primero** qué bajaría, sin descargar nada:
