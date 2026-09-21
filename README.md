@@ -62,11 +62,15 @@ orpheus "https://open.qobuz.com/track/441053229"
 searching all three services by ISRC (it picks, per track, where the best quality is):
 
 ```powershell
-abq "https://tidal.com/artist/10411"           # a whole artist
-abq "https://www.deezer.com/album/1603029"     # an album
-abq "https://www.deezer.com/playlist/123456"   # a playlist
-abq "https://tidal.com/browse/track/96594261"  # a single track
+abq "https://tidal.com/artist/10411"              # a whole artist
+abq "https://www.deezer.com/album/1603029"        # an album
+abq "https://www.deezer.com/playlist/123456"      # a playlist
+abq "https://tidal.com/browse/track/96594261"     # a single track
+abq "https://open.spotify.com/playlist/6C6Es..."  # a Spotify playlist
 ```
+
+A **Spotify** link works too: Spotify has no FLAC, so it's used only to read the
+songs (by ISRC) and the audio is downloaded from Qobuz/Tidal/Deezer.
 
 Tip: add `--dry` to **preview** what it would download, without downloading anything.
 
@@ -144,11 +148,15 @@ orpheus "https://open.qobuz.com/track/441053229"
 3 servicios por ISRC (elige, tema por tema, dónde está la mejor calidad):
 
 ```powershell
-abq "https://tidal.com/artist/10411"           # artista completo
-abq "https://www.deezer.com/album/1603029"     # un álbum
-abq "https://www.deezer.com/playlist/123456"   # una playlist
-abq "https://tidal.com/browse/track/96594261"  # un solo tema
+abq "https://tidal.com/artist/10411"              # artista completo
+abq "https://www.deezer.com/album/1603029"        # un álbum
+abq "https://www.deezer.com/playlist/123456"      # una playlist
+abq "https://tidal.com/browse/track/96594261"     # un solo tema
+abq "https://open.spotify.com/playlist/6C6Es..."  # una playlist de Spotify
 ```
+
+Un enlace de **Spotify** también sirve: Spotify no tiene FLAC, así que solo se usa
+para leer los temas (por ISRC) y el audio se baja de Qobuz/Tidal/Deezer.
 
 Truco: añade `--dry` para **ver primero** qué bajaría, sin descargar nada.
 

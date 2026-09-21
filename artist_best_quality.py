@@ -57,6 +57,7 @@ NETLOC_MAP = {
     'tidal.com': 'tidal',
     'deezer.com': 'deezer',
     'qobuz.com': 'qobuz',
+    'spotify.com': 'spotify',  # metadata-only SOURCE (no FLAC); never a download target
 }
 
 TARGET_ALIASES = {
@@ -463,7 +464,9 @@ def _u(x):
 
 
 def source_isrcs(core, service, mtype, mid):
-    """Return the set of ISRCs contained in a track/album/playlist link."""
+    """Return the set of ISRCs contained in a track/album/playlist/artist link."""
+    if service == 'spotify':
+        return _spotify_isrcs(core, mtype, mid)
     s = core.session(service)
     out = set()
     if mtype == 'track':
@@ -548,6 +551,60 @@ def _playlist_isrcs(core, service, playlist_id):
     return out
 
 
+def _spotify_isrcs(core, mtype, mid):
+    """ISRCs from a Spotify link. Spotify is metadata-only here (never a FLAC
+    source): we read the ISRCs and download the exact recordings from the other
+    services. Uses app-level / anonymous metadata, not an account login."""
+    out = set()
+    try:
+        mod = core.module('spotify')
+    except Exception as e:
+        log(f'  spotify: could not load module: {e}')
+        return out
+    api = getattr(mod, 'spotify_api', None)
+
+    def isrc_by_id(tid):
+        try:
+            if api and api._init_web_api_client() and getattr(api, 'client', None):
+                tr = api.client.track(str(tid)) or {}
+                return (tr.get('external_ids') or {}).get('isrc')
+        except Exception:
+            pass
+        return None
+
+    def from_tracklist(info):
+        for t in (getattr(info, 'tracks', None) or []):
+            isrc = getattr(getattr(t, 'tags', None), 'isrc', None)
+            if not isrc:
+                tid = getattr(t, 'id', None) or (t if isinstance(t, str) else None)
+                isrc = isrc_by_id(tid) if tid else None
+            if isrc:
+                out.add(isrc.strip().upper())
+
+    try:
+        if mtype == 'track':
+            i = isrc_by_id(mid)
+            if i:
+                out.add(i.strip().upper())
+        elif mtype == 'album':
+            from_tracklist(call_timeout(lambda: mod.get_album_info(str(mid)), 60,
+                                        default=None, label='spotify album'))
+        elif mtype == 'playlist':
+            from_tracklist(call_timeout(lambda: mod.get_playlist_info(str(mid)), 120,
+                                        default=None, label='spotify playlist'))
+        elif mtype == 'artist':
+            info = call_timeout(lambda: mod.get_artist_info(str(mid)), 90,
+                                default=None, label='spotify artist')
+            album_ids = [a if isinstance(a, str) else (a.get('id') if isinstance(a, dict) else None)
+                         for a in (getattr(info, 'albums', None) or [])]
+            for aid in [a for a in album_ids if a]:
+                from_tracklist(call_timeout(lambda aid=aid: mod.get_album_info(str(aid)), 60,
+                                            default=None, label=f'spotify album {aid}'))
+    except Exception as e:
+        log(f'  spotify: metadata read failed: {e}')
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Selection
 # --------------------------------------------------------------------------- #
@@ -616,7 +673,8 @@ def main():
     ap = argparse.ArgumentParser(
         description='Download an artist/album/playlist/track as best-quality FLAC across '
                     'Tidal/Deezer/Qobuz (matched by ISRC).')
-    ap.add_argument('url', help='Tidal/Deezer/Qobuz URL: artist, album, playlist or track.')
+    ap.add_argument('url', help='Tidal/Deezer/Qobuz/Spotify URL: artist, album, playlist or track. '
+                                '(Spotify is a metadata-only source: audio comes from the other services.)')
     ap.add_argument('-q', '--quality', default=None,
                     help='best|max | hires|24|hifi | lossless|16  (default from settings.json: %(default)s)')
     ap.add_argument('--exact', action='store_true',
@@ -658,7 +716,9 @@ def main():
         out_path = out_path.rstrip('/\\') or out_path
 
     src_service, mtype, mid = parse_media_url(args.url)
-    if src_service not in active:
+    # Only real download services (qobuz/tidal/deezer) join the candidate pool.
+    # A Spotify source is metadata-only: it supplies ISRCs, never FLAC.
+    if src_service in ALL_SERVICES and src_service not in active:
         active = [src_service] + active
         prefer = [src_service] + [s for s in prefer if s != src_service]
     log(f'Source: {src_service} {mtype} {mid}')
@@ -671,7 +731,9 @@ def main():
     try:
         union = {}  # isrc -> {service: (id, bd, sr)}
 
-        if mtype == 'artist':
+        # A Spotify artist (or any Spotify link) has no FLAC and no enumerator, so
+        # it always goes through the ISRC-probe path below, never the union path.
+        if mtype == 'artist' and src_service in ALL_SERVICES:
             # ---- artist name (cheap; for logging + name-search fallback) ----
             artist_name = artist_name_of(core, src_service, mid)
             if artist_name:
