@@ -1,14 +1,102 @@
-# OrpheusDL (fork np3ir)
+# OrpheusDL (np3ir fork)
 
-Descarga música en **FLAC (máxima calidad)** desde **Tidal, Deezer, Qobuz y Spotify**.
-Pegas un enlace y lo baja. Con un comando extra (`abq`) baja **toda la discografía de
-un artista** eligiendo, tema por tema, el servicio que tenga el **mejor FLAC**.
+Download music in **FLAC (top quality)** from **Tidal, Deezer, Qobuz and Spotify**.
+Paste a link and it downloads. With one extra command (`abq`) it downloads a whole
+**artist, album, playlist or track**, picking — track by track — the service with
+the **best FLAC**.
 
+**[English](#english) · [Español](#español)**
+
+> You need your own accounts for those services (a subscription for hi-res).
 > Necesitas tus propias cuentas de esos servicios (con suscripción para el hi-res).
 
 ---
 
-## 1) Instalar en Windows (paso a paso)
+## English
+
+### 1) Install on Windows (step by step)
+
+**Step A — install 3 programs** (once). Easiest: open **PowerShell** and paste:
+
+```powershell
+winget install Git.Git Python.Python.3.13 Gyan.FFmpeg
+```
+
+When it finishes, **close and reopen PowerShell** so it picks up what you installed.
+
+> No `winget`? Download them by hand: [Git](https://git-scm.com/download/win),
+> [Python 3.13](https://www.python.org/downloads/) (tick *"Add python.exe to PATH"*),
+> [FFmpeg](https://www.gyan.dev/ffmpeg/builds/).
+
+**Step B — download and install OrpheusDL.** Paste this in PowerShell:
+
+```powershell
+git clone https://github.com/np3ir/orpheusdl.git
+cd orpheusdl
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+When it says **"Ready"**, **open a new terminal** and the commands work from any folder.
+
+### 2) Add your accounts
+
+Open the config file and fill in your details for each service:
+
+```powershell
+notepad "$HOME\orpheusdl\config\settings.json"
+```
+
+Find the `"modules"` section and fill in the user/password or tokens for Qobuz,
+Tidal, Deezer and/or Spotify. Save and close. (That file is private and is **not**
+uploaded to GitHub.)
+
+### 3) Use
+
+**`orpheus`** — download whatever the link points to (track, album, playlist or artist):
+
+```powershell
+orpheus "https://open.qobuz.com/track/441053229"
+```
+
+**`abq`** — download an **artist, album, playlist or track** as the best FLAC,
+searching all three services by ISRC (it picks, per track, where the best quality is):
+
+```powershell
+abq "https://tidal.com/artist/10411"           # a whole artist
+abq "https://www.deezer.com/album/1603029"     # an album
+abq "https://www.deezer.com/playlist/123456"   # a playlist
+abq "https://tidal.com/browse/track/96594261"  # a single track
+```
+
+Tip: add `--dry` to **preview** what it would download, without downloading anything.
+
+Choose quality (optional): `-q best` (default, the best) · `-q 24` (hi-res) · `-q 16` (CD).
+Full `abq` guide: [docs/ARTIST_BEST_QUALITY.md](docs/ARTIST_BEST_QUALITY.md).
+
+Everything is saved to the folder in `download_path` (in the config). You can stop
+with **Ctrl-C** anytime; running it again skips what's already downloaded.
+
+### Update to the latest version
+
+```powershell
+cd $HOME\orpheusdl
+git pull
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -RegisterCommandOnly
+```
+
+### If something doesn't work
+
+- **"orpheus/abq not recognized"** → open a **new terminal** (or restart Windows Terminal).
+- Put the URL **in quotes** and without brackets: `"https://..."`, not `[text](url)`.
+- Install **FFmpeg** and open a new terminal if it asks for it.
+- More help: [docs/WINDOWS_COMMAND.md](docs/WINDOWS_COMMAND.md) ·
+  [manual install](docs/INSTALL_WINDOWS.md).
+
+---
+
+## Español
+
+### 1) Instalar en Windows (paso a paso)
 
 **Paso A — Instala 3 programas** (una sola vez). Lo más fácil: abre **PowerShell** y pega:
 
@@ -33,9 +121,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 Al terminar dirá **"Ready"**. **Abre una terminal nueva** y ya puedes usar los comandos
 desde cualquier carpeta.
 
----
-
-## 2) Poner tus cuentas
+### 2) Poner tus cuentas
 
 Abre el archivo de configuración y escribe tus datos de cada servicio:
 
@@ -46,9 +132,7 @@ notepad "$HOME\orpheusdl\config\settings.json"
 Busca la sección `"modules"` y rellena usuario/contraseña o tokens de Qobuz, Tidal,
 Deezer y/o Spotify. Guarda y cierra. (Ese archivo es privado y **no** se sube a GitHub.)
 
----
-
-## 3) Usar
+### 3) Usar
 
 **`orpheus`** — baja lo que sea del enlace (canción, álbum, playlist o artista):
 
@@ -60,27 +144,21 @@ orpheus "https://open.qobuz.com/track/441053229"
 3 servicios por ISRC (elige, tema por tema, dónde está la mejor calidad):
 
 ```powershell
-abq "https://tidal.com/artist/10411"          # artista completo
-abq "https://www.deezer.com/album/1603029"    # un álbum
-abq "https://www.deezer.com/playlist/123456"  # una playlist
-abq "https://tidal.com/browse/track/96594261" # un solo tema
+abq "https://tidal.com/artist/10411"           # artista completo
+abq "https://www.deezer.com/album/1603029"     # un álbum
+abq "https://www.deezer.com/playlist/123456"   # una playlist
+abq "https://tidal.com/browse/track/96594261"  # un solo tema
 ```
 
-Truco: añade `--dry` para **ver primero** qué bajaría, sin descargar nada:
-
-```powershell
-abq "https://tidal.com/artist/10411" --dry
-```
+Truco: añade `--dry` para **ver primero** qué bajaría, sin descargar nada.
 
 Elegir calidad (opcional): `-q best` (por defecto, la mejor) · `-q 24` (hi-res) · `-q 16` (CD).
 Guía completa de `abq`: [docs/ARTIST_BEST_QUALITY.md](docs/ARTIST_BEST_QUALITY.md).
 
-Todo se guarda en la carpeta que pusiste en `download_path` (por defecto en la config).
+Todo se guarda en la carpeta que pusiste en `download_path` (en la config).
 Puedes cortar con **Ctrl-C** cuando quieras; al volver a lanzarlo salta lo ya descargado.
 
----
-
-## Actualizar a la última versión
+### Actualizar a la última versión
 
 ```powershell
 cd $HOME\orpheusdl
@@ -88,7 +166,7 @@ git pull
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -RegisterCommandOnly
 ```
 
-## Si algo no funciona
+### Si algo no funciona
 
 - **"orpheus/abq no se reconoce"** → abre una **terminal nueva** (o reinicia Windows Terminal).
 - Pega la URL **entre comillas** y sin corchetes: `"https://..."`, no `[texto](url)`.
@@ -99,43 +177,44 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -RegisterComma
 ---
 
 <details>
-<summary><b>Detalles técnicos (avanzado)</b></summary>
+<summary><b>Technical details (advanced) · Detalles técnicos</b></summary>
 
-Fork de [OrpheusDL](https://github.com/bascurtiz/OrpheusDL) (basado en OrfiTeam/OrpheusDL),
-orientado a **construir una biblioteca grande, limpia y de alta calidad**, priorizando
-corrección y seguridad de la cuenta sobre la velocidad.
+A hardened, quality-first fork of [OrpheusDL](https://github.com/bascurtiz/OrpheusDL)
+(based on OrfiTeam/OrpheusDL), tuned for **building a large, clean, high-quality
+library automatically**, where correctness and account safety matter more than speed.
 
-### Lo que añade este fork
-- **Límite de peticiones por servicio** (`utils/rate_limit.py`, `modules.<svc>.rate_limit_rpm`):
-  espacia las peticiones de API para no disparar detección de la cuenta. `0` = desactivado.
-  El audio se descarga a toda velocidad; solo se limita la metadata.
-- **Solo FLAC** (`global.codecs.flac_only`, por defecto `true`): los módulos rechazan
-  transferencias que no sean FLAC.
-- **De-duplicación por ISRC entre servicios**: reutiliza la carpeta del álbum cuando los
-  temas coinciden por ISRC (evita copias `(2)/(3)` de la misma grabación).
-- **Índice ISRC de la biblioteca** (opt-in): ver [docs/DEDUPE_OPERATIONS.md](docs/DEDUPE_OPERATIONS.md)
-  y [docs/DEDUPE_DESIGN.md](docs/DEDUPE_DESIGN.md).
-- **Config a prueba de fallos**: `settings.json` se escribe de forma atómica con copia `.bak`.
-- **`artist_best_quality.py` (comando `abq`)**: artista → mejor FLAC entre Qobuz/Tidal/Deezer
-  por ISRC (unión de los 3, dedup y selección de calidad). Config permanente en
-  `settings.json → global.artist_best_quality`. Ver [docs/ARTIST_BEST_QUALITY.md](docs/ARTIST_BEST_QUALITY.md).
+### What this fork adds
+- **Per-service rate limiting** (`utils/rate_limit.py`, `modules.<svc>.rate_limit_rpm`):
+  spaces API requests so an account is not flagged. `0` = disabled. Only metadata is
+  paced; audio streams at full speed.
+- **FLAC-only** (`global.codecs.flac_only`, default `true`): the modules refuse
+  non-FLAC transfers.
+- **Cross-service ISRC de-duplication**: reuses an album folder when tracks match by
+  ISRC (avoids `(2)/(3)` copies of the same recording).
+- **Library-wide ISRC index** (opt-in): see [docs/DEDUPE_OPERATIONS.md](docs/DEDUPE_OPERATIONS.md)
+  and [docs/DEDUPE_DESIGN.md](docs/DEDUPE_DESIGN.md).
+- **Crash-safe config**: `settings.json` is written atomically with a `.bak` copy.
+- **`artist_best_quality.py` (command `abq`)**: any Tidal/Deezer/Qobuz link
+  (artist/album/playlist/track) → best FLAC across the three services by ISRC.
+  Permanent options in `settings.json → global.artist_best_quality`. See
+  [docs/ARTIST_BEST_QUALITY.md](docs/ARTIST_BEST_QUALITY.md).
 
-### Los dos comandos
-Los lanzadores `orpheus.cmd` y `abq.cmd` viven en la carpeta de instalación, que el
-instalador añade a tu PATH; por eso ambos funcionan desde cualquier carpeta. En Linux/macOS
-usa el equivalente `python orpheus.py <url>` / `python artist_best_quality.py <url>`.
+### The two commands
+`orpheus.cmd` and `abq.cmd` live in the install folder, which the installer adds to
+PATH, so both commands work from anywhere. On Linux/macOS use the equivalents
+`python orpheus.py <url>` / `python artist_best_quality.py <url>`.
 
-### Módulos de servicio (repos separados)
-El instalador los clona en `modules/` automáticamente. Para instalación manual:
+### Service modules (separate repos)
+The installer clones them into `modules/` automatically. For a manual install:
 
-| Módulo | Repo | Rama |
+| Module | Repo | Branch |
 |---|---|---|
 | Qobuz  | [np3ir/orpheusdl-qobuz](https://github.com/np3ir/orpheusdl-qobuz)   | `feat/rate-limit-flac-only` |
 | Deezer | [np3ir/OrpheusDL-deezer](https://github.com/np3ir/OrpheusDL-deezer) | `feat/rate-limit-flac-only` |
 | Tidal  | [np3ir/orpheusdl-tidal](https://github.com/np3ir/orpheusdl-tidal)   | `feat/rate-limit-flac-only` |
 | Spotify| [np3ir/orpheusdl-spotify](https://github.com/np3ir/orpheusdl-spotify) | `codex/flac-only` |
 
-### Instalación manual (Linux/macOS o sin `install.ps1`)
+### Manual installation (Linux/macOS or without `install.ps1`)
 ```bash
 git clone https://github.com/np3ir/orpheusdl.git
 cd orpheusdl
@@ -145,19 +224,19 @@ git clone --recurse-submodules -b feat/rate-limit-flac-only https://github.com/n
 git clone -b codex/flac-only https://github.com/np3ir/orpheusdl-spotify.git modules/spotify
 python -m venv .venv && source .venv/bin/activate
 python -m pip install -r requirements-core.txt
-python orpheus.py <url>            # el primer arranque crea config/settings.json
+python orpheus.py <url>            # the first run creates config/settings.json
 ```
 
-### Configuración clave (`config/settings.json`)
-- `general.download_path` — carpeta de la biblioteca (p. ej. `Z:\`).
+### Key configuration (`config/settings.json`)
+- `general.download_path` — library root (e.g. `Z:\`).
 - `general.download_quality` — `lossless`.
-- `codecs.flac_only` — rechazar lo que no sea FLAC.
-- `global.artist_best_quality` — opciones de `abq` (`default_quality`, `prefer_order`, …).
-- `modules.<servicio>.rate_limit_rpm` — ritmo de peticiones por servicio.
+- `codecs.flac_only` — refuse non-FLAC transfers.
+- `global.artist_best_quality` — `abq` options (`default_quality`, `prefer_order`, …).
+- `modules.<service>.rate_limit_rpm` — per-service request pacing.
 
-### Créditos
-Upstream: [bascurtiz/OrpheusDL](https://github.com/bascurtiz/OrpheusDL) y
-[OrfiTeam/OrpheusDL](https://github.com/OrfiTeam/OrpheusDL). Uso personal, sin ánimo de
-lucro; respeta los términos de servicio de cada plataforma.
+### Credits
+Upstream: [bascurtiz/OrpheusDL](https://github.com/bascurtiz/OrpheusDL) and
+[OrfiTeam/OrpheusDL](https://github.com/OrfiTeam/OrpheusDL). For personal, lossless,
+quality-first archival use — respect each platform's terms of service.
 
 </details>
