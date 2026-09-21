@@ -129,6 +129,16 @@ class Orpheus:
                 "merge_same_name_albums": False,
                 "explicit_content": "prefer_explicit",
             },
+            # Used by artist_best_quality.py: download an artist as best-quality FLAC
+            # across services, matched by ISRC. default_quality: best|hires|lossless
+            # (or 24/16). prefer_order breaks quality ties / picks the 16-bit source.
+            "artist_best_quality": {
+                "default_quality": "best",
+                "prefer_order": ["qobuz", "tidal", "deezer"],
+                "dedup_with_library": True,
+                "library_root": "",
+                "credited_albums": False,
+            },
             "formatting": {
                 "discography_format": "{name} {quality}",
                 "album_format": "{artist}/{name}",

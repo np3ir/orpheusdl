@@ -58,6 +58,11 @@ function Install-Orpheus {
     if (-not (Test-Path -LiteralPath $entryPoint) -or -not (Test-Path -LiteralPath $launcher)) {
         throw 'Run this installer from a complete OrpheusDL checkout.'
     }
+    # Second command: abq (artist_best_quality.py). Soft check so an older
+    # checkout without it still installs the orpheus command normally.
+    $abqEntry = Join-Path $InstallRoot 'artist_best_quality.py'
+    $abqLauncher = Join-Path $InstallRoot 'abq.cmd'
+    $abqAvailable = (Test-Path -LiteralPath $abqEntry) -and (Test-Path -LiteralPath $abqLauncher)
     # Inspect current state before making any PATH/config changes.
     $oldUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $oldProcessPath = $env:Path
@@ -96,6 +101,10 @@ function Install-Orpheus {
             Invoke-OrpheusChecked $python @('-m', 'pip', 'install', '-r', 'requirements-core.txt')
             Invoke-OrpheusChecked $python @('-m', 'pip', 'check')
             Invoke-OrpheusChecked $python @('orpheus.py', '--help')
+            if ($abqAvailable) {
+                Invoke-OrpheusChecked $python @('artist_best_quality.py', '--help')
+                $steps.Add('abq (artist_best_quality) checked')
+            }
             $steps.Add('Dependencies and CLI checked')
             $settings = Join-Path $InstallRoot 'config\settings.json'
             $newSettings = -not (Test-Path -LiteralPath $settings)
@@ -138,6 +147,9 @@ function Install-Orpheus {
             Write-Host 'Ready. Open a NEW terminal (restart Windows Terminal if necessary), then run:'
         }
         Write-Host '  orpheus "https://open.qobuz.com/track/441053229"'
+        if ($abqAvailable) {
+            Write-Host '  abq     "https://tidal.com/artist/10411"        # el artista completo, al mejor FLAC entre servicios'
+        }
         Write-Host 'Use a plain URL, not [text](URL). Configure your account in config/settings.json.'
         Write-Host 'Existing terminals may still have their old PATH. No permanent execution-policy change was made.'
     } finally {
