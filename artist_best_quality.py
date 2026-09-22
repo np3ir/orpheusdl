@@ -223,8 +223,38 @@ class Core:
 # --------------------------------------------------------------------------- #
 # Discography enumeration  ->  {isrc: (track_id, bit_depth, sample_rate)}
 # --------------------------------------------------------------------------- #
-def enumerate_qobuz(session, artist_id, credited, max_albums=0):
+def _artist_on_track(track, service, artist_id):
+    """True if `artist_id` actually performs on this track. Filters out other
+    artists' tracks that ride along on compilations / Various-Artists albums that
+    a service happens to list under the artist."""
+    aid = str(artist_id)
+    ids = set()
+    if service == 'qobuz':
+        p = track.get('performer') or {}
+        if p.get('id') is not None:
+            ids.add(str(p['id']))
+        for a in (track.get('artists') or []):
+            if isinstance(a, dict) and a.get('id') is not None:
+                ids.add(str(a['id']))
+    elif service == 'tidal':
+        arts = track.get('artists') or ([track.get('artist')] if track.get('artist') else [])
+        for a in arts:
+            if isinstance(a, dict) and a.get('id') is not None:
+                ids.add(str(a['id']))
+    elif service == 'deezer':
+        if track.get('ART_ID') is not None:
+            ids.add(str(track['ART_ID']))
+        for a in (track.get('ARTISTS') or []):
+            if isinstance(a, dict) and a.get('ART_ID') is not None:
+                ids.add(str(a['ART_ID']))
+    if not ids:
+        return True  # no artist data on the track -> don't over-filter
+    return aid in ids
+
+
+def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=True):
     out = {}
+    skipped = 0
     artist = call_timeout(lambda: session.get_artist(str(artist_id)), 60,
                           default=None, label='qobuz get_artist')
     if not artist:
@@ -249,14 +279,21 @@ def enumerate_qobuz(session, artist_id, credited, max_albums=0):
         for tr in (data.get('tracks') or {}).get('items') or []:
             isrc = (tr.get('isrc') or '').strip().upper()
             tid = tr.get('id')
-            if isrc and tid is not None:
-                _keep_best(out, isrc, (str(tid), int(bd), float(sr)))
+            if not (isrc and tid is not None):
+                continue
+            if artist_filter and not _artist_on_track(tr, 'qobuz', artist_id):
+                skipped += 1
+                continue
+            _keep_best(out, isrc, (str(tid), int(bd), float(sr)))
         time.sleep(0.1)
+    if skipped:
+        log(f'  qobuz: skipped {skipped} track(s) not performed by this artist')
     return out
 
 
-def enumerate_tidal(session, artist_id, credited, max_albums=0):
+def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=True):
     out = {}
+    skipped = 0
     album_ids = []
     for fn in ('get_artist_albums', 'get_artist_albums_ep_singles'):
         res = call_timeout(lambda fn=fn: getattr(session, fn)(str(artist_id)), 45,
@@ -278,14 +315,21 @@ def enumerate_tidal(session, artist_id, credited, max_albums=0):
             isrc = (item.get('isrc') or '').strip().upper()
             tid = item.get('id')
             bd, sr = tidal_quality(item.get('audioQuality'))
-            if isrc and tid is not None and bd:  # bd==0 -> lossy, not a FLAC source
-                _keep_best(out, isrc, (str(tid), bd, sr))
+            if not (isrc and tid is not None and bd):  # bd==0 -> lossy, not a FLAC source
+                continue
+            if artist_filter and not _artist_on_track(item, 'tidal', artist_id):
+                skipped += 1
+                continue
+            _keep_best(out, isrc, (str(tid), bd, sr))
         time.sleep(0.1)
+    if skipped:
+        log(f'  tidal: skipped {skipped} track(s) not performed by this artist')
     return out
 
 
-def enumerate_deezer(session, artist_id, credited, max_albums=0):
+def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=True):
     out = {}
+    skipped = 0
     album_ids, start, page = [], 0, 200
     while True:
         batch = call_timeout(
@@ -315,10 +359,15 @@ def enumerate_deezer(session, artist_id, credited, max_albums=0):
             if not isrc:
                 missing_isrc += 1
                 continue
+            if artist_filter and not _artist_on_track(tr, 'deezer', artist_id):
+                skipped += 1
+                continue
             _keep_best(out, isrc, (str(tid), 16, 44.1))  # Deezer FLAC = 16/44.1
         time.sleep(0.1)
     if missing_isrc:
         log(f'  deezer: {missing_isrc} tracks had no ISRC in album data (skipped for discovery)')
+    if skipped:
+        log(f'  deezer: skipped {skipped} track(s) not performed by this artist')
     return out
 
 
@@ -690,6 +739,9 @@ def main():
     ap.add_argument('--limit', type=int, default=0, help='Only process the first N recordings (for testing).')
     ap.add_argument('--max-albums', type=int, default=0,
                     help='Only read the first N albums per service (sampling/testing; 0 = all).')
+    ap.add_argument('--all-album-tracks', action='store_true',
+                    help='(artist links) keep every track on the artist\'s albums, including '
+                         'other artists\' tracks on compilations. Default: only tracks the artist performs.')
     ap.add_argument('--dry', action='store_true', help='Show the plan (service + quality per track); download nothing.')
     args = ap.parse_args()
 
@@ -742,7 +794,8 @@ def main():
             # ---- enumerate the source discography ----
             log(f'\nEnumerating {src_service} discography...')
             per_service = {src_service: ENUMERATORS[src_service](
-                core.session(src_service), mid, credited, args.max_albums)}
+                core.session(src_service), mid, credited, args.max_albums,
+                not args.all_album_tracks)}
             log(f'  {src_service}: {len(per_service[src_service])} recordings with ISRC')
 
             src_set = set(per_service[src_service].keys())
@@ -757,7 +810,8 @@ def main():
                 if not aid:
                     continue
                 log(f'Enumerating {svc} discography...')
-                mp = ENUMERATORS[svc](core.session(svc), aid, credited, args.max_albums)
+                mp = ENUMERATORS[svc](core.session(svc), aid, credited, args.max_albums,
+                                      not args.all_album_tracks)
                 # Verify a name-resolved artist really is the same person: its ISRCs
                 # must overlap the source. Guards the union against a same-name match.
                 if method == 'name' and src_set and mp:

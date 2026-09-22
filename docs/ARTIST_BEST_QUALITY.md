@@ -85,6 +85,7 @@ python artist_best_quality.py "https://tidal.com/artist/10411"
 | `-o PATH` | output path (default: `download_path` from settings) |
 | `--limit N` | only process the first N recordings (testing) |
 | `--max-albums N` | (artist links) only read the first N albums per service (sampling/testing) |
+| `--all-album-tracks` | (artist links) keep other artists' tracks that ride along on compilations (default: only tracks the artist actually performs) |
 | `--dry` | show the plan, download nothing |
 
 ### Permanent configuration (settings.json)
@@ -128,10 +129,12 @@ skip). Positive matches are re-verified against the real file on disk.
   `settings.json`). Hi-res from Qobuz/Tidal also requires a subscription that
   allows it; otherwise those services deliver 16-bit and the tool downloads that.
 - Deezer FLAC is always 16-bit/44.1 kHz; Qobuz and Tidal can be hi-res.
-- For an **artist** link, a recording is compared only on services where it appears
-  in the resolved artist's discography; a copy hiding on an unrelated compilation
-  isn't probed. Album/playlist/track links look every ISRC up directly on all
-  services.
+- For an **artist** link, only tracks the artist **actually performs** are kept:
+  other artists' tracks that ride along on compilations / Various-Artists albums
+  listed under the artist are skipped (override with `--all-album-tracks`). A
+  recording is compared only on services where it appears in the resolved artist's
+  discography; a copy hiding on an unrelated compilation isn't probed. Album,
+  playlist and track links look every ISRC up directly on all services.
 - Deezer tracks whose album/playlist payload carries no ISRC are skipped for
   *discovery* (they can still be a fallback source when found via another service).
 
@@ -220,6 +223,7 @@ python artist_best_quality.py "https://tidal.com/artist/10411"
 | `-o RUTA` | carpeta de salida (por defecto: `download_path` de la config) |
 | `--limit N` | procesar solo las primeras N grabaciones (pruebas) |
 | `--max-albums N` | (enlaces de artista) leer solo los primeros N álbumes por servicio (muestreo/pruebas) |
+| `--all-album-tracks` | (enlaces de artista) conservar temas de otros artistas que vienen en recopilatorios (por defecto: solo los que interpreta el artista) |
 | `--dry` | mostrar el plan, sin descargar |
 
 ### Configuración permanente (settings.json)
@@ -263,9 +267,12 @@ Los positivos se re-verifican contra el archivo real en disco.
   `settings.json`). El hi-res de Qobuz/Tidal también necesita una suscripción que
   lo permita; si no, esos servicios entregan 16-bit y eso se descarga.
 - El FLAC de Deezer es siempre 16-bit/44.1 kHz; Qobuz y Tidal pueden ser hi-res.
-- En un enlace de **artista**, una grabación se compara solo en los servicios donde
-  aparece en la discografía del artista resuelto; una copia escondida en una
-  recopilación ajena no se sondea. Los enlaces de álbum/playlist/track buscan cada
-  ISRC directamente en todos los servicios.
+- En un enlace de **artista**, solo se conservan los temas que el artista
+  **realmente interpreta**: los temas de otros artistas que vienen en recopilatorios
+  / álbumes Various Artists listados bajo el artista se saltan (se puede forzar con
+  `--all-album-tracks`). Una grabación se compara solo en los servicios donde aparece
+  en la discografía del artista resuelto; una copia escondida en una recopilación
+  ajena no se sondea. Los enlaces de álbum/playlist/track buscan cada ISRC
+  directamente en todos los servicios.
 - Los temas de Deezer cuyo álbum/playlist no traiga ISRC se saltan para el
   *descubrimiento* (aún pueden servir como fuente si se encuentran vía otro servicio).
