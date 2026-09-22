@@ -78,7 +78,7 @@ class IsrcLibraryIndex:
 
     # ---- the scan ----
     def _iter_audio(self):
-        for dirpath, dirs, files in os.walk(self.root, onerror=self._scan_error):
+        for dirpath, dirs, files in os.walk(self.root, onerror=self._walk_error):
             # Never index the dedupe quarantine — moved-aside copies must not
             # re-count as library duplicates.
             dirs[:] = [d for d in dirs if d.lower() != '_duplicados' and not os.path.islink(os.path.join(dirpath, d))]
@@ -87,7 +87,17 @@ class IsrcLibraryIndex:
                 if ext in AUDIO_EXT and not name.startswith('.orpheus-'):
                     yield os.path.join(dirpath, name)
 
+    def _walk_error(self, error):
+        # A directory could not be listed -> the traversal is incomplete, so some
+        # files never enter `seen`. Pruning would then wrongly delete them. This is
+        # the only kind of error that must block completion/pruning.
+        self._walk_errors.append(str(error))
+
     def _scan_error(self, error):
+        # A single file could not be read/verified this round (transient NAS hiccup,
+        # untagged/corrupt file, or a file changing mid-scan). It is still in `seen`,
+        # so it is never pruned; it just isn't (re)indexed this round. Benign: it is
+        # reported as a warning but does NOT block completion.
         self._scan_errors.append(str(error))
 
     def build(self, force=False, workers=8):
@@ -107,7 +117,8 @@ class IsrcLibraryIndex:
         if not os.path.isdir(self.root):
             self._print(f'  [isrc-index] root no existe: {self.root}')
             return {'error': 'root_missing'}
-        self._scan_errors = []
+        self._scan_errors = []   # benign per-file read failures (do not block completion)
+        self._walk_errors = []   # directory-traversal failures (block prune/completion)
         known = {}
         for path, mtime, size, isrc in self._conn.execute('SELECT path, mtime, size, isrc FROM files'):
             known[path] = (mtime, size, isrc)
@@ -158,10 +169,12 @@ class IsrcLibraryIndex:
                             (path, mtime, size, isrc))
                 done += len(batch)
                 self._print(f'  [isrc-index] {done}/{len(to_read)} tags inspected')
-        # Incomplete NAS walks must not erase previously known entries or mark
-        # an incomplete first build as usable. Re-run explicitly after recovery.
+        # Only an incomplete *traversal* (a directory we couldn't list) must block
+        # pruning/completion: pruning relies on `seen` being the full file set. A
+        # handful of unreadable individual files must NOT keep a 100k-file library
+        # from ever completing -- those files are in `seen`, so they're never pruned.
         removed = 0
-        if not self._scan_errors:
+        if not self._walk_errors:
             with self._mutex, self._conn:
                 for path in known:
                     if path not in seen and not os.path.isfile(path):
@@ -169,10 +182,16 @@ class IsrcLibraryIndex:
                         removed += 1
                 self._meta_set('last_scan', time.time())
                 self._meta_set('root', self.root)
-        return {'total_files': len(seen), 'added': added, 'changed': changed,
-                'removed': removed, 'isrcs': self.isrc_count(),
-                'seconds': round(time.time() - t0, 1),
-                **({'error': 'incomplete_scan', 'errors': self._scan_errors[:10]} if self._scan_errors else {})}
+        stats = {'total_files': len(seen), 'added': added, 'changed': changed,
+                 'removed': removed, 'isrcs': self.isrc_count(),
+                 'seconds': round(time.time() - t0, 1)}
+        if self._walk_errors:
+            stats['error'] = 'incomplete_scan'
+            stats['errors'] = self._walk_errors[:10]
+        if self._scan_errors:
+            stats['read_warnings'] = len(self._scan_errors)
+            stats['read_error_samples'] = self._scan_errors[:5]
+        return stats
 
     def ensure_fresh(self):
         """Compatibility shim: downloads/reports never trigger a full NAS walk.

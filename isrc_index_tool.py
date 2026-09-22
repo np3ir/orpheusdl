@@ -47,26 +47,40 @@ def main():
         if not idx.is_built():
             print('Primer build (leyendo tags del disco, puede tardar en un NAS grande)...')
         stats = idx.build(force=args.force, workers=args.workers)
+
+        def _read_warnings():
+            # Benign per-file read failures (do not block completion).
+            samples = stats.get('read_error_samples') or []
+            if stats.get('read_warnings'):
+                print(f'  AVISO: {stats["read_warnings"]} archivo(s) no se pudieron leer/verificar '
+                      f'esta vez; quedan sin indexar hasta el próximo build.')
+                print('  Note: some files could not be read/verified this run; they will be retried '
+                      'next build.')
+                for e in samples:
+                    print(f'    - {e}')
+
         if stats.get('error') == 'incomplete_scan':
             errs = stats.get('errors') or []
-            print('\nAVISO: escaneo incompleto / incomplete scan.')
-            print('  Los tags leídos SÍ se guardaron; el índice previo sigue en uso, pero no se')
-            print('  actualizó la marca de "escaneo completo" ni se limpiaron archivos borrados.')
-            print('  Read tags WERE saved; the previous complete index stays in use, but the')
-            print('  "last complete scan" mark was not updated and deleted files were not pruned.')
-            print('  Causa habitual / usual cause: archivos que cambian durante el escaneo (una')
-            print('  descarga en curso) o archivos/carpetas del NAS ilegibles. Repite sin descargas')
-            print('  activas / re-run with no active downloads.')
-            other = {k: v for k, v in stats.items() if k not in ('error', 'errors')}
+            print('\nAVISO: recorrido incompleto / incomplete traversal.')
+            print('  No se pudo listar alguna carpeta, así que NO se marcó el escaneo como completo')
+            print('  ni se purgaron archivos borrados (podrían no haberse visto). Los tags leídos')
+            print('  SÍ se guardaron y el índice previo sigue en uso.')
+            print('  A directory could not be listed, so the scan was NOT marked complete and no')
+            print('  deleted files were pruned. Read tags WERE saved; the previous index stays in use.')
+            other = {k: v for k, v in stats.items()
+                     if k not in ('error', 'errors', 'read_error_samples') and not isinstance(v, list)}
             print('  ' + ', '.join(f'{k}={v}' for k, v in other.items()))
             if errs:
-                print(f'  primeros problemas / first issues (max 10 of {stats.get("total_files", "?")}):')
+                print('  carpetas/errores de recorrido / traversal errors:')
                 for e in errs:
                     print(f'    - {e}')
+            _read_warnings()
             idx.close(); return 2
         if stats.get('error'):
             print(f'ERROR: {stats["error"]}'); idx.close(); return 2
-        print('Build OK: ' + ', '.join(f'{k}={v}' for k, v in stats.items()))
+        scalar = {k: v for k, v in stats.items() if isinstance(v, (str, int, float, bool))}
+        print('Build OK: ' + ', '.join(f'{k}={v}' for k, v in scalar.items()))
+        _read_warnings()
     else:
         if not idx.is_built():
             print('ERROR: index not built; run --build explicitly.')
