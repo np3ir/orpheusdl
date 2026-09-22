@@ -85,6 +85,57 @@ album, year, track number, title…). You rarely need to change them.
 | `isrc_fallback` | If a track fails, try to get the same recording from another service (by ISRC). |
 | `spotify_metadata_only` | Never stream audio from Spotify; use it only to read song info. |
 
+#### Placeholders you can use in the name patterns
+Write them exactly like `{name}`. Anything outside `{ }` is kept as-is, e.g.
+`{album_artist}/({release_year}) {name}` → `Nat King Cole/(1957) Love Is the Thing`.
+A `/` starts a new subfolder.
+
+**Album folder** (`album_format`, `discography_format`):
+| Placeholder | Meaning |
+|---|---|
+| `{name}` | Album title |
+| `{artist}` / `{album_artist}` | The album's artist |
+| `{release_year}` | Release year |
+| `{quality}` | Quality badge, e.g. `[🅷 HI-RES]` |
+| `{explicit}` | ` (explicit)` when the album is explicit |
+| `{label}` | Record label |
+| `{catalog_number}` | Catalog number |
+| `{upc}` | Album barcode (UPC) |
+| `{artist_initials}` | First letter of the artist (for A–Z folders) |
+| `{platform}` | Service name (Qobuz/Tidal/…) |
+| `{id}` | Album id on the service |
+
+**Track file name** (`track_filename_format`, `playlist_track_filename_format`, `single_full_path_format`):
+| Placeholder | Meaning |
+|---|---|
+| `{name}` | Song title |
+| `{artist}` | Song artist(s) |
+| `{album}` | Album name |
+| `{album_artist}` | Album's main artist |
+| `{track_number}` / `{total_tracks}` | Track number / total on the disc |
+| `{disc_number}` / `{total_discs}` | Disc number / total discs |
+| `{release_year}` / `{release_date}` | Year / full date |
+| `{genres}` | Genre(s) |
+| `{isrc}` | Recording code (ISRC) |
+| `{upc}` | Album barcode |
+| `{composer}` | Composer |
+| `{label}` / `{catalog_number}` | Label / catalog number |
+| `{quality}` | Codec, e.g. `FLAC` (or a badge for single tracks) |
+| `{explicit}` | ` (explicit)` when explicit |
+| `{playlist_position}` | Position in the playlist |
+| `{platform}` | Service name |
+
+**Playlist folder** (`playlist_format`):
+| Placeholder | Meaning |
+|---|---|
+| `{name}` | Playlist name |
+| `{creator}` | Who made the playlist |
+| `{release_year}` | Year the playlist was created |
+| `{num_tracks}` | Number of songs |
+| `{explicit}` | ` (explicit)` when it contains explicit songs |
+| `{platform}` | Service name |
+| `{id}` | Playlist id |
+
 ### codec_conversion — converting after download
 | Option | What it does |
 |---|---|
@@ -221,6 +272,57 @@ Son patrones de nombre; las palabras entre `{ }` se rellenan solas (artista,
 | `use_album_position` | Numerar los archivos por su posición en el álbum. |
 | `isrc_fallback` | Si una canción falla, intentar la misma grabación en otro servicio (por ISRC). |
 | `spotify_metadata_only` | No transmitir audio de Spotify; usarlo solo para leer la info de las canciones. |
+
+#### Placeholders que puedes usar en los patrones de nombre
+Escríbelos tal cual `{name}`. Lo que esté fuera de `{ }` se mantiene igual, p. ej.
+`{album_artist}/({release_year}) {name}` → `Nat King Cole/(1957) Love Is the Thing`.
+Una `/` crea una subcarpeta.
+
+**Carpeta de álbum** (`album_format`, `discography_format`):
+| Placeholder | Significado |
+|---|---|
+| `{name}` | Título del álbum |
+| `{artist}` / `{album_artist}` | El artista del álbum |
+| `{release_year}` | Año de publicación |
+| `{quality}` | Distintivo de calidad, p. ej. `[🅷 HI-RES]` |
+| `{explicit}` | ` (explicit)` si el álbum es explícito |
+| `{label}` | Sello discográfico |
+| `{catalog_number}` | Número de catálogo |
+| `{upc}` | Código de barras del álbum (UPC) |
+| `{artist_initials}` | Inicial del artista (para carpetas A–Z) |
+| `{platform}` | Nombre del servicio (Qobuz/Tidal/…) |
+| `{id}` | Id del álbum en el servicio |
+
+**Nombre de archivo de pista** (`track_filename_format`, `playlist_track_filename_format`, `single_full_path_format`):
+| Placeholder | Significado |
+|---|---|
+| `{name}` | Título de la canción |
+| `{artist}` | Artista(s) de la canción |
+| `{album}` | Nombre del álbum |
+| `{album_artist}` | Artista principal del álbum |
+| `{track_number}` / `{total_tracks}` | Nº de pista / total del disco |
+| `{disc_number}` / `{total_discs}` | Nº de disco / total de discos |
+| `{release_year}` / `{release_date}` | Año / fecha completa |
+| `{genres}` | Género(s) |
+| `{isrc}` | Código de grabación (ISRC) |
+| `{upc}` | Código de barras del álbum |
+| `{composer}` | Compositor |
+| `{label}` / `{catalog_number}` | Sello / número de catálogo |
+| `{quality}` | Códec, p. ej. `FLAC` (o distintivo en temas sueltos) |
+| `{explicit}` | ` (explicit)` si es explícito |
+| `{playlist_position}` | Posición en la playlist |
+| `{platform}` | Nombre del servicio |
+
+**Carpeta de playlist** (`playlist_format`):
+| Placeholder | Significado |
+|---|---|
+| `{name}` | Nombre de la playlist |
+| `{creator}` | Quién creó la playlist |
+| `{release_year}` | Año de creación de la playlist |
+| `{num_tracks}` | Número de canciones |
+| `{explicit}` | ` (explicit)` si contiene temas explícitos |
+| `{platform}` | Nombre del servicio |
+| `{id}` | Id de la playlist |
 
 ### codec_conversion — convertir tras descargar
 | Opción | Qué hace |
