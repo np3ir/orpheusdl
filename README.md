@@ -50,6 +50,9 @@ Find the `"modules"` section and fill in the user/password or tokens for Qobuz,
 Tidal, Deezer and/or Spotify. Save and close. (That file is private and is **not**
 uploaded to GitHub.)
 
+Every option in that file is explained in plain language here:
+[docs/SETTINGS.md](docs/SETTINGS.md).
+
 ### 3) Use
 
 **`orpheus`** — download whatever the link points to (track, album, playlist or artist):
@@ -135,6 +138,9 @@ notepad "$HOME\orpheusdl\config\settings.json"
 
 Busca la sección `"modules"` y rellena usuario/contraseña o tokens de Qobuz, Tidal,
 Deezer y/o Spotify. Guarda y cierra. (Ese archivo es privado y **no** se sube a GitHub.)
+
+Cada opción de ese archivo está explicada en lenguaje sencillo aquí:
+[docs/SETTINGS.md](docs/SETTINGS.md).
 
 ### 3) Usar
 
