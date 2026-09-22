@@ -47,6 +47,23 @@ def main():
         if not idx.is_built():
             print('Primer build (leyendo tags del disco, puede tardar en un NAS grande)...')
         stats = idx.build(force=args.force, workers=args.workers)
+        if stats.get('error') == 'incomplete_scan':
+            errs = stats.get('errors') or []
+            print('\nAVISO: escaneo incompleto / incomplete scan.')
+            print('  Los tags leídos SÍ se guardaron; el índice previo sigue en uso, pero no se')
+            print('  actualizó la marca de "escaneo completo" ni se limpiaron archivos borrados.')
+            print('  Read tags WERE saved; the previous complete index stays in use, but the')
+            print('  "last complete scan" mark was not updated and deleted files were not pruned.')
+            print('  Causa habitual / usual cause: archivos que cambian durante el escaneo (una')
+            print('  descarga en curso) o archivos/carpetas del NAS ilegibles. Repite sin descargas')
+            print('  activas / re-run with no active downloads.')
+            other = {k: v for k, v in stats.items() if k not in ('error', 'errors')}
+            print('  ' + ', '.join(f'{k}={v}' for k, v in other.items()))
+            if errs:
+                print(f'  primeros problemas / first issues (max 10 of {stats.get("total_files", "?")}):')
+                for e in errs:
+                    print(f'    - {e}')
+            idx.close(); return 2
         if stats.get('error'):
             print(f'ERROR: {stats["error"]}'); idx.close(); return 2
         print('Build OK: ' + ', '.join(f'{k}={v}' for k, v in stats.items()))
