@@ -43,6 +43,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from urllib.parse import urlparse
 
 import requests
@@ -150,6 +151,7 @@ def abq_config(settings):
     cfg.setdefault('dedup_with_library', True)
     cfg.setdefault('library_root', '')
     cfg.setdefault('credited_albums', False)
+    cfg.setdefault('own_albums_only', False)
     # keep only known services, preserve order, append any missing
     order = [s for s in cfg['prefer_order'] if s in ALL_SERVICES]
     for s in ALL_SERVICES:
@@ -223,11 +225,13 @@ class Core:
 # --------------------------------------------------------------------------- #
 # Discography enumeration  ->  {isrc: (track_id, bit_depth, sample_rate)}
 # --------------------------------------------------------------------------- #
-def _artist_on_track(track, service, artist_id):
-    """True if `artist_id` actually performs on this track. Filters out other
-    artists' tracks that ride along on compilations / Various-Artists albums that
-    a service happens to list under the artist."""
-    aid = str(artist_id)
+def _norm(s):
+    """Casefold + strip accents/punctuation for tolerant name comparison."""
+    s = unicodedata.normalize('NFKD', str(s or '')).encode('ascii', 'ignore').decode('ascii')
+    return ' '.join(''.join(c if c.isalnum() else ' ' for c in s.lower()).split())
+
+
+def _track_artist_ids(track, service):
     ids = set()
     if service == 'qobuz':
         p = track.get('performer') or {}
@@ -247,14 +251,102 @@ def _artist_on_track(track, service, artist_id):
         for a in (track.get('ARTISTS') or []):
             if isinstance(a, dict) and a.get('ART_ID') is not None:
                 ids.add(str(a['ART_ID']))
-    if not ids:
+    return ids
+
+
+def _track_artist_names(track, service):
+    names = set()
+    if service == 'qobuz':
+        p = track.get('performer') or {}
+        if p.get('name'):
+            names.add(p['name'])
+        for a in (track.get('artists') or []):
+            if isinstance(a, dict) and a.get('name'):
+                names.add(a['name'])
+        perf = track.get('performers')
+        if isinstance(perf, str):
+            for chunk in perf.split(' - '):
+                nm = chunk.split(',')[0].strip()
+                if nm:
+                    names.add(nm)
+    elif service == 'tidal':
+        arts = track.get('artists') or ([track.get('artist')] if track.get('artist') else [])
+        for a in arts:
+            if isinstance(a, dict) and a.get('name'):
+                names.add(a['name'])
+    elif service == 'deezer':
+        if track.get('ART_NAME'):
+            names.add(track['ART_NAME'])
+        for a in (track.get('ARTISTS') or []):
+            if isinstance(a, dict) and a.get('ART_NAME'):
+                names.add(a['ART_NAME'])
+    return {_norm(n) for n in names if n}
+
+
+def _name_matches(target_norm, name_norm):
+    """Tolerant artist-name match. Handles alias entities like 'Nat King Cole' vs
+    'Nat King Cole Trio' / 'The King Cole Trio' (shared name tokens) while still
+    rejecting a genuinely different artist (e.g. 'Lester Young')."""
+    if not target_norm or not name_norm:
+        return False
+    if target_norm == name_norm:
+        return True
+    if target_norm in name_norm or name_norm in target_norm:
+        return True
+    tt = set(target_norm.split())
+    nt = set(name_norm.split())
+    if not tt:
+        return False
+    overlap = len(tt & nt)
+    # keep when at least half of the target's name tokens appear in the credit
+    return overlap >= 1 and overlap / len(tt) >= 0.5
+
+
+def _artist_on_track(track, service, artist_id, artist_name=None):
+    """True if the target artist actually performs on this track. Keeps the track
+    when it matches by artist **id** or by a tolerant **name** match (robust to a
+    service's variant artist ids/aliases, e.g. Deezer tagging 'Nat King Cole Trio'
+    with a different ART_ID). Filters out other artists' tracks that ride along on
+    compilations / Various-Artists albums."""
+    if str(artist_id) in _track_artist_ids(track, service):
+        return True
+    names = _track_artist_names(track, service)
+    if artist_name and names:
+        tn = _norm(artist_name)
+        if any(_name_matches(tn, n) for n in names):
+            return True
+    if not names and not _track_artist_ids(track, service):
         return True  # no artist data on the track -> don't over-filter
-    return aid in ids
+    return False
 
 
-def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=True):
+def _album_artist_ids(album_obj, service):
+    """Artist id(s) credited to the whole album (not per track)."""
+    ids = set()
+    if not isinstance(album_obj, dict):
+        return ids
+    if service in ('qobuz', 'tidal'):
+        a = album_obj.get('artist') or {}
+        if a.get('id') is not None:
+            ids.add(str(a['id']))
+        for x in (album_obj.get('artists') or []):
+            if isinstance(x, dict) and x.get('id') is not None:
+                ids.add(str(x['id']))
+    elif service == 'deezer':
+        d = album_obj.get('DATA') if isinstance(album_obj.get('DATA'), dict) else album_obj
+        if d.get('ART_ID') is not None:
+            ids.add(str(d['ART_ID']))
+        for x in (d.get('ARTISTS') or []):
+            if isinstance(x, dict) and x.get('ART_ID') is not None:
+                ids.add(str(x['ART_ID']))
+    return ids
+
+
+def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=True,
+                    own_albums_only=False, artist_name=None):
     out = {}
     skipped = 0
+    skipped_albums = 0
     artist = call_timeout(lambda: session.get_artist(str(artist_id)), 60,
                           default=None, label='qobuz get_artist')
     if not artist:
@@ -272,6 +364,11 @@ def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=Tr
                             default=None, label=f'qobuz album {aid}')
         if not data:
             continue
+        if own_albums_only:
+            aids = _album_artist_ids(data, 'qobuz')
+            if aids and str(artist_id) not in aids:
+                skipped_albums += 1
+                continue
         bd = data.get('maximum_bit_depth') or 16
         sr = data.get('maximum_sampling_rate') or 44.1
         if not data.get('hires_streamable', False):
@@ -281,29 +378,42 @@ def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=Tr
             tid = tr.get('id')
             if not (isrc and tid is not None):
                 continue
-            if artist_filter and not _artist_on_track(tr, 'qobuz', artist_id):
+            if artist_filter and not _artist_on_track(tr, 'qobuz', artist_id, artist_name):
                 skipped += 1
                 continue
             _keep_best(out, isrc, (str(tid), int(bd), float(sr)))
         time.sleep(0.1)
+    if skipped_albums:
+        log(f'  qobuz: skipped {skipped_albums} album(s) not credited to this artist')
     if skipped:
         log(f'  qobuz: skipped {skipped} track(s) not performed by this artist')
     return out
 
 
-def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=True):
+def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=True,
+                    own_albums_only=False, artist_name=None):
     out = {}
     skipped = 0
+    skipped_albums = 0
     album_ids = []
+    alb_artist_ids = {}  # album id -> set of album-artist ids (from the listing)
     for fn in ('get_artist_albums', 'get_artist_albums_ep_singles'):
         res = call_timeout(lambda fn=fn: getattr(session, fn)(str(artist_id)), 45,
                            default=None, label=f'tidal {fn}') or {}
-        album_ids += [it.get('id') for it in (res.get('items') or []) if it.get('id') is not None]
+        for it in (res.get('items') or []):
+            if it.get('id') is not None:
+                album_ids.append(it.get('id'))
+                alb_artist_ids[str(it.get('id'))] = _album_artist_ids(it, 'tidal')
     album_ids = list(dict.fromkeys(album_ids))
     if max_albums:
         album_ids = album_ids[:max_albums]
     log(f'  tidal: {len(album_ids)} albums/EPs')
     for aid in album_ids:
+        if own_albums_only:
+            aids = alb_artist_ids.get(str(aid)) or set()
+            if aids and str(artist_id) not in aids:
+                skipped_albums += 1
+                continue
         res = call_timeout(lambda: session.get_album_items_all(str(aid)), 60,
                            default=None, label=f'tidal album {aid}')
         if not res:
@@ -317,19 +427,23 @@ def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=Tr
             bd, sr = tidal_quality(item.get('audioQuality'))
             if not (isrc and tid is not None and bd):  # bd==0 -> lossy, not a FLAC source
                 continue
-            if artist_filter and not _artist_on_track(item, 'tidal', artist_id):
+            if artist_filter and not _artist_on_track(item, 'tidal', artist_id, artist_name):
                 skipped += 1
                 continue
             _keep_best(out, isrc, (str(tid), bd, sr))
         time.sleep(0.1)
+    if skipped_albums:
+        log(f'  tidal: skipped {skipped_albums} album(s) not credited to this artist')
     if skipped:
         log(f'  tidal: skipped {skipped} track(s) not performed by this artist')
     return out
 
 
-def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=True):
+def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=True,
+                     own_albums_only=False, artist_name=None):
     out = {}
     skipped = 0
+    skipped_albums = 0
     album_ids, start, page = [], 0, 200
     while True:
         batch = call_timeout(
@@ -351,6 +465,11 @@ def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=T
                              default=None, label=f'deezer album {aid}')
         if not album:
             continue
+        if own_albums_only:
+            aids = _album_artist_ids(album, 'deezer')
+            if aids and str(artist_id) not in aids:
+                skipped_albums += 1
+                continue
         for tr in (album.get('SONGS') or {}).get('data') or []:
             isrc = (tr.get('ISRC') or '').strip().upper()
             tid = tr.get('SNG_ID')
@@ -359,11 +478,13 @@ def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=T
             if not isrc:
                 missing_isrc += 1
                 continue
-            if artist_filter and not _artist_on_track(tr, 'deezer', artist_id):
+            if artist_filter and not _artist_on_track(tr, 'deezer', artist_id, artist_name):
                 skipped += 1
                 continue
             _keep_best(out, isrc, (str(tid), 16, 44.1))  # Deezer FLAC = 16/44.1
         time.sleep(0.1)
+    if skipped_albums:
+        log(f'  deezer: skipped {skipped_albums} album(s) not credited to this artist')
     if missing_isrc:
         log(f'  deezer: {missing_isrc} tracks had no ISRC in album data (skipped for discovery)')
     if skipped:
@@ -742,6 +863,12 @@ def main():
     ap.add_argument('--all-album-tracks', action='store_true',
                     help='(artist links) keep every track on the artist\'s albums, including '
                          'other artists\' tracks on compilations. Default: only tracks the artist performs.')
+    ap.add_argument('--own-albums-only', dest='own_albums_only', action='store_true', default=None,
+                    help='(artist links) skip whole albums not credited to the artist (compilations, '
+                         'and collab/feature albums where they are not the album artist).')
+    ap.add_argument('--all-albums', dest='own_albums_only', action='store_false',
+                    help='(artist links) consider every album in the discography (overrides '
+                         'own_albums_only from settings).')
     ap.add_argument('--dry', action='store_true', help='Show the plan (service + quality per track); download nothing.')
     args = ap.parse_args()
 
@@ -763,6 +890,7 @@ def main():
         active = list(prefer)
 
     credited = cfg['credited_albums'] if args.credited is None else args.credited
+    own_albums = cfg['own_albums_only'] if args.own_albums_only is None else args.own_albums_only
     out_path = args.output or (settings.get('global', {}).get('general', {}).get('download_path'))
     if out_path:
         out_path = out_path.rstrip('/\\') or out_path
@@ -795,7 +923,7 @@ def main():
             log(f'\nEnumerating {src_service} discography...')
             per_service = {src_service: ENUMERATORS[src_service](
                 core.session(src_service), mid, credited, args.max_albums,
-                not args.all_album_tracks)}
+                not args.all_album_tracks, own_albums, artist_name)}
             log(f'  {src_service}: {len(per_service[src_service])} recordings with ISRC')
 
             src_set = set(per_service[src_service].keys())
@@ -811,7 +939,7 @@ def main():
                     continue
                 log(f'Enumerating {svc} discography...')
                 mp = ENUMERATORS[svc](core.session(svc), aid, credited, args.max_albums,
-                                      not args.all_album_tracks)
+                                      not args.all_album_tracks, own_albums, artist_name)
                 # Verify a name-resolved artist really is the same person: its ISRCs
                 # must overlap the source. Guards the union against a same-name match.
                 if method == 'name' and src_set and mp:

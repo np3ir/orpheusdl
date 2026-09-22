@@ -138,6 +138,7 @@ class Orpheus:
                 "dedup_with_library": True,
                 "library_root": "",
                 "credited_albums": False,
+                "own_albums_only": False,
             },
             "formatting": {
                 "discography_format": "{name} {quality}",

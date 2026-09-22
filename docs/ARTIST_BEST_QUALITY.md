@@ -86,6 +86,8 @@ python artist_best_quality.py "https://tidal.com/artist/10411"
 | `--limit N` | only process the first N recordings (testing) |
 | `--max-albums N` | (artist links) only read the first N albums per service (sampling/testing) |
 | `--all-album-tracks` | (artist links) keep other artists' tracks that ride along on compilations (default: only tracks the artist actually performs) |
+| `--own-albums-only` | (artist links) skip whole albums not credited to the artist (compilations and collab/feature albums) |
+| `--all-albums` | (artist links) consider every album in the discography (overrides `own_albums_only` from settings) |
 | `--dry` | show the plan, download nothing |
 
 ### Permanent configuration (settings.json)
@@ -99,7 +101,8 @@ Defaults live in `config/settings.json` → `global` → `artist_best_quality`
     "prefer_order": ["qobuz", "tidal", "deezer"],
     "dedup_with_library": true,
     "library_root": "",
-    "credited_albums": false
+    "credited_albums": false,
+    "own_albums_only": false
 }
 ```
 
@@ -108,6 +111,9 @@ Defaults live in `config/settings.json` → `global` → `artist_best_quality`
 - `dedup_with_library` — skip ISRCs already in your library.
 - `library_root` — folder to dedup against; empty = the download path.
 - `credited_albums` — include appears-on albums by default (artist links).
+- `own_albums_only` — `true` skips whole albums not credited to the artist
+  (compilations and collab/feature albums). Default `false`: keep every track the
+  artist performs (main or featured), drop only other artists' tracks.
 
 The `-q` flag and the CLI flags override these for a single run.
 
@@ -224,6 +230,8 @@ python artist_best_quality.py "https://tidal.com/artist/10411"
 | `--limit N` | procesar solo las primeras N grabaciones (pruebas) |
 | `--max-albums N` | (enlaces de artista) leer solo los primeros N álbumes por servicio (muestreo/pruebas) |
 | `--all-album-tracks` | (enlaces de artista) conservar temas de otros artistas que vienen en recopilatorios (por defecto: solo los que interpreta el artista) |
+| `--own-albums-only` | (enlaces de artista) saltar álbumes enteros no acreditados al artista (recopilatorios y colaboraciones/feats) |
+| `--all-albums` | (enlaces de artista) considerar todos los álbumes de la discografía (anula `own_albums_only` de la config) |
 | `--dry` | mostrar el plan, sin descargar |
 
 ### Configuración permanente (settings.json)
@@ -237,7 +245,8 @@ Los valores por defecto viven en `config/settings.json` → `global` →
     "prefer_order": ["qobuz", "tidal", "deezer"],
     "dedup_with_library": true,
     "library_root": "",
-    "credited_albums": false
+    "credited_albums": false,
+    "own_albums_only": false
 }
 ```
 
@@ -246,6 +255,9 @@ Los valores por defecto viven en `config/settings.json` → `global` →
 - `dedup_with_library` — saltar ISRC ya presentes en tu biblioteca.
 - `library_root` — carpeta contra la que deduplicar; vacío = la ruta de descarga.
 - `credited_albums` — incluir álbumes de "aparece en" por defecto (enlaces de artista).
+- `own_albums_only` — `true` salta álbumes enteros no acreditados al artista
+  (recopilatorios y colaboraciones/feats). Por defecto `false`: conserva cada tema
+  que el artista interpreta (principal o featuring) y descarta solo los ajenos.
 
 El flag `-q` y los flags de la CLI tienen prioridad para un run puntual.
 
