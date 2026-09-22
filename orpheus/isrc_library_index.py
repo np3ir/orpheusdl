@@ -78,10 +78,11 @@ class IsrcLibraryIndex:
 
     # ---- the scan ----
     def _iter_audio(self):
+        skip_dirs = {'_duplicados', '_no_flac_quarantine'}
         for dirpath, dirs, files in os.walk(self.root, onerror=self._walk_error):
-            # Never index the dedupe quarantine — moved-aside copies must not
-            # re-count as library duplicates.
-            dirs[:] = [d for d in dirs if d.lower() != '_duplicados' and not os.path.islink(os.path.join(dirpath, d))]
+            # Never index the dedupe quarantine or the non-FLAC quarantine —
+            # moved-aside copies must not re-count as library files.
+            dirs[:] = [d for d in dirs if d.lower() not in skip_dirs and not os.path.islink(os.path.join(dirpath, d))]
             for name in files:
                 ext = os.path.splitext(name)[1].lower()
                 if ext in AUDIO_EXT and not name.startswith('.orpheus-'):

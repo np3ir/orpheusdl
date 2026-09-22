@@ -19,8 +19,9 @@ def in_library(path, root):
     p, r = canonical(path), canonical(root)
     try:
         rel = Path(os.path.relpath(p, r))
+        skip = {'_duplicados', '_no_flac_quarantine'}
         return (os.path.commonpath((p, r)) == r and p != r
-                and '_duplicados' not in [part.lower() for part in rel.parts]
+                and not (skip & {part.lower() for part in rel.parts})
                 and not Path(p).name.startswith('.orpheus-'))
     except (ValueError, OSError):
         return False
