@@ -208,6 +208,17 @@ library automatically**, where correctness and account safety matter more than s
 - **Library-wide ISRC index** (opt-in): see [docs/DEDUPE_OPERATIONS.md](docs/DEDUPE_OPERATIONS.md)
   and [docs/DEDUPE_DESIGN.md](docs/DEDUPE_DESIGN.md).
 - **Crash-safe config**: `settings.json` is written atomically with a `.bak` copy.
+- **A-Z folder buckets by album artist**: `{artist_initials}` in a path template is the
+  album artist's **literal first letter** — `The Weeknd` → `T` (no article stripping), and
+  a track's featured guests never change the bucket (it follows `{album_artist}`, not the
+  first credited artist). Pair them, e.g.
+  `album_format = "{artist_initials}/{album_artist}/({release_year}) {name}"`, so every
+  album by an artist lands under one letter.
+- **Qobuz token precedence**: a token pasted into `settings.json`
+  (`modules.qobuz.auth_token`) wins over any stale token cached in `loginstorage.bin`.
+  When the token expires (~monthly), paste a fresh one into the config and it works
+  immediately — nothing else to do. (Qobuz accounts that authenticate only by token/OAuth
+  can't be auto-refreshed from email/password.)
 - **`artist_best_quality.py` (command `abq`)**: any Tidal/Deezer/Qobuz link
   (artist/album/playlist/track) → best FLAC across the three services by ISRC.
   Permanent options in `settings.json → global.artist_best_quality`. See
