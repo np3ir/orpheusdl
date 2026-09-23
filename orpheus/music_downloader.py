@@ -3436,7 +3436,13 @@ class Downloader:
         quality_label = self._quality_path_label(quality_source)
         album_tags['quality'] = f'[{quality_label}]' if quality_label else ''
         album_tags['explicit'] = ' (explicit)' if album_info.explicit else ''
-        album_tags['artist_initials'] = self._get_artist_initials_from_name(album_info)
+        # Bucket albums by their ALBUM ARTIST's initial (matches the {album_artist}
+        # folder), falling back to the album's main artist when unset.
+        _album_aa = getattr(album_info, 'album_artist', None) or getattr(album_info, 'artist', None) or ''
+        if isinstance(_album_aa, (list, tuple)):
+            _album_aa = _album_aa[0] if _album_aa else ''
+        album_tags['artist_initials'] = self._get_artist_initials_from_name(
+            AlbumInfo(name='', artist=str(_album_aa), tracks=[], release_year=0))
         album_tags['name'] = self._compact_path_tag(album_tags.get('name', ''))
         
         # Add additional formatting tags if they exist
@@ -3587,10 +3593,14 @@ class Downloader:
         track_tags['disc_number'] = str(track_info.tags.disc_number) if track_info.tags.disc_number else ''
         track_tags['total_discs'] = str(track_info.tags.total_discs) if track_info.tags.total_discs else ''
         track_tags['quality'] = track_info.codec.name if track_info.codec else ''
-        # Podcasts/episodes often omit track artists; fall back to show (album_artist/album) for folder sorting.
+        # Bucket by the ALBUM ARTIST so every album by an artist lands under one
+        # initial. A track's first credited artist is often a featured guest, which
+        # would otherwise scatter an artist's albums across buckets (e.g. a Frijo
+        # album filed under "U" because "Uri" is the first listed collaborator).
+        # Podcasts/episodes omit track artists -> fall back to the track artist / album.
         artist_for_initials = (
-            track_tags['artist']
-            or track_tags['album_artist']
+            track_tags['album_artist']
+            or track_tags['artist']
             or track_tags.get('album', '')
         )
         track_tags['artist_initials'] = self._get_artist_initials_from_name(
