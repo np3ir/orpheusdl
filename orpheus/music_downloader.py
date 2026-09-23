@@ -2659,18 +2659,10 @@ class Downloader:
         if not artist:
             return '#'
 
-        # Skip leading "The " for sorting initials (e.g. "The Beatles" -> B)
-        initial = artist
-        lower = artist.lower()
-        if lower.startswith('the '):
-            initial = artist[4:].strip()
-        elif lower == 'the':
-            initial = ''
-        if not initial:
-            return '#'
-
-        # Unicode fix
-        ch = unicodedata.normalize('NFKD', initial[0]).encode('ascii', 'ignore').decode('utf-8')
+        # Bucket by the LITERAL first letter (e.g. "The Weeknd" -> T), matching the
+        # library convention here. (No article stripping: "The" is kept, so all of a
+        # band's albums stay under one bucket regardless of tooling.)
+        ch = unicodedata.normalize('NFKD', artist[0]).encode('ascii', 'ignore').decode('utf-8')
         if not ch:
             return '#'
 
