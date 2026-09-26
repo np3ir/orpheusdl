@@ -4747,6 +4747,9 @@ class Downloader:
                 if await finish_io(loop.run_in_executor(None, self._existing_file_is_stale, track_location, track_info)):
                     await finish_io(loop.run_in_executor(None, self._force_remove_track_file, track_location))
                 else:
+                    # Back-fill the ISRC index for an already-present file so a future
+                    # run skips it in the plan instead of re-attempting it every time.
+                    await finish_io(asyncio.to_thread(register_completed, _isrc_idx, track_info, track_location))
                     return "ALREADY_EXISTS"
 
             if not self._skip_existing_files_enabled():
@@ -5360,6 +5363,9 @@ class Downloader:
                     d_print(f'=== {symbols["skip"]} Track skipped ===', drop_level=header_drop_level)
                     self.track_skipped_count += 1
 
+                    # Back-fill the ISRC index for an already-present file so a future
+                    # run skips it in the plan instead of re-attempting it every time.
+                    register_completed(_isrc_idx, track_info, track_location)
                     return return_with_blank_line("SKIPPED")
 
             if flac_only() and getattr(track_info, 'codec', None) is not CodecEnum.FLAC:
@@ -5584,6 +5590,9 @@ class Downloader:
                         symbols = self._get_status_symbols()
                         d_print(f'=== {symbols["skip"]} Track skipped ===', drop_level=header_drop_level)
                         self.track_skipped_count += 1
+                        # Back-fill the ISRC index for an already-present file so a future
+                        # run skips it in the plan instead of re-attempting it every time.
+                        register_completed(_isrc_idx, track_info, track_location)
                         return return_with_blank_line("SKIPPED")
 
             self._prepare_track_download_path(track_location)
