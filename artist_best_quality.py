@@ -363,6 +363,46 @@ def _report_failed_albums(service, failed):
             f'-> excluded from the union (may lose FLAC sources): {shown}{more}')
 
 
+# Tracks skipped at enumeration because they are not yet streamable (pre-release /
+# embargoed). Collected per run -- abq runs as a fresh process per artist, so this
+# starts empty each run -- and written to config/abq_pendientes.csv at the end so
+# they can be revisited after their release date.
+_PRERELEASE = []  # list of (service, isrc, available_from)
+
+
+def _fmt_avail(v):
+    """Best-effort YYYY-MM-DD from a unix ts (qobuz) or ISO/date string (tidal/deezer)."""
+    if v in (None, ''):
+        return ''
+    if isinstance(v, (int, float)):
+        try:
+            return time.strftime('%Y-%m-%d', time.gmtime(int(v)))
+        except Exception:
+            return str(v)
+    return str(v)[:10]
+
+
+def append_pendientes(rows):
+    """Append rows (dicts) to config/abq_pendientes.csv, writing a header when new.
+    Never raises into the caller: a failed log write must not fail a download run."""
+    if not rows:
+        return
+    import csv
+    path = os.path.join(CONFIG_DIR, 'abq_pendientes.csv')
+    cols = ['date', 'source', 'artist', 'isrc', 'reason', 'tried', 'available_from']
+    try:
+        new = not os.path.exists(path)
+        with open(path, 'a', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            if new:
+                w.writeheader()
+            for r in rows:
+                w.writerow({c: r.get(c, '') for c in cols})
+        log(f'  [pendientes] logged {len(rows)} track(s) -> {path}')
+    except Exception as e:
+        log(f'  [pendientes] could not write CSV: {e}')
+
+
 def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=True,
                     own_albums_only=False, artist_name=None):
     out = {}
@@ -403,6 +443,7 @@ def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=Tr
                 continue
             if tr.get('streamable') is False:  # pre-release/embargoed (streamable_at future) or pulled
                 unavailable += 1
+                _PRERELEASE.append(('qobuz', isrc, _fmt_avail(tr.get('streamable_at'))))
                 continue
             if artist_filter and not _artist_on_track(tr, 'qobuz', artist_id, artist_name):
                 skipped += 1
@@ -460,6 +501,7 @@ def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=Tr
                 continue
             if item.get('streamReady') is False:  # pre-release (streamStartDate future) or pulled
                 unavailable += 1
+                _PRERELEASE.append(('tidal', isrc, _fmt_avail(item.get('streamStartDate'))))
                 continue
             if artist_filter and not _artist_on_track(item, 'tidal', artist_id, artist_name):
                 skipped += 1
@@ -519,6 +561,7 @@ def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=T
                 continue
             if (tr.get('RIGHTS') or {}).get('STREAM_SUB_AVAILABLE') is False:  # not streamable on sub (pre-release/pulled)
                 unavailable += 1
+                _PRERELEASE.append(('deezer', isrc, _fmt_avail((tr.get('RIGHTS') or {}).get('STREAM_SUB') or tr.get('DATE_START'))))
                 continue
             if artist_filter and not _artist_on_track(tr, 'deezer', artist_id, artist_name):
                 skipped += 1
@@ -911,6 +954,7 @@ def main():
         sys.stdin = open(os.devnull)
     except Exception:
         pass
+    _PRERELEASE.clear()
 
     settings = load_settings()
     cfg = abq_config(settings)
@@ -985,6 +1029,7 @@ def main():
     core = Core()
     try:
         union = {}  # isrc -> {service: (id, bd, sr)}
+        artist_name = ''  # set below for artist links; kept '' for album/track/playlist
 
         # A Spotify artist (or any Spotify link) has no FLAC and no enumerator, so
         # it always goes through the ISRC-probe path below, never the union path.
@@ -1201,6 +1246,22 @@ def main():
             for isrc in unrecovered:
                 tried = '/'.join(tried_by_isrc.get(isrc) or order_by_isrc.get(isrc, [])) or '?'
                 log(f'    {isrc}  (tried: {tried})')
+
+        # ---- persist for later revisit: config/abq_pendientes.csv ----
+        stamp = time.strftime('%Y-%m-%d')
+        pend = [{'date': stamp, 'source': args.url, 'artist': artist_name, 'isrc': isrc,
+                 'reason': 'unrecoverable', 'available_from': '',
+                 'tried': '/'.join(tried_by_isrc.get(isrc) or order_by_isrc.get(isrc, []))}
+                for isrc in unrecovered]
+        seen_pre = set()
+        for svc, isrc, avail in _PRERELEASE:
+            if isrc in seen_pre:
+                continue
+            seen_pre.add(isrc)
+            pend.append({'date': stamp, 'source': args.url, 'artist': artist_name,
+                         'isrc': isrc, 'reason': 'pre-release', 'tried': svc,
+                         'available_from': avail})
+        append_pendientes(pend)
 
         log('\nDone.')
     finally:
