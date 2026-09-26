@@ -1143,13 +1143,33 @@ def main():
         # ---- cross-service fallback: retry each failed ISRC on its next-best
         # service, in preference order, until one has it (downloaded or present). ----
         failed = failed_direct
-        retry = [(isrc, order[1:]) for isrc, order in plan
-                 if isrc in failed and len(order) > 1]
         recovered = set()          # newly downloaded from a fallback service
         present_elsewhere = set()  # already in the library (confirmed while retrying)
+        # Build fallback candidates per failed ISRC: first the remaining union sources,
+        # then a probe-by-ISRC on any service the artist enumeration did not cover. This
+        # recovers collab / appears-on tracks that only one service listed in the
+        # discography (so the union has no alternative) even though another service has
+        # the FLAC under the same ISRC — e.g. a feature on someone else's album.
+        retry = []
+        tried_by_isrc = {}
+        for isrc, order in plan:
+            if isrc not in failed:
+                continue
+            alts = list(order[1:])
+            covered = set(order)
+            for svc in prefer:
+                if svc in covered:
+                    continue
+                cand = probe_isrc(core, svc, isrc)
+                if cand:
+                    union.setdefault(isrc, {})[svc] = cand
+                    alts.append(svc)
+            tried_by_isrc[isrc] = list(order) + [s for s in alts if s not in order]
+            if alts:
+                retry.append((isrc, alts))
         if retry:
             log(f'\n=== ISRC fallback: {len(retry)} track(s) failed on best source; '
-                f'retrying on next-best service ===')
+                f'retrying on next-best / probed service(s) ===')
             for isrc, alts in retry:
                 for svc in alts:
                     tid = str(union[isrc][svc][0])
@@ -1179,7 +1199,7 @@ def main():
                 f'tried service(s) for THIS account (restricted / unavailable here; '
                 f'the FLAC may exist in the catalog or for another account):')
             for isrc in unrecovered:
-                tried = '/'.join(order_by_isrc.get(isrc, [])) or '?'
+                tried = '/'.join(tried_by_isrc.get(isrc) or order_by_isrc.get(isrc, [])) or '?'
                 log(f'    {isrc}  (tried: {tried})')
 
         log('\nDone.')
