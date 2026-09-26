@@ -417,6 +417,8 @@ def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=Tr
         log('  qobuz: get_artist failed/empty')
         return out
     albums = (artist.get('albums') or {}).get('items') or []
+    _LAST_ALBUM_IDS[('qobuz', str(artist_id))] = sorted(
+        str(a.get('id')) for a in albums if a.get('id') is not None)
     if max_albums:
         albums = albums[:max_albums]
     log(f'  qobuz: {len(albums)} albums')
@@ -583,6 +585,7 @@ def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=Tr
             arts = (((by_id.get(aid) or {}).get('relationships') or {}).get('artists') or {}).get('data') or []
             alb_artist_ids[aid] = {str(a.get('id')) for a in arts if a.get('id')}
     album_ids = list(dict.fromkeys(album_ids))
+    _LAST_ALBUM_IDS[('tidal', str(artist_id))] = sorted(str(x) for x in album_ids)
     if max_albums:
         album_ids = album_ids[:max_albums]
     log(f'  tidal: {len(album_ids)} albums/EPs (guest metadata, no account)')
@@ -663,6 +666,7 @@ def _enumerate_tidal_auth(session, artist_id, credited, max_albums=0, artist_fil
                 album_ids.append(it.get('id'))
                 alb_artist_ids[str(it.get('id'))] = _album_artist_ids(it, 'tidal')
     album_ids = list(dict.fromkeys(album_ids))
+    _LAST_ALBUM_IDS[('tidal', str(artist_id))] = sorted(str(x) for x in album_ids)
     if max_albums:
         album_ids = album_ids[:max_albums]
     log(f'  tidal: {len(album_ids)} albums/EPs')
@@ -724,6 +728,7 @@ def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=T
             break
         start += page
     album_ids = list(dict.fromkeys(album_ids))
+    _LAST_ALBUM_IDS[('deezer', str(artist_id))] = sorted(album_ids)
     if max_albums:
         album_ids = album_ids[:max_albums]
     log(f'  deezer: {len(album_ids)} albums')
@@ -779,6 +784,7 @@ ENUMERATORS = {'qobuz': enumerate_qobuz, 'tidal': enumerate_tidal, 'deezer': enu
 # --------------------------------------------------------------------------- #
 _ENUM_CACHE_DIR = os.path.join(CONFIG_DIR, 'enum_cache')
 _ENUM_TTL_DAYS = 30
+_LAST_ALBUM_IDS = {}  # (svc, artist_id) -> sorted album-id list, set by each enumerate_*
 
 
 def _enum_sig(credited, own_albums_only, artist_filter):
@@ -806,24 +812,66 @@ def _read_enum_cache(path):
     return data
 
 
-def _write_enum_cache(path, out, titles_delta, pre_delta):
+def _write_enum_cache(path, out, titles_delta, pre_delta, album_ids):
     try:
         os.makedirs(_ENUM_CACHE_DIR, exist_ok=True)
         tmp = f'{path}.{os.getpid()}.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump({'ts': time.time(),
                        'out': {k: list(v) for k, v in out.items()},
-                       'titles': titles_delta, 'prerelease': pre_delta}, f)
+                       'titles': titles_delta, 'prerelease': pre_delta,
+                       'album_ids': album_ids}, f)
         os.replace(tmp, path)
     except Exception:
         pass
 
 
+def _album_ids(svc, session, artist_id, credited):
+    """Cheap album-id list for the freshness check -- the artist's album listing
+    only, WITHOUT fetching any album's tracks. Returns a sorted list, or None if it
+    could not be fetched (caller then treats the cache as stale and re-enumerates)."""
+    try:
+        if svc == 'qobuz':
+            a = call_timeout(lambda: session.get_artist(str(artist_id)), 60,
+                             default=None, label='qobuz freshness')
+            if a is None:
+                return None
+            return sorted(str(x.get('id')) for x in (a.get('albums') or {}).get('items') or []
+                          if x.get('id') is not None)
+        if svc == 'tidal':
+            if _tidal_guest_auth() is None:
+                return None  # can't cheaply verify -> re-enumerate
+            ids = []
+            for j in _tidal_guest_pages(
+                    f'/artists/{artist_id}/relationships/albums?countryCode={_TIDAL_CC}'):
+                ids += [x.get('id') for x in j.get('data', []) if x.get('id')]
+            return sorted(str(x) for x in dict.fromkeys(ids))
+        if svc == 'deezer':
+            ids, start, page = [], 0, 200
+            while True:
+                batch = call_timeout(
+                    lambda start=start: session.get_artist_album_ids(str(artist_id), start, page, credited),
+                    45, default=None, label='deezer freshness')
+                if batch is None:
+                    return None if not ids else sorted(dict.fromkeys(ids))
+                ids += [str(a) for a in batch]
+                if len(batch) < page:
+                    break
+                start += page
+            return sorted(dict.fromkeys(ids))
+    except Exception:
+        return None
+    return None
+
+
 def enumerate_cached(svc, session, artist_id, credited, max_albums, artist_filter,
                      own_albums_only, artist_name, use_cache=True):
-    """enumerate_* with a per-artist on-disk cache. A cache hit returns the stored
-    result AND replays its title / pre-release side effects, making ZERO account
-    (or guest) metadata calls. Sampling runs (max_albums) never use the cache."""
+    """enumerate_* with a per-artist on-disk cache guarded by a FRESHNESS check: a
+    cache hit is used only when the artist's current album-id list still matches the
+    cached one, so a NEW release always triggers a re-enumeration (quality-first).
+    A hit replays the stored title / pre-release side effects. The freshness check
+    costs one cheap album-listing call (free on tidal's guest token); there is no
+    check on a cold cache (first run), so the initial batch adds no overhead."""
     real = ENUMERATORS[svc]
     if not use_cache or max_albums:
         return real(session, artist_id, credited, max_albums, artist_filter,
@@ -831,18 +879,22 @@ def enumerate_cached(svc, session, artist_id, credited, max_albums, artist_filte
     path = _enum_cache_file(svc, artist_id, _enum_sig(credited, own_albums_only, artist_filter))
     cached = _read_enum_cache(path)
     if cached is not None:
-        _TITLES.update(cached.get('titles') or {})
-        for row in cached.get('prerelease') or []:
-            _PRERELEASE.append(tuple(row))
-        log(f'  {svc}: {len(cached["out"])} recordings (cache hit -> no metadata call)')
-        return {k: tuple(v) for k, v in cached['out'].items()}
+        current = _album_ids(svc, session, artist_id, credited)
+        if current is not None and current == (cached.get('album_ids') or []):
+            _TITLES.update(cached.get('titles') or {})
+            for row in cached.get('prerelease') or []:
+                _PRERELEASE.append(tuple(row))
+            log(f'  {svc}: {len(cached["out"])} recordings (cache hit, fresh -> no track calls)')
+            return {k: tuple(v) for k, v in cached['out'].items()}
+        log(f'  {svc}: cache stale (new/changed albums) -> re-enumerating')
     t_before = set(_TITLES)
     p_before = len(_PRERELEASE)
     out = real(session, artist_id, credited, max_albums, artist_filter,
                own_albums_only, artist_name)
     titles_delta = {k: _TITLES[k] for k in _TITLES if k not in t_before}
     pre_delta = [list(x) for x in _PRERELEASE[p_before:]]
-    _write_enum_cache(path, out, titles_delta, pre_delta)
+    album_ids = _LAST_ALBUM_IDS.get((svc, str(artist_id)), [])
+    _write_enum_cache(path, out, titles_delta, pre_delta, album_ids)
     return out
 
 
