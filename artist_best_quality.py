@@ -771,6 +771,81 @@ def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=T
 ENUMERATORS = {'qobuz': enumerate_qobuz, 'tidal': enumerate_tidal, 'deezer': enumerate_deezer}
 
 
+# --------------------------------------------------------------------------- #
+# Per-artist enumeration cache (config/enum_cache). Protects the qobuz/deezer
+# ACCOUNTS across re-runs: a cached artist makes ZERO metadata calls. Invalidated
+# by TTL or when a cached pre-release's release date has arrived, so a newly
+# released track is never missed (quality-first). config/ is git-ignored.
+# --------------------------------------------------------------------------- #
+_ENUM_CACHE_DIR = os.path.join(CONFIG_DIR, 'enum_cache')
+_ENUM_TTL_DAYS = 30
+
+
+def _enum_sig(credited, own_albums_only, artist_filter):
+    return f'c{int(bool(credited))}o{int(bool(own_albums_only))}f{int(bool(artist_filter))}'
+
+
+def _enum_cache_file(svc, artist_id, sig):
+    safe = re.sub(r'[^A-Za-z0-9]+', '_', str(artist_id))
+    return os.path.join(_ENUM_CACHE_DIR, f'{svc}_{safe}_{sig}.json')
+
+
+def _read_enum_cache(path):
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if time.time() - float(data.get('ts', 0)) > _ENUM_TTL_DAYS * 86400:
+        return None
+    today = time.strftime('%Y-%m-%d')
+    for row in data.get('prerelease') or []:  # a pending release has dropped -> re-check live
+        avail = row[2] if len(row) > 2 else ''
+        if avail and str(avail) <= today:
+            return None
+    return data
+
+
+def _write_enum_cache(path, out, titles_delta, pre_delta):
+    try:
+        os.makedirs(_ENUM_CACHE_DIR, exist_ok=True)
+        tmp = f'{path}.{os.getpid()}.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({'ts': time.time(),
+                       'out': {k: list(v) for k, v in out.items()},
+                       'titles': titles_delta, 'prerelease': pre_delta}, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def enumerate_cached(svc, session, artist_id, credited, max_albums, artist_filter,
+                     own_albums_only, artist_name, use_cache=True):
+    """enumerate_* with a per-artist on-disk cache. A cache hit returns the stored
+    result AND replays its title / pre-release side effects, making ZERO account
+    (or guest) metadata calls. Sampling runs (max_albums) never use the cache."""
+    real = ENUMERATORS[svc]
+    if not use_cache or max_albums:
+        return real(session, artist_id, credited, max_albums, artist_filter,
+                    own_albums_only, artist_name)
+    path = _enum_cache_file(svc, artist_id, _enum_sig(credited, own_albums_only, artist_filter))
+    cached = _read_enum_cache(path)
+    if cached is not None:
+        _TITLES.update(cached.get('titles') or {})
+        for row in cached.get('prerelease') or []:
+            _PRERELEASE.append(tuple(row))
+        log(f'  {svc}: {len(cached["out"])} recordings (cache hit -> no metadata call)')
+        return {k: tuple(v) for k, v in cached['out'].items()}
+    t_before = set(_TITLES)
+    p_before = len(_PRERELEASE)
+    out = real(session, artist_id, credited, max_albums, artist_filter,
+               own_albums_only, artist_name)
+    titles_delta = {k: _TITLES[k] for k in _TITLES if k not in t_before}
+    pre_delta = [list(x) for x in _PRERELEASE[p_before:]]
+    _write_enum_cache(path, out, titles_delta, pre_delta)
+    return out
+
+
 def artist_name_of(core, service, artist_id):
     """Cheap artist-name lookup (one request), avoiding the heavy get_artist_info
     metadata batch that would duplicate our own enumeration."""
@@ -1178,6 +1253,8 @@ def main():
                     help='(artist links) consider every album in the discography (overrides '
                          'own_albums_only from settings).')
     ap.add_argument('--dry', action='store_true', help='Show the plan (service + quality per track); download nothing.')
+    ap.add_argument('--no-cache', action='store_true',
+                    help='Ignore the per-artist enumeration cache (config/enum_cache); read metadata live.')
     args = ap.parse_args()
 
     target_raw = (args.quality or cfg['default_quality'] or 'best').strip().lower()
@@ -1230,9 +1307,9 @@ def main():
 
             # ---- enumerate the source discography ----
             log(f'\nEnumerating {src_service} discography...')
-            per_service = {src_service: ENUMERATORS[src_service](
-                core.session(src_service), mid, credited, args.max_albums,
-                not args.all_album_tracks, own_albums, artist_name)}
+            per_service = {src_service: enumerate_cached(
+                src_service, core.session(src_service), mid, credited, args.max_albums,
+                not args.all_album_tracks, own_albums, artist_name, use_cache=not args.no_cache)}
             log(f'  {src_service}: {len(per_service[src_service])} recordings with ISRC')
 
             src_set = set(per_service[src_service].keys())
@@ -1247,8 +1324,9 @@ def main():
                 if not aid:
                     continue
                 log(f'Enumerating {svc} discography...')
-                mp = ENUMERATORS[svc](core.session(svc), aid, credited, args.max_albums,
-                                      not args.all_album_tracks, own_albums, artist_name)
+                mp = enumerate_cached(svc, core.session(svc), aid, credited, args.max_albums,
+                                      not args.all_album_tracks, own_albums, artist_name,
+                                      use_cache=not args.no_cache)
                 # Verify a name-resolved artist really is the same person: its ISRCs
                 # must overlap the source. Guards the union against a same-name match.
                 if method == 'name' and src_set and mp:
