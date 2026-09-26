@@ -393,7 +393,9 @@ def append_pendientes(rows):
     cols = ['date', 'source', 'artist', 'title', 'isrc', 'reason', 'tried', 'available_from']
     try:
         new = not os.path.exists(path)
-        with open(path, 'a', newline='', encoding='utf-8') as f:
+        # utf-8-sig (BOM) when creating the file so Excel reads CJK / accents
+        # correctly; plain utf-8 when appending so the BOM is written exactly once.
+        with open(path, 'a', newline='', encoding='utf-8-sig' if new else 'utf-8') as f:
             w = csv.DictWriter(f, fieldnames=cols)
             if new:
                 w.writeheader()
