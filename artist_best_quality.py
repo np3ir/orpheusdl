@@ -823,16 +823,39 @@ def choose_service(cands, target, prefer):
 # --------------------------------------------------------------------------- #
 # Download (delegated to orpheus.py) + ISRC-based cross-service fallback
 # --------------------------------------------------------------------------- #
-# Failure line printed by music_downloader when a track can't even be resolved
-# (get_track_info 404 / dead catalog id / "FLAC only: track omitted"). These never
-# create an error.txt, so they are INVISIBLE to failed_isrcs_since(); parse them
-# from stdout instead. The captured id is the display track id (== our stored tid).
-_TRACK_FAIL_RE = re.compile(r'Could not get track info for (\S+?):')
+# Per-track OUTCOMES of an orpheus run, keyed by the numeric id orpheus prints.
+# We detect PRESENCE explicitly (downloaded, or skipped/already in library) and let
+# the caller treat every submitted track that is NOT present as failed. This is
+# parsed from captured stdout because:
+#   - orpheus exits 0 even when it logs "=== ERRORS ===", so the return code is not
+#     a reliable success signal;
+#   - some failures ("Track unavailable", "not available in your country", a 404 /
+#     dead id) print no usable track id at all, so we can't match them positively.
+# Detecting success and subtracting is therefore the only robust, walk-free signal.
+_TRACK_START_RE = re.compile(r'=== Downloading track .*\((\d+)\) ===')
+_PRESENT_MARKERS = ('Track skipped', 'already in library', 'Track file already exists')
 
 
-def failed_ids_from_output(text):
-    """Track ids that failed at the get_track_info stage in an orpheus run."""
-    return {m.group(1).strip() for m in _TRACK_FAIL_RE.finditer(text or '')}
+def outcomes_from_output(text):
+    """(downloaded, present) sets of track ids for an orpheus run:
+    downloaded = reached 'Track completed'; present = skipped / already in library.
+    Any submitted id in neither set failed (dead id, unavailable, flac-omit, etc.)."""
+    downloaded, present = set(), set()
+    cur = None
+    for line in (text or '').splitlines():
+        m = _TRACK_START_RE.search(line)
+        if m:
+            cur = m.group(1)
+            continue
+        if cur is None:
+            continue
+        if 'Track completed' in line:
+            downloaded.add(cur)
+            cur = None
+        elif any(s in line for s in _PRESENT_MARKERS):
+            present.add(cur)
+            cur = None
+    return downloaded, present
 
 
 def run_orpheus(urls, dlq, out_path):
@@ -857,27 +880,6 @@ def run_orpheus(urls, dlq, out_path):
         chunks.append(line)
     p.wait()
     return p.returncode, ''.join(chunks)
-
-
-def failed_isrcs_since(base, since):
-    """Collect ISRCs written to error.txt files touched during this run."""
-    found = set()
-    base = str(base).rstrip('/\\')
-    if not os.path.isdir(base):
-        return found
-    for dirpath, _dirs, files in os.walk(base):
-        if 'error.txt' not in files:
-            continue
-        err = os.path.join(dirpath, 'error.txt')
-        try:
-            if os.path.getmtime(err) < since - 5:
-                continue
-            txt = open(err, encoding='utf-8', errors='ignore').read()
-        except Exception:
-            continue
-        for m in re.finditer(r'\[ISRC:([A-Za-z0-9]+)\]', txt):
-            found.add(m.group(1).strip().upper())
-    return found
 
 
 # --------------------------------------------------------------------------- #
@@ -1096,7 +1098,6 @@ def main():
             return
 
         # ---- download: one orpheus.py call per (primary service, dlq) batch ----
-        run_start = time.time()
         order_by_isrc = dict(plan)
         by_service = {}  # svc -> list of (isrc, tid, url), in plan order
         for isrc, order in plan:
@@ -1104,29 +1105,30 @@ def main():
             tid = str(union[isrc][svc][0])
             by_service.setdefault(svc, []).append((isrc, tid, track_url(svc, tid)))
 
-        # ISRCs whose PRIMARY track failed at get_track_info (404 / dead catalog
-        # id / flac-only omit). Those write no error.txt, so detect them from the
-        # captured stdout and feed them into the same cross-service fallback.
+        # A primary track is FAILED unless orpheus reports it present (downloaded or
+        # already in library). Detected from captured stdout -> catches every failure
+        # mode (404 / dead id / flac-omit / "Track unavailable" / region lock) with
+        # no library walk and without trusting orpheus' always-zero exit code.
         failed_direct = set()
         for svc in [s for s in prefer if s in by_service]:
             entries = by_service[svc]
             log(f'\n=== Downloading {len(entries)} track(s) from {svc} @ {dlq} ===')
             for i in range(0, len(entries), 40):
                 chunk = entries[i:i + 40]
-                id_to_isrc = {tid: isrc for isrc, tid, _u in chunk}
                 _rc, out = run_orpheus([u for _i, _t, u in chunk], dlq, out_path)
-                for bad_id in failed_ids_from_output(out):
-                    isrc = id_to_isrc.get(bad_id)
-                    if isrc:
+                dl, pres = outcomes_from_output(out)
+                ok = dl | pres
+                for isrc, tid, _u in chunk:
+                    if tid not in ok:
                         failed_direct.add(isrc)
 
-        # ---- cross-service fallback for failures (by ISRC, next-best service) ----
-        # error.txt detection catches failures AFTER metadata (tagging/io);
-        # failed_direct catches get_track_info failures. Use the union of both.
-        failed = failed_isrcs_since(out_path, run_start) | failed_direct
+        # ---- cross-service fallback: retry each failed ISRC on its next-best
+        # service, in preference order, until one has it (downloaded or present). ----
+        failed = failed_direct
         retry = [(isrc, order[1:]) for isrc, order in plan
                  if isrc in failed and len(order) > 1]
-        recovered = set()
+        recovered = set()          # newly downloaded from a fallback service
+        present_elsewhere = set()  # already in the library (confirmed while retrying)
         if retry:
             log(f'\n=== ISRC fallback: {len(retry)} track(s) failed on best source; '
                 f'retrying on next-best service ===')
@@ -1134,20 +1136,30 @@ def main():
                 for svc in alts:
                     tid = str(union[isrc][svc][0])
                     log(f'  retry {isrc} via {svc}')
-                    rc, out = run_orpheus([track_url(svc, tid)], dlq, out_path)
-                    if rc == 0 and tid not in failed_ids_from_output(out):
+                    _rc, out = run_orpheus([track_url(svc, tid)], dlq, out_path)
+                    dl, pres = outcomes_from_output(out)
+                    if tid in dl:
                         recovered.add(isrc)
                         break
+                    if tid in pres:
+                        present_elsewhere.add(isrc)
+                        break
 
-        # ---- visibility: tracks lost on EVERY source. orpheus reports these as
-        # "NO ERRORS", so surface them here or a big batch drops them silently. ----
+        # ---- visibility: tell the truth. orpheus logs "NO ERRORS" for tracks it
+        # never downloaded, so a big batch would drop them silently otherwise. ----
+        handled = recovered | present_elsewhere
         unrecovered = [isrc for isrc, _order in plan
-                       if isrc in failed and isrc not in recovered]
+                       if isrc in failed and isrc not in handled]
         if recovered:
-            log(f'\n✔ recovered {len(recovered)} track(s) via cross-service fallback')
+            log(f'\n✔ recovered {len(recovered)} track(s) newly downloaded via '
+                f'cross-service fallback')
+        if present_elsewhere:
+            log(f'\n• {len(present_elsewhere)} failed track(s) were already in the '
+                f'library (confirmed during fallback)')
         if unrecovered:
-            log(f'\n⚠️ {len(unrecovered)} track(s) could NOT be downloaded from ANY '
-                f'source (no FLAC anywhere / dead catalog ids):')
+            log(f'\n⚠️ {len(unrecovered)} track(s) could NOT be downloaded from the '
+                f'tried service(s) for THIS account (restricted / unavailable here; '
+                f'the FLAC may exist in the catalog or for another account):')
             for isrc in unrecovered:
                 tried = '/'.join(order_by_isrc.get(isrc, [])) or '?'
                 log(f'    {isrc}  (tried: {tried})')
