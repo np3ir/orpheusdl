@@ -1,4 +1,6 @@
 defusedxml>=0.7.1
+# Both crypto libs needed (NOT redundant): `Cryptodome` ns = pycryptodomex (deezer/librespot),
+# `Crypto` ns = pycryptodome (spotify, listed further below).
 pycryptodomex>=3.10.1
 requests>=2.25.1
 aiohttp>=3.8.0

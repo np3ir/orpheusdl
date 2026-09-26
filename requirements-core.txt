@@ -8,6 +8,8 @@ tqdm>=4.60.0
 mutagen>=1.45.1
 ffmpeg-python>=0.2.0
 defusedxml>=0.7.1
+# Both crypto libs are required (NOT redundant): modules/deezer + librespot import the
+# `Cryptodome` namespace (pycryptodomex); modules/spotify imports `Crypto` (pycryptodome).
 pycryptodomex>=3.10.1
 pycryptodome
 pkce>=1.0.3

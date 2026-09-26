@@ -454,8 +454,13 @@ def api_settings_raw_save():
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import os
+    # Bind to localhost by default: the web UI has NO authentication, so exposing
+    # it on the LAN (0.0.0.0) would let anyone on the network control it. Opt in
+    # explicitly with ORPHEUS_WEBUI_HOST=0.0.0.0 (and only behind a trusted network).
+    host = os.environ.get("ORPHEUS_WEBUI_HOST", "127.0.0.1")
     print("OrpheusDL Web UI")
     print(f"  OrpheusDL dir : {ORPHEUS_DIR}")
     print(f"  Settings file : {SETTINGS_FILE}")
-    print(f"  Open browser  : http://localhost:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    print(f"  Open browser  : http://{host}:5000")
+    app.run(host=host, port=5000, debug=False, threaded=True)

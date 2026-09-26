@@ -1,0 +1,18 @@
+# Tooling config only (ruff + pytest). Intentionally NO [project]/[build-system]
+# table: OrpheusDL runs in place, it is not pip-installed as a package.
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+extend-exclude = [".venv", "modules", "vendor", "config", "temp", "build", "__pycache__"]
+
+[tool.ruff.lint]
+# Gate CI only on REAL bugs: syntax errors (E9), undefined names (F82), broken
+# statements (F7), invalid comparisons (F63). The inherited pipeline carries a lot
+# of harmless style noise (unused imports, bare excepts, f-strings without
+# placeholders, redundant re-imports) that we deliberately do NOT fail CI on — the
+# goal is catching regressions, not churning code that comes from upstream OrpheusDL.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
