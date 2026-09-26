@@ -367,7 +367,8 @@ def _report_failed_albums(service, failed):
 # embargoed). Collected per run -- abq runs as a fresh process per artist, so this
 # starts empty each run -- and written to config/abq_pendientes.csv at the end so
 # they can be revisited after their release date.
-_PRERELEASE = []  # list of (service, isrc, available_from)
+_PRERELEASE = []  # list of (service, isrc, available_from, title)
+_TITLES = {}      # isrc -> track title, captured during enumeration for the pendientes log
 
 
 def _fmt_avail(v):
@@ -389,7 +390,7 @@ def append_pendientes(rows):
         return
     import csv
     path = os.path.join(CONFIG_DIR, 'abq_pendientes.csv')
-    cols = ['date', 'source', 'artist', 'isrc', 'reason', 'tried', 'available_from']
+    cols = ['date', 'source', 'artist', 'title', 'isrc', 'reason', 'tried', 'available_from']
     try:
         new = not os.path.exists(path)
         with open(path, 'a', newline='', encoding='utf-8') as f:
@@ -443,11 +444,12 @@ def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=Tr
                 continue
             if tr.get('streamable') is False:  # pre-release/embargoed (streamable_at future) or pulled
                 unavailable += 1
-                _PRERELEASE.append(('qobuz', isrc, _fmt_avail(tr.get('streamable_at'))))
+                _PRERELEASE.append(('qobuz', isrc, _fmt_avail(tr.get('streamable_at')), tr.get('title') or ''))
                 continue
             if artist_filter and not _artist_on_track(tr, 'qobuz', artist_id, artist_name):
                 skipped += 1
                 continue
+            _TITLES.setdefault(isrc, tr.get('title') or '')
             _keep_best(out, isrc, (str(tid), int(bd), float(sr)))
         time.sleep(0.1)
     if skipped_albums:
@@ -501,11 +503,12 @@ def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=Tr
                 continue
             if item.get('streamReady') is False:  # pre-release (streamStartDate future) or pulled
                 unavailable += 1
-                _PRERELEASE.append(('tidal', isrc, _fmt_avail(item.get('streamStartDate'))))
+                _PRERELEASE.append(('tidal', isrc, _fmt_avail(item.get('streamStartDate')), item.get('title') or ''))
                 continue
             if artist_filter and not _artist_on_track(item, 'tidal', artist_id, artist_name):
                 skipped += 1
                 continue
+            _TITLES.setdefault(isrc, item.get('title') or '')
             _keep_best(out, isrc, (str(tid), bd, sr))
         time.sleep(0.1)
     if skipped_albums:
@@ -561,11 +564,12 @@ def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=T
                 continue
             if (tr.get('RIGHTS') or {}).get('STREAM_SUB_AVAILABLE') is False:  # not streamable on sub (pre-release/pulled)
                 unavailable += 1
-                _PRERELEASE.append(('deezer', isrc, _fmt_avail((tr.get('RIGHTS') or {}).get('STREAM_SUB') or tr.get('DATE_START'))))
+                _PRERELEASE.append(('deezer', isrc, _fmt_avail((tr.get('RIGHTS') or {}).get('STREAM_SUB') or tr.get('DATE_START')), tr.get('SNG_TITLE') or ''))
                 continue
             if artist_filter and not _artist_on_track(tr, 'deezer', artist_id, artist_name):
                 skipped += 1
                 continue
+            _TITLES.setdefault(isrc, tr.get('SNG_TITLE') or '')
             _keep_best(out, isrc, (str(tid), 16, 44.1))  # Deezer FLAC = 16/44.1
         time.sleep(0.1)
     if skipped_albums:
@@ -955,6 +959,7 @@ def main():
     except Exception:
         pass
     _PRERELEASE.clear()
+    _TITLES.clear()
 
     settings = load_settings()
     cfg = abq_config(settings)
@@ -1249,18 +1254,19 @@ def main():
 
         # ---- persist for later revisit: config/abq_pendientes.csv ----
         stamp = time.strftime('%Y-%m-%d')
-        pend = [{'date': stamp, 'source': args.url, 'artist': artist_name, 'isrc': isrc,
+        pend = [{'date': stamp, 'source': args.url, 'artist': artist_name,
+                 'title': _TITLES.get(isrc, ''), 'isrc': isrc,
                  'reason': 'unrecoverable', 'available_from': '',
                  'tried': '/'.join(tried_by_isrc.get(isrc) or order_by_isrc.get(isrc, []))}
                 for isrc in unrecovered]
         seen_pre = set()
-        for svc, isrc, avail in _PRERELEASE:
+        for svc, isrc, avail, title in _PRERELEASE:
             if isrc in seen_pre:
                 continue
             seen_pre.add(isrc)
             pend.append({'date': stamp, 'source': args.url, 'artist': artist_name,
-                         'isrc': isrc, 'reason': 'pre-release', 'tried': svc,
-                         'available_from': avail})
+                         'title': title or _TITLES.get(isrc, ''), 'isrc': isrc,
+                         'reason': 'pre-release', 'tried': svc, 'available_from': avail})
         append_pendientes(pend)
 
         log('\nDone.')
