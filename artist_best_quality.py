@@ -462,8 +462,192 @@ def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=Tr
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Tidal metadata via the app-level GUEST token (client_credentials, NO user
+# account). Keeps the whole artist enumeration off the user's Tidal account;
+# downloads still use the authenticated module. Proven (parity test) to return the
+# same ISRCs + FLAC quality as the account view.
+# --------------------------------------------------------------------------- #
+_TIDAL_GUEST = {'tok': None, 'cfg': None}
+_TIDAL_CC = 'US'
+
+
+def _tidal_guest_cfg():
+    if _TIDAL_GUEST['cfg'] is None:
+        try:
+            with open(os.path.join(CONFIG_DIR, 'settings.json'), encoding='utf-8') as f:
+                _TIDAL_GUEST['cfg'] = json.load(f)['modules']['tidal']
+        except Exception:
+            _TIDAL_GUEST['cfg'] = {}
+    return _TIDAL_GUEST['cfg']
+
+
+def _tidal_guest_auth():
+    """App-level client_credentials token (no user login). Returns it, or None if
+    guest creds are missing / auth fails (caller then falls back to the account)."""
+    cfg = _tidal_guest_cfg()
+    tok, sec = cfg.get('guest_token'), cfg.get('guest_secret')
+    if not (tok and sec):
+        return None
+    try:
+        r = requests.post('https://auth.tidal.com/v1/oauth2/token',
+                          data={'client_id': tok, 'client_secret': sec,
+                                'grant_type': 'client_credentials'},
+                          headers={'User-Agent': 'Mozilla/5.0', 'Origin': 'https://tidal.com'},
+                          timeout=30)
+        r.raise_for_status()
+        _TIDAL_GUEST['tok'] = r.json()['access_token']
+        return _TIDAL_GUEST['tok']
+    except Exception:
+        return None
+
+
+def _tidal_guest_get(path):
+    """GET a v2 path with the guest token. Robust: refreshes on 401 and backs off /
+    retries on 429 or 5xx so a transient rate-limit never silently drops an album
+    (that would lose tracks -- unacceptable for a quality-first library)."""
+    if not _TIDAL_GUEST['tok'] and _tidal_guest_auth() is None:
+        return None
+    delay = 0.5
+    for attempt in range(5):
+        try:
+            r = requests.get('https://openapi.tidal.com/v2' + path,
+                             headers={'Authorization': f'Bearer {_TIDAL_GUEST["tok"]}',
+                                      'accept': 'application/vnd.api+json'}, timeout=45)
+            if r.status_code == 401:
+                if _tidal_guest_auth() is None:
+                    return None
+                continue
+            if r.status_code == 429 or r.status_code >= 500:
+                time.sleep(delay)
+                delay = min(delay * 2, 8)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            if attempt >= 4:
+                return None
+            time.sleep(delay)
+            delay = min(delay * 2, 8)
+    return None
+
+
+def _tidal_guest_pages(path, cap=300):
+    seen = set()
+    while path and path not in seen and len(seen) < cap:
+        seen.add(path)
+        j = _tidal_guest_get(path)
+        if j is None:
+            break
+        yield j
+        path = (j.get('links') or {}).get('next')
+        time.sleep(0.03)
+
+
+def _tidal_guest_quality(media_tags):
+    """(bit_depth, sample_rate) proxy from the catalog media tags. The account is
+    hi-res capable (downloads 24/96 with the token), so report real hi-res — the
+    guest v2 mediaTags are actually MORE accurate about hi-res availability than the
+    authenticated album-listing's audioQuality field. Matches tidal_quality()."""
+    tags = set(media_tags or [])
+    if 'HIRES_LOSSLESS' in tags:
+        return (24, 96.0)
+    if 'LOSSLESS' in tags:
+        return (16, 44.1)
+    return (0, 0.0)  # lossy -> not a FLAC source
+
+
 def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=True,
                     own_albums_only=False, artist_name=None):
+    """Enumerate a Tidal artist via the GUEST token (no account impact). Same
+    behavior/return as the authenticated path (artist_filter, streamable filter,
+    _TITLES). Falls back to the account session if the guest token is unavailable."""
+    if _tidal_guest_auth() is None:
+        log('  tidal: guest token unavailable -> authenticated session')
+        return _enumerate_tidal_auth(session, artist_id, credited, max_albums,
+                                     artist_filter, own_albums_only, artist_name)
+    out = {}
+    skipped = skipped_albums = unavailable = 0
+    failed_albums = []
+    album_ids, alb_artist_ids, alb_date = [], {}, {}
+    for j in _tidal_guest_pages(
+            f'/artists/{artist_id}/relationships/albums?countryCode={_TIDAL_CC}&include=albums'):
+        by_id = {a['id']: a for a in j.get('included', []) if a.get('type') == 'albums'}
+        for ref in j.get('data', []):
+            aid = ref.get('id')
+            if not aid:
+                continue
+            album_ids.append(aid)
+            at = (by_id.get(aid) or {}).get('attributes') or {}
+            alb_date[aid] = at.get('releaseDate') or ''
+            arts = (((by_id.get(aid) or {}).get('relationships') or {}).get('artists') or {}).get('data') or []
+            alb_artist_ids[aid] = {str(a.get('id')) for a in arts if a.get('id')}
+    album_ids = list(dict.fromkeys(album_ids))
+    if max_albums:
+        album_ids = album_ids[:max_albums]
+    log(f'  tidal: {len(album_ids)} albums/EPs (guest metadata, no account)')
+    for aid in album_ids:
+        if own_albums_only:
+            aids = alb_artist_ids.get(aid) or set()
+            if aids and str(artist_id) not in aids:
+                skipped_albums += 1
+                continue
+        got_any = False
+        for j in _tidal_guest_pages(
+                f'/albums/{aid}/relationships/items?countryCode={_TIDAL_CC}&include=items.artists'):
+            got_any = True
+            names = {x.get('id'): (x.get('attributes') or {}).get('name')
+                     for x in j.get('included', []) if x.get('type') == 'artists'}
+            for t in j.get('included', []):
+                if t.get('type') != 'tracks':
+                    continue
+                at = t.get('attributes') or {}
+                isrc = (at.get('isrc') or '').strip().upper()
+                tid = t.get('id')
+                bd, sr = _tidal_guest_quality(at.get('mediaTags'))
+                if not (isrc and tid and bd):  # bd==0 -> lossy, not a FLAC source
+                    continue
+                avail = at.get('availability')
+                if avail is not None and 'STREAM' not in avail:  # explicitly not streamable (pre-release/pulled); None -> keep
+                    unavailable += 1
+                    _PRERELEASE.append(('tidal', isrc, _fmt_avail(alb_date.get(aid)), at.get('title') or ''))
+                    continue
+                if artist_filter:
+                    # Same rule as _artist_on_track: keep on id OR a tolerant NAME
+                    # match (variant credits like "Heart with the ... Horns") OR when
+                    # the track carries no artist data. Filters other artists' tracks
+                    # riding along on VA/compilation albums.
+                    tarts = (((t.get('relationships') or {}).get('artists') or {}).get('data')) or []
+                    tids = {str(a.get('id')) for a in tarts if a.get('id')}
+                    keep = str(artist_id) in tids
+                    if not keep and artist_name:
+                        tn = _norm(artist_name)
+                        keep = any(nm and _name_matches(tn, _norm(nm))
+                                   for nm in (names.get(a.get('id')) for a in tarts))
+                    if not keep and not tids:  # no artist data -> don't over-filter
+                        keep = True
+                    if not keep:
+                        skipped += 1
+                        continue
+                _TITLES.setdefault(isrc, at.get('title') or '')
+                _keep_best(out, isrc, (str(tid), bd, sr))
+        if not got_any:
+            failed_albums.append(aid)
+        time.sleep(0.03)
+    if skipped_albums:
+        log(f'  tidal: skipped {skipped_albums} album(s) not credited to this artist')
+    if skipped:
+        log(f'  tidal: skipped {skipped} track(s) not performed by this artist')
+    if unavailable:
+        log(f'  tidal: skipped {unavailable} track(s) not yet streamable (pre-release/unavailable)')
+    _report_failed_albums('tidal', failed_albums)
+    return out
+
+
+def _enumerate_tidal_auth(session, artist_id, credited, max_albums=0, artist_filter=True,
+                          own_albums_only=False, artist_name=None):
+    """Fallback: enumerate Tidal via the AUTHENTICATED account session (used only
+    when the guest token is unavailable)."""
     out = {}
     skipped = 0
     skipped_albums = 0
