@@ -823,12 +823,40 @@ def choose_service(cands, target, prefer):
 # --------------------------------------------------------------------------- #
 # Download (delegated to orpheus.py) + ISRC-based cross-service fallback
 # --------------------------------------------------------------------------- #
+# Failure line printed by music_downloader when a track can't even be resolved
+# (get_track_info 404 / dead catalog id / "FLAC only: track omitted"). These never
+# create an error.txt, so they are INVISIBLE to failed_isrcs_since(); parse them
+# from stdout instead. The captured id is the display track id (== our stored tid).
+_TRACK_FAIL_RE = re.compile(r'Could not get track info for (\S+?):')
+
+
+def failed_ids_from_output(text):
+    """Track ids that failed at the get_track_info stage in an orpheus run."""
+    return {m.group(1).strip() for m in _TRACK_FAIL_RE.finditer(text or '')}
+
+
 def run_orpheus(urls, dlq, out_path):
-    cmd = [sys.executable, 'orpheus.py', *urls, '-q', dlq]
+    """Run orpheus.py for these track URLs. Streams orpheus output live AND
+    captures it, so the caller can tell which tracks failed to resolve (a 404 /
+    dead id writes no error.txt). Returns (returncode, captured_stdout).
+    `-u` keeps the child unbuffered so the tee stays live during long runs."""
+    cmd = [sys.executable, '-u', 'orpheus.py', *urls, '-q', dlq]
     if out_path:
         cmd += ['-o', out_path]
-    p = subprocess.run(cmd, cwd=SCRIPT_DIR, stdin=subprocess.DEVNULL)
-    return p.returncode
+    # Force the child to emit utf-8 on its (now piped) stdout so unicode titles
+    # (accents, full-width chars) match our decode and don't turn into U+FFFD.
+    env = dict(os.environ)
+    env['PYTHONIOENCODING'] = 'utf-8'
+    p = subprocess.Popen(cmd, cwd=SCRIPT_DIR, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, encoding='utf-8', errors='replace', bufsize=1, env=env)
+    chunks = []
+    for line in p.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        chunks.append(line)
+    p.wait()
+    return p.returncode, ''.join(chunks)
 
 
 def failed_isrcs_since(base, since):
@@ -1069,32 +1097,60 @@ def main():
 
         # ---- download: one orpheus.py call per (primary service, dlq) batch ----
         run_start = time.time()
-        by_service = {}
+        order_by_isrc = dict(plan)
+        by_service = {}  # svc -> list of (isrc, tid, url), in plan order
         for isrc, order in plan:
             svc = order[0]
-            tid = union[isrc][svc][0]
-            by_service.setdefault(svc, []).append(track_url(svc, tid))
+            tid = str(union[isrc][svc][0])
+            by_service.setdefault(svc, []).append((isrc, tid, track_url(svc, tid)))
+
+        # ISRCs whose PRIMARY track failed at get_track_info (404 / dead catalog
+        # id / flac-only omit). Those write no error.txt, so detect them from the
+        # captured stdout and feed them into the same cross-service fallback.
+        failed_direct = set()
         for svc in [s for s in prefer if s in by_service]:
-            urls = by_service[svc]
-            log(f'\n=== Downloading {len(urls)} track(s) from {svc} @ {dlq} ===')
-            for i in range(0, len(urls), 40):
-                run_orpheus(urls[i:i + 40], dlq, out_path)
+            entries = by_service[svc]
+            log(f'\n=== Downloading {len(entries)} track(s) from {svc} @ {dlq} ===')
+            for i in range(0, len(entries), 40):
+                chunk = entries[i:i + 40]
+                id_to_isrc = {tid: isrc for isrc, tid, _u in chunk}
+                _rc, out = run_orpheus([u for _i, _t, u in chunk], dlq, out_path)
+                for bad_id in failed_ids_from_output(out):
+                    isrc = id_to_isrc.get(bad_id)
+                    if isrc:
+                        failed_direct.add(isrc)
 
         # ---- cross-service fallback for failures (by ISRC, next-best service) ----
-        failed = failed_isrcs_since(out_path, run_start)
-        retry = []
-        for isrc, order in plan:
-            if isrc in failed and len(order) > 1:
-                retry.append((isrc, order[1:]))
+        # error.txt detection catches failures AFTER metadata (tagging/io);
+        # failed_direct catches get_track_info failures. Use the union of both.
+        failed = failed_isrcs_since(out_path, run_start) | failed_direct
+        retry = [(isrc, order[1:]) for isrc, order in plan
+                 if isrc in failed and len(order) > 1]
+        recovered = set()
         if retry:
             log(f'\n=== ISRC fallback: {len(retry)} track(s) failed on best source; '
                 f'retrying on next-best service ===')
-            for isrc, order in retry:
-                for svc in order:
-                    tid = union[isrc][svc][0]
+            for isrc, alts in retry:
+                for svc in alts:
+                    tid = str(union[isrc][svc][0])
                     log(f'  retry {isrc} via {svc}')
-                    if run_orpheus([track_url(svc, tid)], dlq, out_path) == 0:
+                    rc, out = run_orpheus([track_url(svc, tid)], dlq, out_path)
+                    if rc == 0 and tid not in failed_ids_from_output(out):
+                        recovered.add(isrc)
                         break
+
+        # ---- visibility: tracks lost on EVERY source. orpheus reports these as
+        # "NO ERRORS", so surface them here or a big batch drops them silently. ----
+        unrecovered = [isrc for isrc, _order in plan
+                       if isrc in failed and isrc not in recovered]
+        if recovered:
+            log(f'\n✔ recovered {len(recovered)} track(s) via cross-service fallback')
+        if unrecovered:
+            log(f'\n⚠️ {len(unrecovered)} track(s) could NOT be downloaded from ANY '
+                f'source (no FLAC anywhere / dead catalog ids):')
+            for isrc in unrecovered:
+                tried = '/'.join(order_by_isrc.get(isrc, [])) or '?'
+                log(f'    {isrc}  (tried: {tried})')
 
         log('\nDone.')
     finally:
