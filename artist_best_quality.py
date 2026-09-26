@@ -369,6 +369,7 @@ def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=Tr
     skipped = 0
     skipped_albums = 0
     failed_albums = []
+    unavailable = 0
     artist = call_timeout(lambda: session.get_artist(str(artist_id)), 60,
                           default=None, label='qobuz get_artist')
     if not artist:
@@ -400,6 +401,9 @@ def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=Tr
             tid = tr.get('id')
             if not (isrc and tid is not None):
                 continue
+            if tr.get('streamable') is False:  # pre-release/embargoed (streamable_at future) or pulled
+                unavailable += 1
+                continue
             if artist_filter and not _artist_on_track(tr, 'qobuz', artist_id, artist_name):
                 skipped += 1
                 continue
@@ -409,6 +413,8 @@ def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=Tr
         log(f'  qobuz: skipped {skipped_albums} album(s) not credited to this artist')
     if skipped:
         log(f'  qobuz: skipped {skipped} track(s) not performed by this artist')
+    if unavailable:
+        log(f'  qobuz: skipped {unavailable} track(s) not yet streamable (pre-release/unavailable)')
     _report_failed_albums('qobuz', failed_albums)
     return out
 
@@ -419,6 +425,7 @@ def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=Tr
     skipped = 0
     skipped_albums = 0
     failed_albums = []
+    unavailable = 0
     album_ids = []
     alb_artist_ids = {}  # album id -> set of album-artist ids (from the listing)
     for fn in ('get_artist_albums', 'get_artist_albums_ep_singles'):
@@ -451,6 +458,9 @@ def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=Tr
             bd, sr = tidal_quality(item.get('audioQuality'))
             if not (isrc and tid is not None and bd):  # bd==0 -> lossy, not a FLAC source
                 continue
+            if item.get('streamReady') is False:  # pre-release (streamStartDate future) or pulled
+                unavailable += 1
+                continue
             if artist_filter and not _artist_on_track(item, 'tidal', artist_id, artist_name):
                 skipped += 1
                 continue
@@ -460,6 +470,8 @@ def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=Tr
         log(f'  tidal: skipped {skipped_albums} album(s) not credited to this artist')
     if skipped:
         log(f'  tidal: skipped {skipped} track(s) not performed by this artist')
+    if unavailable:
+        log(f'  tidal: skipped {unavailable} track(s) not yet streamable (pre-release/unavailable)')
     _report_failed_albums('tidal', failed_albums)
     return out
 
@@ -470,6 +482,7 @@ def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=T
     skipped = 0
     skipped_albums = 0
     failed_albums = []
+    unavailable = 0
     album_ids, start, page = [], 0, 200
     while True:
         batch = call_timeout(
@@ -504,6 +517,9 @@ def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=T
             if not isrc:
                 missing_isrc += 1
                 continue
+            if (tr.get('RIGHTS') or {}).get('STREAM_SUB_AVAILABLE') is False:  # not streamable on sub (pre-release/pulled)
+                unavailable += 1
+                continue
             if artist_filter and not _artist_on_track(tr, 'deezer', artist_id, artist_name):
                 skipped += 1
                 continue
@@ -515,6 +531,8 @@ def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=T
         log(f'  deezer: {missing_isrc} tracks had no ISRC in album data (skipped for discovery)')
     if skipped:
         log(f'  deezer: skipped {skipped} track(s) not performed by this artist')
+    if unavailable:
+        log(f'  deezer: skipped {unavailable} track(s) not yet streamable (pre-release/unavailable)')
     _report_failed_albums('deezer', failed_albums)
     return out
 
