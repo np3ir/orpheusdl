@@ -342,11 +342,33 @@ def _album_artist_ids(album_obj, service):
     return ids
 
 
+def fetch_album_retry(fn, seconds, label, attempts=3, wait=3.0):
+    """call_timeout with retries: a transient timeout/hiccup on a slow API or NAS
+    must not silently drop an album from the union (that loses a real FLAC source
+    for the whole artist run). Returns the result, or None after all attempts."""
+    for n in range(1, attempts + 1):
+        res = call_timeout(fn, seconds, default=None, label=label)
+        if res:
+            return res
+        if n < attempts:
+            time.sleep(wait)
+    return None
+
+
+def _report_failed_albums(service, failed):
+    if failed:
+        shown = ', '.join(str(a) for a in failed[:20])
+        more = f' … (+{len(failed) - 20})' if len(failed) > 20 else ''
+        log(f'  ⚠️ {service}: {len(failed)} album(s) could NOT be read after retries '
+            f'-> excluded from the union (may lose FLAC sources): {shown}{more}')
+
+
 def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=True,
                     own_albums_only=False, artist_name=None):
     out = {}
     skipped = 0
     skipped_albums = 0
+    failed_albums = []
     artist = call_timeout(lambda: session.get_artist(str(artist_id)), 60,
                           default=None, label='qobuz get_artist')
     if not artist:
@@ -360,9 +382,9 @@ def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=Tr
         aid = alb.get('id')
         if aid is None:
             continue
-        data = call_timeout(lambda: session.get_album(str(aid)), 45,
-                            default=None, label=f'qobuz album {aid}')
+        data = fetch_album_retry(lambda: session.get_album(str(aid)), 45, f'qobuz album {aid}')
         if not data:
+            failed_albums.append(aid)
             continue
         if own_albums_only:
             aids = _album_artist_ids(data, 'qobuz')
@@ -387,6 +409,7 @@ def enumerate_qobuz(session, artist_id, credited, max_albums=0, artist_filter=Tr
         log(f'  qobuz: skipped {skipped_albums} album(s) not credited to this artist')
     if skipped:
         log(f'  qobuz: skipped {skipped} track(s) not performed by this artist')
+    _report_failed_albums('qobuz', failed_albums)
     return out
 
 
@@ -395,6 +418,7 @@ def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=Tr
     out = {}
     skipped = 0
     skipped_albums = 0
+    failed_albums = []
     album_ids = []
     alb_artist_ids = {}  # album id -> set of album-artist ids (from the listing)
     for fn in ('get_artist_albums', 'get_artist_albums_ep_singles'):
@@ -414,9 +438,9 @@ def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=Tr
             if aids and str(artist_id) not in aids:
                 skipped_albums += 1
                 continue
-        res = call_timeout(lambda: session.get_album_items_all(str(aid)), 60,
-                           default=None, label=f'tidal album {aid}')
+        res = fetch_album_retry(lambda: session.get_album_items_all(str(aid)), 60, f'tidal album {aid}')
         if not res:
+            failed_albums.append(aid)
             continue
         for row in res.get('items') or []:
             item = row.get('item') if isinstance(row, dict) and 'item' in row else row
@@ -436,6 +460,7 @@ def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=Tr
         log(f'  tidal: skipped {skipped_albums} album(s) not credited to this artist')
     if skipped:
         log(f'  tidal: skipped {skipped} track(s) not performed by this artist')
+    _report_failed_albums('tidal', failed_albums)
     return out
 
 
@@ -444,6 +469,7 @@ def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=T
     out = {}
     skipped = 0
     skipped_albums = 0
+    failed_albums = []
     album_ids, start, page = [], 0, 200
     while True:
         batch = call_timeout(
@@ -461,9 +487,9 @@ def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=T
     log(f'  deezer: {len(album_ids)} albums')
     missing_isrc = 0
     for aid in album_ids:
-        album = call_timeout(lambda: session.get_album(str(aid)), 30,
-                             default=None, label=f'deezer album {aid}')
+        album = fetch_album_retry(lambda: session.get_album(str(aid)), 30, f'deezer album {aid}')
         if not album:
+            failed_albums.append(aid)
             continue
         if own_albums_only:
             aids = _album_artist_ids(album, 'deezer')
@@ -489,6 +515,7 @@ def enumerate_deezer(session, artist_id, credited, max_albums=0, artist_filter=T
         log(f'  deezer: {missing_isrc} tracks had no ISRC in album data (skipped for discovery)')
     if skipped:
         log(f'  deezer: skipped {skipped} track(s) not performed by this artist')
+    _report_failed_albums('deezer', failed_albums)
     return out
 
 
