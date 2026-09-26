@@ -25,6 +25,13 @@ jobs:
       - name: Ruff (real-bug rules only; config in pyproject.toml)
         run: ruff check .
 
+      - name: Clone service modules (test_flac_only.py reads modules/*/interface.py)
+        run: |
+          git clone -b feat/rate-limit-flac-only https://github.com/np3ir/orpheusdl-qobuz.git  modules/qobuz
+          git clone -b feat/rate-limit-flac-only https://github.com/np3ir/OrpheusDL-deezer.git modules/deezer
+          git clone --recurse-submodules -b feat/rate-limit-flac-only https://github.com/np3ir/orpheusdl-tidal.git modules/tidal
+          git clone -b codex/flac-only https://github.com/np3ir/orpheusdl-spotify.git modules/spotify
+
       - name: Tests
         # Two isrc-library tests are pre-existing/stale vs the "don't block on
         # unreadable files" (incomplete_scan) behaviour change — deselected until
