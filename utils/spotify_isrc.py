@@ -24,7 +24,12 @@ one call per track on a 400-track playlist exhausts it and Spotify answers
      content in it) so no call is made before Retry-After has passed, even in a
      new run. Every message shows what Spotify sent (status, reason, message,
      Retry-After).
-  5. 401 (bad/expired token): renew the 1 h Client Credentials token once.
+  5. Token: own Client Credentials request as documented (POST
+     accounts.spotify.com/api/token, ``Authorization: Basic base64(id:secret)``,
+     grant_type=client_credentials), reused until shortly before ``expires_in``
+     and then requested again (this flow has no refresh token). OAuth errors
+     (invalid_client...) are reported with error/error_description.
+     401 (bad/expired token): request a new token once.
      403 on track lookups / a second 401: stop. 5xx and network errors: retried
      with exponential backoff (1 s, 2 s, 4 s); repeated failures stop the bucket.
 """
@@ -41,6 +46,8 @@ _429_BASE = 1               # seconds; 429 backoff is 1, 2, 4, 8, 16 (or Retry-A
 _429_RETRIES = 5
 _429_MAX_WAIT = 600         # longer Retry-After -> stop the bucket instead of sleeping for hours
 _API = 'https://api.spotify.com/v1'
+_TOKEN_URL = 'https://accounts.spotify.com/api/token'
+_TOKEN_MARGIN = 60          # renew this many seconds before expires_in
 _BUCKETS = {'tracks': 'track lookups (GET /tracks/{id})',
             'playlists': 'playlist reads (GET /playlists/{id}/items)'}
 
@@ -68,6 +75,10 @@ def _isrc_of(track):
     return ((track.get('external_ids') or {}).get('isrc') or '').strip().upper() or None
 
 
+class _CredentialsError(Exception):
+    """The token endpoint refused the app (or no client_id/client_secret)."""
+
+
 class SpotifyIsrcLookup:
     """isrc(track_id) -> ISRC or None; prefetch_playlist(id) fills the cache in bulk."""
 
@@ -83,6 +94,8 @@ class SpotifyIsrcLookup:
         self.stopped_by = {b: None for b in _BUCKETS}   # bucket -> reason, once disabled
         self.stats = {'spotify': 0, 'missing': 0}
         self._last = 0.0
+        self._tok = None
+        self._tok_exp = 0.0
         self._failures = {b: 0 for b in _BUCKETS}
         blocks = self._blocks()
         for bucket, block in blocks.items():
@@ -110,7 +123,7 @@ class SpotifyIsrcLookup:
             return self.cache[tid]
         found = None
         if not self.stopped:
-            ok, tr = self._call('tracks', lambda: self.api.client.track(tid))
+            ok, tr = self._call('tracks', lambda tok: self._get(f'{_API}/tracks/{tid}', tok))
             found = _isrc_of(tr) if ok and isinstance(tr, dict) else None
         if found:
             self._remember(tid, found)
@@ -129,7 +142,7 @@ class SpotifyIsrcLookup:
         url = f'{_API}/playlists/{playlist_id}/items?limit={_PAGE_LIMIT}'
         got = pages = 0
         while url:
-            ok, page = self._call('playlists', lambda url=url: self._get(url))
+            ok, page = self._call('playlists', lambda tok, url=url: self._get(url, tok))
             if not ok or not isinstance(page, dict):
                 return None
             pages += 1
@@ -153,8 +166,40 @@ class SpotifyIsrcLookup:
         """Kept for callers; nothing is written (no caching beyond this run)."""
 
     # --------------------------------------------------------------- spotify
-    def _get(self, url):
-        r = requests.get(url, headers={'Authorization': f'Bearer {self.api.client.token}'}, timeout=20)
+    def _token(self):
+        """Client Credentials access token, requested as the Spotify tutorial shows
+        and reused until _TOKEN_MARGIN seconds before it expires."""
+        if self._tok and time.monotonic() < self._tok_exp:
+            return self._tok
+        cfg = getattr(self.api, 'config', None) or {}
+        cid = str(cfg.get('client_id') or '').strip()
+        secret = str(cfg.get('client_secret') or '').strip()
+        if not cid or not secret:
+            raise _CredentialsError('Spotify Web API unavailable (set client_id/client_secret in '
+                                    'config/settings.json > modules > spotify).')
+        r = requests.post(_TOKEN_URL, data={'grant_type': 'client_credentials'},
+                          auth=(cid, secret), timeout=20)   # Authorization: Basic base64(id:secret)
+        if r.status_code >= 500:
+            r.raise_for_status()                            # transient: retried with backoff
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        if r.status_code != 200 or not body.get('access_token'):
+            err = body.get('error')
+            if isinstance(err, dict):                        # Web API style error object
+                why = _detail(err)
+            else:                                            # OAuth style: error / error_description
+                why = ' / '.join(str(x) for x in (err, body.get('error_description')) if x)
+            raise _CredentialsError(f'Spotify token request failed ({r.status_code}'
+                                    f'{": " + why if why else ""}); check client_id/client_secret.')
+        self._tok = body['access_token']
+        self._tok_exp = time.monotonic() + max(0, int(body.get('expires_in') or 3600) - _TOKEN_MARGIN)
+        return self._tok
+
+    @staticmethod
+    def _get(url, token):
+        r = requests.get(url, headers={'Authorization': f'Bearer {token}'}, timeout=20)
         r.raise_for_status()
         return r.json()
 
@@ -165,19 +210,22 @@ class SpotifyIsrcLookup:
         n429 = 0
         while True:
             try:
-                ready = self.api._init_web_api_client() and getattr(self.api, 'client', None)
-            except Exception:
-                ready = False
-            if not ready:
-                self._stop_all('Spotify Web API unavailable (set client_id/client_secret in '
-                               'config/settings.json > modules > spotify).')
+                tok = self._token()
+            except _CredentialsError as e:
+                self._stop_all(str(e))
+                return False, None
+            except Exception as e:
+                if backoff:
+                    time.sleep(backoff.pop(0))
+                    continue
+                self._transient(bucket, f'token request: {e}')
                 return False, None
             wait = self._last + _SPOTIFY_INTERVAL - time.monotonic()
             if wait > 0:
                 time.sleep(wait)
             self._last = time.monotonic()
             try:
-                data = fn()
+                data = fn(tok)
             except requests.HTTPError as e:
                 resp = e.response
                 code = getattr(resp, 'status_code', None)
@@ -188,10 +236,10 @@ class SpotifyIsrcLookup:
                     return False, None
                 d = _detail(_error_of(resp))
                 if code == 401 and not renewed:
-                    # Bad or expired token. Client Credentials tokens last 1 h and have
-                    # no refresh token: drop the client so a new token is requested.
+                    # Bad or expired token. Client Credentials has no refresh token:
+                    # request a new access token and retry once.
                     renewed = True
-                    self.api.client = None
+                    self._tok = None
                     continue
                 if code == 403 and bucket == 'playlists':
                     # Spec: get-playlists-items is owner/collaborator-only (403 otherwise).
