@@ -65,10 +65,18 @@ def test_status_retries_exhausted_returns_none(env):
 
 def test_network_errors_use_their_own_budget(env):
     install, waits, calls, _ = env
-    install(requests.ConnectionError('reset'), requests.Timeout('slow'), resp(429),
+    install(requests.ConnectionError('reset'), requests.ConnectionError('reset'), resp(429),
             resp(200, {'ok': True}))
     assert abq._tidal_guest_get('/x') == {'ok': True}
     assert waits == pytest.approx([0.8, 1.6, 0.4])  # network n=0,1 then status n=0
+
+
+def test_timeouts_use_the_sdk_timeout_policy(env):
+    install, waits, calls, _ = env
+    install(*[requests.Timeout('slow')] * 4)
+    assert abq._tidal_guest_get('/x') is None
+    assert len(calls) == 4                           # 3 retries, as in the SDK
+    assert waits == pytest.approx([6.4, 12.8, 25.6])  # 8 s * 2^n * 0.8, cap 32 s
 
 
 def test_404_is_not_retried(env):

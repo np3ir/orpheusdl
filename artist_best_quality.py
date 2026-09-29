@@ -514,7 +514,8 @@ def _tidal_guest_auth():
 # callers don't hit the rate limit again in lockstep. (base s, cap s, max retries)
 _TIDAL_RETRY = {
     'status': (0.5, 16.0, 5),    # 429 / 5xx  (SDK: 3 retries; abq favours completeness)
-    'network': (1.0, 16.0, 10),  # connection errors / timeouts (SDK default)
+    'network': (1.0, 16.0, 10),  # connection errors / bad bodies (SDK default)
+    'timeout': (8.0, 32.0, 3),   # read timeouts (SDK default; each attempt already waited 45 s)
 }
 
 
@@ -528,13 +529,15 @@ def _tidal_guest_get(path):
     (that would lose tracks -- unacceptable for a quality-first library)."""
     if not _TIDAL_GUEST['tok'] and _tidal_guest_auth() is None:
         return None
-    retries = {'status': 0, 'network': 0}
+    retries = {'status': 0, 'network': 0, 'timeout': 0}
     reauthed = False
     while True:
         try:
             r = requests.get('https://openapi.tidal.com/v2' + path,
                              headers={'Authorization': f'Bearer {_TIDAL_GUEST["tok"]}',
                                       'accept': 'application/vnd.api+json'}, timeout=45)
+        except requests.Timeout:
+            kind = 'timeout'
         except requests.RequestException:
             kind = 'network'
         else:
