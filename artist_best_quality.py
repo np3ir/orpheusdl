@@ -564,44 +564,88 @@ def _tidal_guest_quality(media_tags):
 
 
 # ISRC lookups via the guest token: GET /tracks?filter[isrc]=... (THIRD_PARTY tier,
-# client-credentials). Up to 20 ISRCs per request (filter[isrc] maxItems), one track
-# per ISRC; with a single ISRC the endpoint paginates and may return several tracks.
-# Saves one account (v1) request per ISRC, which matters for big playlists.
+# client-credentials). Per the TIDAL API reference: up to 20 ISRCs per request
+# (filter[isrc] maxItems); with several ISRCs ONE track per ISRC is returned without
+# pagination, with a single ISRC every track (all versions) is returned, paginated.
+# The one track a batch returns may be a lossless or lossy copy while another
+# version of the same recording is hi-res, so a batch result is trusted only when
+# it is already the best possible (streamable HIRES) or the ISRC is absent; any other
+# ISRC is re-checked alone to see all its versions. Everything here is guest-token
+# traffic: no account (v1) request per ISRC, which matters for big playlists.
 _TIDAL_MISS = object()   # guest lookup unavailable/failed -> caller uses the account session
 _TIDAL_ISRC_CACHE = {}   # ISRC -> (track_id, bit_depth, sample_rate, artist_id) | None (not on Tidal)
 _TIDAL_ISRC_BATCH = 20
 
 
+def _tidal_guest_isrc_query(isrcs):
+    """One /tracks?filter[isrc]=... lookup, following pagination (single ISRC).
+    Returns {ISRC: [(track_id, bd, sr, artist_id, streamable), ...]}, or None if
+    any page failed (an incomplete answer must not be read as "absent")."""
+    query = urlencode([('countryCode', _TIDAL_CC), ('include', 'artists')]
+                      + [('filter[isrc]', i) for i in isrcs], safe='[]')
+    path, seen, out = f'/tracks?{query}', set(), {}
+    while path and path not in seen and len(seen) < 20:
+        seen.add(path)
+        j = _tidal_guest_get(path)
+        if j is None:
+            return None
+        for t in j.get('data') or []:
+            at = t.get('attributes') or {}
+            isrc = (at.get('isrc') or '').strip().upper()
+            if not isrc or t.get('id') in (None, ''):
+                continue
+            bd, sr = _tidal_guest_quality(at.get('mediaTags'))
+            arts = ((t.get('relationships') or {}).get('artists') or {}).get('data') or []
+            art_id = str(arts[0]['id']) if arts and arts[0].get('id') else None
+            avail = at.get('availability')  # same rule as enumerate_tidal: None -> keep
+            out.setdefault(isrc, []).append((str(t['id']), bd, sr, art_id,
+                                             avail is None or 'STREAM' in avail))
+        path = (j.get('links') or {}).get('next')
+        if path:
+            time.sleep(0.03)
+    return out
+
+
+def _tidal_best_version(versions):
+    """(track_id, bd, sr, artist_id) of the best streamable FLAC version, or
+    (None, 0, 0.0, artist_id) when none is (lossy only / not streamable); None
+    when there are no versions at all (not on Tidal)."""
+    if not versions:
+        return None
+    art_id = next((v[3] for v in versions if v[3]), None)
+    flac = [v for v in versions if v[1] and v[4]]
+    if not flac:
+        return (None, 0, 0.0, art_id)
+    tid, bd, sr = max(flac, key=lambda v: (v[1], v[2]))[:3]
+    return (tid, bd, sr, art_id)
+
+
 def _tidal_guest_isrc_fetch(isrcs):
-    """Look up ISRCs not yet cached, in batches of 20. A batch whose request fails
-    is left uncached, so those ISRCs fall back to the account lookup."""
+    """Look up ISRCs not yet cached: 20 per request, then each ISRC whose batch
+    answer is not already a streamable hi-res version alone (all its versions).
+    A failed request leaves its ISRCs uncached, so they fall back to the account."""
     todo = [i for i in dict.fromkeys((x or '').strip().upper() for x in isrcs)
             if i and i not in _TIDAL_ISRC_CACHE]
     if not todo or not (_TIDAL_GUEST['tok'] or _tidal_guest_auth()):
         return
+    failed = 0
     for n in range(0, len(todo), _TIDAL_ISRC_BATCH):
         chunk = todo[n:n + _TIDAL_ISRC_BATCH]
-        query = urlencode([('countryCode', _TIDAL_CC), ('include', 'artists')]
-                          + [('filter[isrc]', i) for i in chunk], safe='[]')
-        found, got_page = {}, False
-        for j in _tidal_guest_pages(f'/tracks?{query}', cap=20):
-            got_page = True
-            for t in j.get('data') or []:
-                at = t.get('attributes') or {}
-                isrc = (at.get('isrc') or '').strip().upper()
-                if not isrc or t.get('id') in (None, ''):
-                    continue
-                bd, sr = _tidal_guest_quality(at.get('mediaTags'))
-                arts = ((t.get('relationships') or {}).get('artists') or {}).get('data') or []
-                art_id = str(arts[0]['id']) if arts and arts[0].get('id') else None
-                old = found.get(isrc)
-                if old is None or (bd, sr) > (old[1], old[2]):
-                    found[isrc] = (str(t['id']), bd, sr, art_id or (old[3] if old else None))
-        if not got_page:
-            log(f'  ⚠️ tidal: guest ISRC lookup failed for {len(chunk)} ISRC(s) -> using the account')
+        found = _tidal_guest_isrc_query(chunk)
+        if found is None:
+            failed += len(chunk)
             continue
         for i in chunk:
-            _TIDAL_ISRC_CACHE[i] = found.get(i)
+            best = _tidal_best_version(found.get(i))
+            if len(chunk) > 1 and best is not None and best[1] < 24:
+                alone = _tidal_guest_isrc_query([i])  # every version of this recording
+                if alone is None:
+                    failed += 1
+                    continue
+                best = _tidal_best_version(alone.get(i) or found.get(i))
+            _TIDAL_ISRC_CACHE[i] = best
+    if failed:
+        log(f'  ⚠️ tidal: guest ISRC lookup failed for {failed} ISRC(s) -> using the account for them')
 
 
 def _tidal_guest_isrc(isrc):
@@ -1090,7 +1134,7 @@ def probe_isrc(core, service, isrc):
     if service == 'tidal':
         hit = _tidal_guest_isrc(up)
         if hit is not _TIDAL_MISS:
-            return (hit[0], hit[1], hit[2]) if hit and hit[1] else None  # bd 0 = lossy only
+            return (hit[0], hit[1], hit[2]) if hit and hit[1] else None  # bd 0: lossy only / not streamable
         res = call_timeout(lambda: core.session('tidal').get_tracks_by_isrc(isrc),
                            15, default=None, label=f'tidal isrc {isrc}')
         items = res.get('items') if isinstance(res, dict) else res

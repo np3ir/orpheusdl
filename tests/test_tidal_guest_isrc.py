@@ -7,9 +7,11 @@ import pytest
 abq = pytest.importorskip('artist_best_quality')
 
 
-def track(tid, isrc, tags=('LOSSLESS',), artist='7'):
-    return {'id': tid, 'type': 'tracks',
-            'attributes': {'isrc': isrc, 'mediaTags': list(tags), 'title': f't{tid}'},
+def track(tid, isrc, tags=('LOSSLESS',), artist='7', availability=None):
+    at = {'isrc': isrc, 'mediaTags': list(tags), 'title': f't{tid}'}
+    if availability is not None:
+        at['availability'] = list(availability)
+    return {'id': tid, 'type': 'tracks', 'attributes': at,
             'relationships': {'artists': {'data': [{'id': artist, 'type': 'artists'}]}}}
 
 
@@ -50,14 +52,48 @@ def no_account():
 
 def test_prefetch_batches_20_per_request(guest):
     wanted = [f'USX{n:09d}' for n in range(45)]
-    fake = guest(lambda p: {'data': [track(i, s) for i, s in enumerate(isrcs_of(p))], 'links': {}})
+    fake = guest(lambda p: {'data': [track(i, s, ('HIRES_LOSSLESS', 'LOSSLESS'))
+                                     for i, s in enumerate(isrcs_of(p))], 'links': {}})
     abq._tidal_guest_isrc_fetch(wanted)
-    assert [len(isrcs_of(p)) for p in fake.paths] == [20, 20, 5]
+    assert [len(isrcs_of(p)) for p in fake.paths] == [20, 20, 5]   # hi-res answers: no re-check
     assert all(p.startswith('/tracks?') and 'include=artists' in p for p in fake.paths)
     # later probes are served from the cache: no more requests, no account calls
     n = len(fake.paths)
-    assert abq.probe_isrc(no_account(), 'tidal', wanted[0]) == ('0', 16, 44.1)
+    assert abq.probe_isrc(no_account(), 'tidal', wanted[0]) == ('0', 24, 96.0)
     assert len(fake.paths) == n
+
+
+def test_batch_answer_below_hires_is_rechecked_alone(guest):
+    # A batch returns ONE version per ISRC (here the 16-bit one); alone, the ISRC
+    # returns all its versions, including a hi-res album copy.
+    def handler(p):
+        wanted = isrcs_of(p)
+        if len(wanted) > 1:
+            return {'data': [track('lo', 'AA'), track('x', 'BB', ('HIRES_LOSSLESS',))]}
+        return {'data': [track('lo', 'AA'), track('hi', 'AA', ('HIRES_LOSSLESS', 'LOSSLESS'))]}
+    fake = guest(handler)
+    abq._tidal_guest_isrc_fetch(['AA', 'BB', 'CC'])
+    assert [isrcs_of(p) for p in fake.paths] == [['AA', 'BB', 'CC'], ['AA']]  # CC absent, BB hi-res
+    assert abq.probe_isrc(no_account(), 'tidal', 'AA') == ('hi', 24, 96.0)
+    assert abq.probe_isrc(no_account(), 'tidal', 'BB') == ('x', 24, 96.0)
+    assert abq.probe_isrc(no_account(), 'tidal', 'CC') is None
+
+
+def test_not_streamable_versions_are_not_candidates(guest):
+    guest(lambda p: {'data': [track('pre', 'AA', ('HIRES_LOSSLESS',), availability=('DJ',)),
+                              track('ok', 'AA', ('LOSSLESS',), availability=('STREAM',))]})
+    abq._tidal_guest_isrc_fetch(['AA'])
+    assert abq.probe_isrc(no_account(), 'tidal', 'AA') == ('ok', 16, 44.1)
+
+
+def test_failed_second_page_is_not_cached_as_absent(guest):
+    def handler(p):
+        if 'page' in p:
+            return None                          # next page failed after its retries
+        return {'data': [track('a', 'AA', ('',))], 'links': {'next': '/tracks?page[cursor]=2'}}
+    guest(handler)
+    abq._tidal_guest_isrc_fetch(['AA'])
+    assert 'AA' not in abq._TIDAL_ISRC_CACHE    # incomplete -> account fallback, not "no FLAC"
 
 
 def test_probe_picks_best_quality_and_skips_lossy(guest):
