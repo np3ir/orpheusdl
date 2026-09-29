@@ -48,6 +48,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from utils import deezer_public
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(SCRIPT_DIR, 'config')
 SETTINGS_PATH = os.path.join(CONFIG_DIR, 'settings.json')
@@ -960,13 +962,46 @@ def resolve_artist(core, service, sample_isrcs, artist_name):
     return None, None
 
 
+_DEEZER_HTTP = None
+
+
+def _deezer_http(core):
+    """requests.Session for api.deezer.com that respects the Deezer rate gate.
+
+    Reuses the loaded deezer module's session (it already carries the gate from
+    install_service_gate), so abq's public lookups and the module share one pace.
+    If the module is not loaded, uses our own session with the same gate, without
+    forcing a module load/login just for public lookups."""
+    mod = getattr(core, '_modules', {}).get('deezer')
+    s = getattr(getattr(mod, 'session', None), 's', None)
+    if isinstance(s, requests.Session):
+        return s
+    global _DEEZER_HTTP
+    if _DEEZER_HTTP is None:
+        _DEEZER_HTTP = requests.Session()
+        try:
+            from utils.rate_limit import install_service_gate
+            install_service_gate(_DEEZER_HTTP, 'deezer', 'ORPHEUS_DEEZER_RPM', 60)
+        except Exception as e:
+            log(f'  deezer: could not install rate gate on public-API session: {e}')
+    return _DEEZER_HTTP
+
+
+def _deezer_public(core, path, what):
+    """Deezer public-API GET. Returns the body, None if Deezer says 'no data' (800),
+    or None with a visible warning if the lookup failed after retries."""
+    try:
+        return deezer_public.get(path, http=_deezer_http(core))
+    except deezer_public.DeezerLookupError as e:
+        log(f'  ⚠️ deezer: {what} lookup FAILED ({e}) -> Deezer not considered for it')
+        return None
+
+
 def _artist_id_by_isrc(core, service, isrc):
     if service == 'deezer':
-        try:
-            r = requests.get(f'https://api.deezer.com/track/isrc:{isrc}', timeout=20).json()
-            return str(((r.get('artist') or {}).get('id'))) if r.get('artist') else None
-        except Exception:
-            return None
+        r = _deezer_public(core, f'/track/isrc:{isrc}', f'ISRC {isrc}') or {}
+        a = r.get('artist') or {}
+        return str(a['id']) if a.get('id') is not None else None
     if service == 'tidal':
         res = call_timeout(lambda: core.session('tidal').get_tracks_by_isrc(isrc),
                            15, default=None, label=f'tidal isrc {isrc}')
@@ -1008,12 +1043,9 @@ def probe_isrc(core, service, isrc):
                 return (str(it['id']), bd, sr)
         return None
     if service == 'deezer':
-        try:
-            r = requests.get(f'https://api.deezer.com/track/isrc:{isrc}', timeout=20).json()
-            if r.get('id'):
-                return (str(r['id']), 16, 44.1)  # Deezer FLAC = 16/44.1
-        except Exception:
-            return None
+        r = _deezer_public(core, f'/track/isrc:{isrc}', f'ISRC {isrc}') or {}
+        if r.get('id'):
+            return (str(r['id']), 16, 44.1)  # Deezer FLAC = 16/44.1
         return None
     if service == 'qobuz':
         res = call_timeout(lambda: core.session('qobuz').search('track', isrc, limit=3),
@@ -1046,12 +1078,9 @@ def source_isrcs(core, service, mtype, mid):
     out = set()
     if mtype == 'track':
         if service == 'deezer':
-            try:
-                r = requests.get(f'https://api.deezer.com/track/{mid}', timeout=20).json()
-                if _u(r.get('isrc')):
-                    out.add(_u(r.get('isrc')))
-            except Exception:
-                pass
+            r = _deezer_public(core, f'/track/{mid}', f'track {mid}') or {}
+            if _u(r.get('isrc')):
+                out.add(_u(r.get('isrc')))
         else:  # tidal / qobuz: track object carries isrc
             t = call_timeout(lambda: s.get_track(str(mid)), 20, default=None,
                              label=f'{service} track {mid}') or {}
