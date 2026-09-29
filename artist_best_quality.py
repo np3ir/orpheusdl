@@ -965,17 +965,14 @@ def resolve_artist(core, service, sample_isrcs, artist_name):
 _DEEZER_HTTP = None
 
 
-def _deezer_http(core):
-    """requests.Session for api.deezer.com that respects the Deezer rate gate.
+def _deezer_http(core=None):
+    """requests.Session for api.deezer.com, paced by the Deezer rate gate.
 
-    Reuses the loaded deezer module's session (it already carries the gate from
-    install_service_gate), so abq's public lookups and the module share one pace.
-    If the module is not loaded, uses our own session with the same gate, without
-    forcing a module load/login just for public lookups."""
-    mod = getattr(core, '_modules', {}).get('deezer')
-    s = getattr(getattr(mod, 'session', None), 's', None)
-    if isinstance(s, requests.Session):
-        return s
+    Deliberately NOT the deezer module's session: that one carries the account's
+    ``arl`` login cookie for ``.deezer.com``, which would then be sent with every
+    public lookup to api.deezer.com and tie hundreds of anonymous ISRC probes to
+    the account. The public API needs no login, so abq uses its own cookie-less
+    session with the same gate (install_service_gate, ORPHEUS_DEEZER_RPM)."""
     global _DEEZER_HTTP
     if _DEEZER_HTTP is None:
         _DEEZER_HTTP = requests.Session()

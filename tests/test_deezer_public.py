@@ -81,11 +81,11 @@ def test_backoff_grows():
     assert waits == [2.0, 4.0]
 
 
-# --- abq integration: uses the gated module session, warns on failure -------- #
+# --- abq integration: own cookie-less gated session, warns on failure ------- #
 abq = pytest.importorskip('artist_best_quality')
 
 
-class GatedSession(requests.Session):
+class FakeSession(requests.Session):
     def __init__(self, *responses):
         super().__init__()
         self.fake = FakeHttp(*responses)
@@ -94,25 +94,48 @@ class GatedSession(requests.Session):
         return self.fake.get(url, timeout=timeout)
 
 
-def core_with_deezer(session):
-    return SimpleNamespace(_modules={'deezer': SimpleNamespace(session=SimpleNamespace(s=session))})
+@pytest.fixture
+def own_session(monkeypatch):
+    def install(*responses):
+        s = FakeSession(*responses)
+        monkeypatch.setattr(abq, '_DEEZER_HTTP', s)
+        return s
+    return install
 
 
-def test_probe_uses_module_session(monkeypatch):
-    s = GatedSession(resp({'id': 42, 'artist': {'id': 7}}))
-    assert abq.probe_isrc(core_with_deezer(s), 'deezer', 'GBDUW0000053') == ('42', 16, 44.1)
+def core_with_logged_in_deezer():
+    """A loaded deezer module whose session carries the account's arl cookie."""
+    account = FakeSession()
+    account.cookies.set('arl', 'SECRET', domain='.deezer.com')
+    return SimpleNamespace(_modules={'deezer': SimpleNamespace(session=SimpleNamespace(s=account))}), account
+
+
+def test_probe_never_uses_the_logged_in_module_session(own_session):
+    s = own_session(resp({'id': 42, 'artist': {'id': 7}}))
+    core, account = core_with_logged_in_deezer()
+    assert abq.probe_isrc(core, 'deezer', 'GBDUW0000053') == ('42', 16, 44.1)
     assert s.fake.urls == ['https://api.deezer.com/track/isrc:GBDUW0000053']
+    assert account.fake.urls == []              # the arl cookie never reaches api.deezer.com
 
 
-def test_probe_failure_is_logged_not_silent(monkeypatch, capsys):
-    monkeypatch.setattr(dp.time, 'sleep', no_sleep)
+def test_own_session_is_cookieless_and_rate_gated(monkeypatch):
+    monkeypatch.setattr(abq, '_DEEZER_HTTP', None)
+    s = abq._deezer_http()
+    assert isinstance(s, requests.Session) and not s.cookies
+    assert getattr(s, '_rate_gate_installed', False)
+    assert abq._deezer_http() is s              # one shared session per run
+
+
+def test_probe_failure_is_logged_not_silent(monkeypatch, capsys, own_session):
+    own_session()
     monkeypatch.setattr(dp, 'get', lambda path, http=None: (_ for _ in ()).throw(
         dp.DeezerLookupError(f'{path}: QUOTA 4')))
-    s = GatedSession()
-    assert abq.probe_isrc(core_with_deezer(s), 'deezer', 'GBDUW0000053') is None
+    core, _ = core_with_logged_in_deezer()
+    assert abq.probe_isrc(core, 'deezer', 'GBDUW0000053') is None
     assert 'lookup FAILED' in capsys.readouterr().out
 
 
-def test_artist_id_by_isrc(monkeypatch):
-    s = GatedSession(resp({'id': 42, 'artist': {'id': 27}}))
-    assert abq._artist_id_by_isrc(core_with_deezer(s), 'deezer', 'X') == '27'
+def test_artist_id_by_isrc(own_session):
+    own_session(resp({'id': 42, 'artist': {'id': 27}}))
+    core, _ = core_with_logged_in_deezer()
+    assert abq._artist_id_by_isrc(core, 'deezer', 'X') == '27'
