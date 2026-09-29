@@ -74,7 +74,7 @@ def test_429_stops_searching_and_persists_block(tmp_path):
     # the message carries what Spotify sent back
     for part in ('429', 'QUOTA_EXCEEDED', 'Too many requests', 'Retry-After: 16008 s', '4h 26m'):
         assert part in msgs[0], part
-    block = json.loads((tmp_path / 'spotify_blocked_until.json').read_text())
+    block = json.loads((tmp_path / 'spotify_blocked_until.json').read_text())['tracks']
     assert block['until'] > si.time.time() + 16000
     assert block['reason'] == 'QUOTA_EXCEEDED' and block['retry_after'] == 16008
     lk.save()
@@ -102,7 +102,7 @@ def test_short_429_also_stops(tmp_path):
 
 
 def test_block_expires(tmp_path):
-    (tmp_path / 'spotify_blocked_until.json').write_text(json.dumps({'until': si.time.time() - 1}))
+    (tmp_path / 'spotify_blocked_until.json').write_text(json.dumps({'tracks': {'until': si.time.time() - 1}}))
     client = FakeClient([{'external_ids': {'isrc': 'BBBBB0000001'}}])
     lk = lookup(tmp_path, client)
     assert not lk.stopped and lk.isrc('t1') == 'BBBBB0000001'
@@ -144,3 +144,76 @@ def test_missing_credentials_stops_without_calls(tmp_path):
     api = SimpleNamespace(client=None, _init_web_api_client=lambda: False)
     lk = SpotifyIsrcLookup(api, str(tmp_path), print_fn=lambda *a: None)
     assert lk.isrc('t1') is None and 'client_id' in lk.stopped
+
+
+# ------------------------------------------------------------------ playlists
+class FakeHttp:
+    """Stands in for requests.get on GET /playlists/{id}/items pages."""
+
+    def __init__(self, pages):
+        self.pages = list(pages)
+        self.urls = []
+
+    def __call__(self, url, headers=None, timeout=None):
+        self.urls.append(url)
+        page = self.pages.pop(0)
+        resp = requests.Response()
+        if isinstance(page, requests.HTTPError):
+            resp = page.response
+        else:
+            resp.status_code = 200
+            resp._content = json.dumps(page).encode()
+        return resp
+
+
+def track_row(tid, isrc, key='item'):
+    return {key: {'id': tid, 'type': 'track', 'external_ids': {'isrc': isrc} if isrc else {}}}
+
+
+def test_playlist_is_read_100_per_call_into_the_cache(tmp_path, monkeypatch):
+    http = FakeHttp([
+        {'items': [track_row('a', 'mxf140200162'), track_row('b', None), {'item': None}],
+         'next': 'https://api.spotify.com/v1/playlists/P/items?offset=100&limit=100'},
+        {'items': [track_row('c', 'USAAA0000003', key='track'), {'track': {'id': None, 'is_local': True}}],
+         'next': None},
+    ])
+    monkeypatch.setattr(si.requests, 'get', http)
+    client = FakeClient([])          # per-track endpoint must not be needed for a/c
+    client.token = 'tok'
+    msgs = []
+    lk = lookup(tmp_path, client, msgs)
+    assert lk.prefetch_playlist('P') == 2
+    assert http.urls[0] == 'https://api.spotify.com/v1/playlists/P/items?limit=100'
+    assert len(http.urls) == 2 and '2 ISRC(s) read from the playlist in 2 call(s)' in msgs[0]
+    assert lk.isrc('a') == 'MXF140200162' and lk.isrc('c') == 'USAAA0000003'
+    assert client.calls == [] and lk.stats['spotify'] == 2
+    saved = json.loads((tmp_path / 'spotify_isrc_cache.json').read_text())['spotify']
+    assert saved == {'a': 'MXF140200162', 'c': 'USAAA0000003'}
+
+
+def test_playlist_bucket_works_while_tracks_are_blocked(tmp_path, monkeypatch):
+    (tmp_path / 'spotify_blocked_until.json').write_text(
+        json.dumps({'until': si.time.time() + 3600, 'status': 429, 'reason': 'QUOTA_EXCEEDED'}))  # old format
+    monkeypatch.setattr(si.requests, 'get', FakeHttp([{'items': [track_row('a', 'AAAAA0000001')], 'next': None}]))
+    client = FakeClient([])
+    client.token = 'tok'
+    lk = lookup(tmp_path, client)
+    assert lk.stopped and 'QUOTA_EXCEEDED' in lk.stopped
+    assert lk.prefetch_playlist('P') == 1
+    assert lk.isrc('a') == 'AAAAA0000001'
+    assert lk.isrc('zz') is None and client.calls == []
+
+
+def test_playlist_429_blocks_only_the_playlist_bucket(tmp_path, monkeypatch):
+    http = FakeHttp([http_error(429, 600, QUOTA_BODY)])
+    monkeypatch.setattr(si.requests, 'get', http)
+    client = FakeClient([{'external_ids': {'isrc': 'DDDDD0000001'}}])
+    client.token = 'tok'
+    msgs = []
+    lk = lookup(tmp_path, client, msgs)
+    assert lk.prefetch_playlist('P') is None
+    assert 'playlist reads' in msgs[0] and 'QUOTA_EXCEEDED' in msgs[0] and 'Retry-After: 600 s' in msgs[0]
+    assert lk.prefetch_playlist('P') is None and len(http.urls) == 1   # no second playlist call
+    assert lk.isrc('t1') == 'DDDDD0000001'                             # track lookups unaffected
+    blocks = json.loads((tmp_path / 'spotify_blocked_until.json').read_text())
+    assert set(blocks) == {'playlists'}

@@ -1136,8 +1136,9 @@ def _spotify_isrcs(core, mtype, mid):
     except Exception as e:
         log(f'  spotify: could not load module: {e}')
         return out
-    # Cached, throttled Web API lookups that stop on the first 429 (see
-    # utils/spotify_isrc.py). After a stop, only cached ISRCs are returned.
+    # Cached, throttled Web API lookups that stop on the first 429, with bulk
+    # playlist reads (see utils/spotify_isrc.py). After a stop, only cached
+    # ISRCs are returned.
     from utils.spotify_isrc import SpotifyIsrcLookup
     lookup = SpotifyIsrcLookup(getattr(mod, 'spotify_api', None), CONFIG_DIR, print_fn=log)
 
@@ -1162,6 +1163,9 @@ def _spotify_isrcs(core, mtype, mid):
             from_tracklist(call_timeout(lambda: mod.get_album_info(str(mid)), 60,
                                         default=None, label='spotify album'))
         elif mtype == 'playlist':
+            # 100 ISRCs per Web API call into the cache; the per-track pass below
+            # then only asks Spotify for whatever the bulk read did not cover.
+            lookup.prefetch_playlist(str(mid))
             from_tracklist(call_timeout(lambda: mod.get_playlist_info(str(mid)), 120,
                                         default=None, label='spotify playlist'))
         elif mtype == 'artist':

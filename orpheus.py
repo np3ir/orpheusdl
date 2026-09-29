@@ -534,6 +534,8 @@ def _spotify_isrc_only(orpheus, media_list, path):
                     pass
                 entries.append((str(mid), isrc, name))
             elif mt in (DownloadTypeEnum.playlist, DownloadTypeEnum.album):
+                if mt == DownloadTypeEnum.playlist:
+                    lookup.prefetch_playlist(str(mid))  # 100 ISRCs per Web API call
                 info = (mod.get_playlist_info(str(mid)) if mt == DownloadTypeEnum.playlist
                         else mod.get_album_info(str(mid)))
                 # get_playlist_info/get_album_info return TrackInfo objects (metadata only)
