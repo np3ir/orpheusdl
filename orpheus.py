@@ -86,6 +86,9 @@ def setup_ffmpeg_path():
 def main():
     # Setup FFmpeg path from settings.json (same as GUI)
     setup_ffmpeg_path()
+    from utils.update_check import notify_if_outdated
+    _here = os.path.dirname(os.path.abspath(__file__))
+    notify_if_outdated(_here, os.path.join(_here, 'config'))
     
     help_ = 'Use "settings [option]" for orpheus controls (coreupdate, fullupdate, modinstall), "settings [module]' \
            '[option]" for module specific options (update, test, setup), searching by "[search/luckysearch] [module]' \

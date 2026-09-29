@@ -1432,6 +1432,9 @@ def main():
     _PRERELEASE.clear()
     _TITLES.clear()
 
+    from utils.update_check import notify_if_outdated
+    notify_if_outdated(SCRIPT_DIR, CONFIG_DIR, print_fn=log)
+
     settings = load_settings()
     cfg = abq_config(settings)
 
