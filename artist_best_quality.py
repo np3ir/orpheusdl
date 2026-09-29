@@ -1136,29 +1136,26 @@ def _spotify_isrcs(core, mtype, mid):
     except Exception as e:
         log(f'  spotify: could not load module: {e}')
         return out
-    api = getattr(mod, 'spotify_api', None)
-
-    def isrc_by_id(tid):
-        try:
-            if api and api._init_web_api_client() and getattr(api, 'client', None):
-                tr = api.client.track(str(tid)) or {}
-                return (tr.get('external_ids') or {}).get('isrc')
-        except Exception:
-            pass
-        return None
+    # Cached, throttled Web API lookups that stop on the first 429 (see
+    # utils/spotify_isrc.py). After a stop, only cached ISRCs are returned.
+    from utils.spotify_isrc import SpotifyIsrcLookup
+    lookup = SpotifyIsrcLookup(getattr(mod, 'spotify_api', None), CONFIG_DIR, print_fn=log)
 
     def from_tracklist(info):
-        for t in (getattr(info, 'tracks', None) or []):
+        tracks = getattr(info, 'tracks', None) or []
+        for n, t in enumerate(tracks, 1):
             isrc = getattr(getattr(t, 'tags', None), 'isrc', None)
             if not isrc:
                 tid = getattr(t, 'id', None) or (t if isinstance(t, str) else None)
-                isrc = isrc_by_id(tid) if tid else None
+                isrc = lookup.isrc(tid)
             if isrc:
                 out.add(isrc.strip().upper())
+            if len(tracks) > 50 and n % 50 == 0:
+                log(f'  read ISRC {n}/{len(tracks)}...')
 
     try:
         if mtype == 'track':
-            i = isrc_by_id(mid)
+            i = lookup.isrc(mid)
             if i:
                 out.add(i.strip().upper())
         elif mtype == 'album':
@@ -1177,6 +1174,9 @@ def _spotify_isrcs(core, mtype, mid):
                                             default=None, label=f'spotify album {aid}'))
     except Exception as e:
         log(f'  spotify: metadata read failed: {e}')
+    finally:
+        lookup.save()
+    log(f'  {lookup.summary()}')
     return out
 
 

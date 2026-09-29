@@ -504,17 +504,12 @@ def _spotify_isrc_only(orpheus, media_list, path):
 
     api = mod.spotify_api
 
-    def isrc_by_id(tid):
-        """ISRC via the Web API (Client Credentials = a Spotify *app*'s client_id/
-        secret, NOT the user's login). The anonymous embed GraphQL does not expose
-        ISRC, and get_track_info would trigger OAuth — so neither is used."""
-        try:
-            if api._init_web_api_client() and getattr(api, 'client', None):
-                tr = api.client.track(str(tid)) or {}
-                return (tr.get('external_ids') or {}).get('isrc')
-        except Exception:
-            pass
-        return None
+    # ISRC via the Web API (Client Credentials = a Spotify *app*'s client_id/secret,
+    # NOT the user's login) -- cached, throttled, and stopped on the first 429
+    # (utils/spotify_isrc.py). The anonymous embed GraphQL does not expose ISRC,
+    # and get_track_info would trigger OAuth.
+    from utils.spotify_isrc import SpotifyIsrcLookup
+    lookup = SpotifyIsrcLookup(api, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config'))
 
     def _name_of(t, fallback):
         arts = ', '.join(t.artists) if getattr(t, 'artists', None) else ''
@@ -527,10 +522,10 @@ def _spotify_isrc_only(orpheus, media_list, path):
         try:
             if mt == DownloadTypeEnum.track:
                 # single-track URL: media_id is the bare Spotify id
-                isrc = isrc_by_id(mid)
+                isrc = lookup.isrc(mid)
                 name = str(mid)
                 try:
-                    if api._init_web_api_client() and getattr(api, 'client', None):
+                    if not lookup.stopped and api._init_web_api_client() and getattr(api, 'client', None):
                         tr = api.client.track(str(mid)) or {}
                         a = [x.get('name') for x in (tr.get('artists') or []) if x.get('name')]
                         nm = tr.get('name') or str(mid)
@@ -546,12 +541,15 @@ def _spotify_isrc_only(orpheus, media_list, path):
                 print(f'Spotify (metadata only): reading ISRC for {len(tracks)} tracks (Web API, no account login)...')
                 for t in tracks:
                     tid = getattr(t, 'id', None)
-                    isrc = getattr(getattr(t, 'tags', None), 'isrc', None) or (isrc_by_id(tid) if tid else None)
+                    isrc = (getattr(getattr(t, 'tags', None), 'isrc', None)
+                            or lookup.isrc(tid))
                     entries.append((str(tid or _name_of(t, '?')), isrc, _name_of(t, str(tid))))
             else:
                 print(f'Spotify metadata-only: unsupported type {getattr(mt, "name", mt)} for {mid} (skipped)')
         except Exception as e:
             print(f'Spotify metadata error for {mid}: {e}')
+    lookup.save()
+    print(lookup.summary())
 
     have = [(i, s, n) for i, s, n in entries if s]
     missing = len(entries) - len(have)
