@@ -38,6 +38,7 @@ on the next-best service by ISRC.
 import argparse
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -508,34 +509,55 @@ def _tidal_guest_auth():
         return None
 
 
+# Retry policy modelled on TIDAL's own web SDK (@tidal-music/api, retry.ts):
+# delay = min(base * 2**n * jitter, cap), jitter in [0.8, 1), so parallel/looping
+# callers don't hit the rate limit again in lockstep. (base s, cap s, max retries)
+_TIDAL_RETRY = {
+    'status': (0.5, 16.0, 5),    # 429 / 5xx  (SDK: 3 retries; abq favours completeness)
+    'network': (1.0, 16.0, 10),  # connection errors / timeouts (SDK default)
+}
+
+
+def _tidal_backoff(base, cap, n):
+    return min(base * 2 ** n * (0.8 + random.random() * 0.2), cap)
+
+
 def _tidal_guest_get(path):
     """GET a v2 path with the guest token. Robust: refreshes on 401 and backs off /
     retries on 429 or 5xx so a transient rate-limit never silently drops an album
     (that would lose tracks -- unacceptable for a quality-first library)."""
     if not _TIDAL_GUEST['tok'] and _tidal_guest_auth() is None:
         return None
-    delay = 0.5
-    for attempt in range(5):
+    retries = {'status': 0, 'network': 0}
+    reauthed = False
+    while True:
         try:
             r = requests.get('https://openapi.tidal.com/v2' + path,
                              headers={'Authorization': f'Bearer {_TIDAL_GUEST["tok"]}',
                                       'accept': 'application/vnd.api+json'}, timeout=45)
-            if r.status_code == 401:
+        except requests.RequestException:
+            kind = 'network'
+        else:
+            if r.status_code == 401 and not reauthed:
+                reauthed = True  # token expired: renew once, then retry
                 if _tidal_guest_auth() is None:
                     return None
                 continue
-            if r.status_code == 429 or r.status_code >= 500:
-                time.sleep(delay)
-                delay = min(delay * 2, 8)
-                continue
-            r.raise_for_status()
-            return r.json()
-        except Exception:
-            if attempt >= 4:
-                return None
-            time.sleep(delay)
-            delay = min(delay * 2, 8)
-    return None
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                kind = 'status'
+            elif r.status_code >= 400:
+                return None  # other 4xx (bad path, 404...): retrying won't help
+            else:
+                try:
+                    return r.json()
+                except ValueError:
+                    kind = 'network'  # truncated / non-JSON body
+        base, cap, max_retries = _TIDAL_RETRY[kind]
+        n = retries[kind]
+        if n >= max_retries:
+            return None
+        retries[kind] = n + 1
+        time.sleep(_tidal_backoff(base, cap, n))
 
 
 def _tidal_guest_pages(path, cap=300):
