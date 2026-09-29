@@ -113,19 +113,28 @@ def test_429_stops_searching_and_reports_what_spotify_sent(tmp_path):
     assert lk2.isrc('t9') is None and client2.calls == [] and 'QUOTA_EXCEEDED' in msgs2[0]
 
 
-def test_429_without_retry_after_or_body(tmp_path):
+def test_429_without_retry_after_backs_off_exponentially_then_stops(tmp_path, no_sleep):
     msgs = []
-    lk = lookup(tmp_path, FakeClient([http_error(429)]), msgs)
+    client = FakeClient([http_error(429)] * 6)
+    lk = lookup(tmp_path, client, msgs)
     assert lk.isrc('t1') is None and lk.stopped
-    assert 'no Retry-After sent' in msgs[0]
+    assert [s for s in no_sleep if s >= 1] == [1, 2, 4, 8, 16]
+    assert len(client.calls) == 6
+    assert 'no Retry-After sent' in msgs[0] and 'retry 1/5' in msgs[0]
+    assert 'still limited after 5 retries' in msgs[-1]
+    assert lk.isrc('t2') is None and len(client.calls) == 6      # stopped for the run
     assert not (tmp_path / 'spotify_blocked_until.json').exists()
 
 
-def test_short_429_also_stops(tmp_path):
-    client = FakeClient([http_error(429, 2)])
-    lk = lookup(tmp_path, client)
-    assert lk.isrc('t1') is None and lk.isrc('t2') is None
-    assert client.calls == ['t1'] and lk.stopped
+def test_short_429_waits_retry_after_then_succeeds(tmp_path, no_sleep):
+    client = FakeClient([http_error(429, 7, QUOTA_BODY), http_error(429, 1),
+                         {'external_ids': {'isrc': 'GGGGG0000001'}}])
+    msgs = []
+    lk = lookup(tmp_path, client, msgs)
+    assert lk.isrc('t1') == 'GGGGG0000001' and not lk.stopped
+    # waits max(Retry-After, 1 s * 2^n): 7 (Retry-After) then 2 (backoff > Retry-After 1)
+    assert [s for s in no_sleep if s >= 1] == [7, 2]
+    assert 'QUOTA_EXCEEDED' in msgs[0] and 'Retry-After: 7 s' in msgs[0] and 'waiting 7 s' in msgs[0]
 
 
 def test_block_expires(tmp_path):
@@ -214,13 +223,13 @@ def test_playlist_bucket_works_while_tracks_are_blocked(tmp_path, monkeypatch):
 
 
 def test_playlist_429_blocks_only_the_playlist_bucket(tmp_path, monkeypatch):
-    http = FakeHttp([http_error(429, 600, QUOTA_BODY)])
+    http = FakeHttp([http_error(429, 16008, QUOTA_BODY)])
     monkeypatch.setattr(si.requests, 'get', http)
     client = FakeClient([{'external_ids': {'isrc': 'DDDDD0000001'}}])
     msgs = []
     lk = lookup(tmp_path, client, msgs)
     assert lk.prefetch_playlist('P') is None
-    assert 'playlist reads' in msgs[0] and 'QUOTA_EXCEEDED' in msgs[0] and 'Retry-After: 600 s' in msgs[0]
+    assert 'playlist reads' in msgs[0] and 'QUOTA_EXCEEDED' in msgs[0] and 'Retry-After: 16008 s' in msgs[0]
     assert lk.prefetch_playlist('P') is None and len(http.urls) == 1
     assert lk.isrc('t1') == 'DDDDD0000001'
     assert set(json.loads((tmp_path / 'spotify_blocked_until.json').read_text())) == {'playlists'}

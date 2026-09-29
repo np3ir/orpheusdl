@@ -16,10 +16,14 @@ one call per track on a 400-track playlist exhausts it and Spotify answers
      no caching beyond immediate use). A cache file left by an older version
      (config/spotify_isrc_cache.json) is deleted.
   3. Throttle between live calls.
-  4. Any 429 stops that bucket (user choice: no retries). The block is remembered
-     per bucket (config/spotify_blocked_until.json, no Spotify content in it) and
-     that bucket gets NO calls until Retry-After has passed. The message shows
-     what Spotify sent (status, reason, message, Retry-After).
+  4. 429 (Spotify's rule: exponential backoff, respect Retry-After, no tight
+     loops): wait max(Retry-After, 1 s * 2^n) and retry, up to 5 times. If
+     Retry-After is longer than 10 minutes (a QUOTA_EXCEEDED block lasts hours)
+     or the retries run out, that bucket stops for the run; the block is
+     remembered per bucket (config/spotify_blocked_until.json, no Spotify
+     content in it) so no call is made before Retry-After has passed, even in a
+     new run. Every message shows what Spotify sent (status, reason, message,
+     Retry-After).
   5. 401 (bad/expired token): renew the 1 h Client Credentials token once.
      403 on track lookups / a second 401: stop. 5xx and network errors: retried
      with exponential backoff (1 s, 2 s, 4 s); repeated failures stop the bucket.
@@ -33,6 +37,9 @@ import requests
 _SPOTIFY_INTERVAL = 0.35    # seconds between live Web API calls
 _PAGE_LIMIT = 50            # QueryLimit maximum in the OpenAPI spec
 _BACKOFF = (1, 2, 4)        # seconds, for 5xx / network errors
+_429_BASE = 1               # seconds; 429 backoff is 1, 2, 4, 8, 16 (or Retry-After if longer)
+_429_RETRIES = 5
+_429_MAX_WAIT = 600         # longer Retry-After -> stop the bucket instead of sleeping for hours
 _API = 'https://api.spotify.com/v1'
 _BUCKETS = {'tracks': 'track lookups (GET /tracks/{id})',
             'playlists': 'playlist reads (GET /playlists/{id}/items)'}
@@ -155,6 +162,7 @@ class SpotifyIsrcLookup:
         """Run one Web API call. Returns (ok, json); (True, None) on 404."""
         renewed = False
         backoff = list(_BACKOFF)
+        n429 = 0
         while True:
             try:
                 ready = self.api._init_web_api_client() and getattr(self.api, 'client', None)
@@ -174,7 +182,9 @@ class SpotifyIsrcLookup:
                 resp = e.response
                 code = getattr(resp, 'status_code', None)
                 if code == 429:
-                    self._on_429(bucket, resp)
+                    n429 += 1
+                    if self._on_429(bucket, resp, n429):
+                        continue
                     return False, None
                 d = _detail(_error_of(resp))
                 if code == 401 and not renewed:
@@ -211,8 +221,9 @@ class SpotifyIsrcLookup:
             self._failures[bucket] = 0
             return True, data
 
-    def _on_429(self, bucket, resp):
-        """Stop the bucket on a 429 and report exactly what Spotify sent back, e.g.
+    def _on_429(self, bucket, resp, n):
+        """Handle the n-th consecutive 429 of a call. Waits and returns True to retry,
+        or stops the bucket and returns False. Messages carry what Spotify sent, e.g.
         {"error":{"status":429,"message":"Too many requests","reason":"QUOTA_EXCEEDED"}}
         with ``Retry-After: 16008``."""
         try:
@@ -221,19 +232,26 @@ class SpotifyIsrcLookup:
             retry = None
         err = _error_of(resp)
         status = err.get('status') or 429
-        detail = _detail(err) or 'Too many requests'
+        what = (f'Spotify Web API {status} {_detail(err) or "Too many requests"} on {_BUCKETS[bucket]} '
+                f'({"Retry-After: %d s" % retry if retry is not None else "no Retry-After sent"})')
+        wait = max(retry or 0, _429_BASE * 2 ** (n - 1))
+        if n <= _429_RETRIES and wait <= _429_MAX_WAIT:
+            self.print(f'  spotify: {what}; waiting {wait} s before retry {n}/{_429_RETRIES}...')
+            time.sleep(wait)
+            return True
         if retry is not None:
             until = time.time() + retry
             blocks = self._blocks()
             blocks[bucket] = {'until': until, 'status': status, 'reason': err.get('reason'),
                               'message': err.get('message'), 'retry_after': retry}
             self._write(self.block_path, blocks)
-            when = (f'Retry-After: {retry} s = {_fmt_wait(retry)}, '
-                    f'until {time.strftime("%Y-%m-%d %H:%M", time.localtime(until))}')
+            why = (f'Retry-After is {_fmt_wait(retry)}, until '
+                   f'{time.strftime("%Y-%m-%d %H:%M", time.localtime(until))}; not calling it before then'
+                   if wait > _429_MAX_WAIT else f'still limited after {_429_RETRIES} retries')
         else:
-            when = 'no Retry-After sent'
-        self._stop(bucket, f'Spotify Web API {status} {detail} on {_BUCKETS[bucket]} ({when}). '
-                           f'Stopped calling it.')
+            why = f'still limited after {_429_RETRIES} retries'
+        self._stop(bucket, f'{what}. Stopped: {why}.')
+        return False
 
     def _transient(self, bucket, why):
         self._failures[bucket] += 1
