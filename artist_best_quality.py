@@ -44,7 +44,7 @@ import sys
 import threading
 import time
 import unicodedata
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import requests
 
@@ -563,6 +563,54 @@ def _tidal_guest_quality(media_tags):
     return (0, 0.0)  # lossy -> not a FLAC source
 
 
+# ISRC lookups via the guest token: GET /tracks?filter[isrc]=... (THIRD_PARTY tier,
+# client-credentials). Up to 20 ISRCs per request (filter[isrc] maxItems), one track
+# per ISRC; with a single ISRC the endpoint paginates and may return several tracks.
+# Saves one account (v1) request per ISRC, which matters for big playlists.
+_TIDAL_MISS = object()   # guest lookup unavailable/failed -> caller uses the account session
+_TIDAL_ISRC_CACHE = {}   # ISRC -> (track_id, bit_depth, sample_rate, artist_id) | None (not on Tidal)
+_TIDAL_ISRC_BATCH = 20
+
+
+def _tidal_guest_isrc_fetch(isrcs):
+    """Look up ISRCs not yet cached, in batches of 20. A batch whose request fails
+    is left uncached, so those ISRCs fall back to the account lookup."""
+    todo = [i for i in dict.fromkeys((x or '').strip().upper() for x in isrcs)
+            if i and i not in _TIDAL_ISRC_CACHE]
+    if not todo or not (_TIDAL_GUEST['tok'] or _tidal_guest_auth()):
+        return
+    for n in range(0, len(todo), _TIDAL_ISRC_BATCH):
+        chunk = todo[n:n + _TIDAL_ISRC_BATCH]
+        query = urlencode([('countryCode', _TIDAL_CC), ('include', 'artists')]
+                          + [('filter[isrc]', i) for i in chunk], safe='[]')
+        found, got_page = {}, False
+        for j in _tidal_guest_pages(f'/tracks?{query}', cap=20):
+            got_page = True
+            for t in j.get('data') or []:
+                at = t.get('attributes') or {}
+                isrc = (at.get('isrc') or '').strip().upper()
+                if not isrc or t.get('id') in (None, ''):
+                    continue
+                bd, sr = _tidal_guest_quality(at.get('mediaTags'))
+                arts = ((t.get('relationships') or {}).get('artists') or {}).get('data') or []
+                art_id = str(arts[0]['id']) if arts and arts[0].get('id') else None
+                old = found.get(isrc)
+                if old is None or (bd, sr) > (old[1], old[2]):
+                    found[isrc] = (str(t['id']), bd, sr, art_id or (old[3] if old else None))
+        if not got_page:
+            log(f'  ⚠️ tidal: guest ISRC lookup failed for {len(chunk)} ISRC(s) -> using the account')
+            continue
+        for i in chunk:
+            _TIDAL_ISRC_CACHE[i] = found.get(i)
+
+
+def _tidal_guest_isrc(isrc):
+    """Cached guest result for one ISRC: a tuple, None (not on Tidal), or _TIDAL_MISS."""
+    if isrc not in _TIDAL_ISRC_CACHE:
+        _tidal_guest_isrc_fetch([isrc])
+    return _TIDAL_ISRC_CACHE.get(isrc, _TIDAL_MISS)
+
+
 def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=True,
                     own_albums_only=False, artist_name=None):
     """Enumerate a Tidal artist via the GUEST token (no account impact). Same
@@ -576,8 +624,12 @@ def enumerate_tidal(session, artist_id, credited, max_albums=0, artist_filter=Tr
     skipped = skipped_albums = unavailable = 0
     failed_albums = []
     album_ids, alb_artist_ids, alb_date = [], {}, {}
+    # include=albums.artists (not just albums): per the TIDAL API reference a
+    # relationship is only present on an included resource when its path is named
+    # in `include`, so with include=albums the albums carry no `artists` and
+    # own_albums_only could never skip anything. The nested path embeds the albums too.
     for j in _tidal_guest_pages(
-            f'/artists/{artist_id}/relationships/albums?countryCode={_TIDAL_CC}&include=albums'):
+            f'/artists/{artist_id}/relationships/albums?countryCode={_TIDAL_CC}&include=albums.artists'):
         by_id = {a['id']: a for a in j.get('included', []) if a.get('type') == 'albums'}
         for ref in j.get('data', []):
             aid = ref.get('id')
@@ -934,6 +986,8 @@ def resolve_artist(core, service, sample_isrcs, artist_name):
     """Return (artist_id, method) where method is 'isrc' (trusted) or 'name'
     (needs an ISRC-overlap check afterwards)."""
     if service in ISRC_RESOLVE_SERVICES:
+        if service == 'tidal':
+            _tidal_guest_isrc_fetch(list(sample_isrcs)[:_TIDAL_ISRC_BATCH])  # one request
         votes = {}
         for isrc in sample_isrcs:
             aid = _artist_id_by_isrc(core, service, isrc)
@@ -1000,6 +1054,9 @@ def _artist_id_by_isrc(core, service, isrc):
         a = r.get('artist') or {}
         return str(a['id']) if a.get('id') is not None else None
     if service == 'tidal':
+        hit = _tidal_guest_isrc(isrc.strip().upper())
+        if hit is not _TIDAL_MISS:
+            return hit[3] if hit else None
         res = call_timeout(lambda: core.session('tidal').get_tracks_by_isrc(isrc),
                            15, default=None, label=f'tidal isrc {isrc}')
         items = res.get('items') if isinstance(res, dict) else res
@@ -1031,6 +1088,9 @@ def probe_isrc(core, service, isrc):
     is no artist to enumerate -- each recording is looked up directly by ISRC."""
     up = isrc.strip().upper()
     if service == 'tidal':
+        hit = _tidal_guest_isrc(up)
+        if hit is not _TIDAL_MISS:
+            return (hit[0], hit[1], hit[2]) if hit and hit[1] else None  # bd 0 = lossy only
         res = call_timeout(lambda: core.session('tidal').get_tracks_by_isrc(isrc),
                            15, default=None, label=f'tidal isrc {isrc}')
         items = res.get('items') if isinstance(res, dict) else res
@@ -1432,6 +1492,8 @@ def main():
             log(f'\nReading {mtype} {mid} from {src_service}...')
             isrcs = source_isrcs(core, src_service, mtype, mid)
             log(f'  {len(isrcs)} recording(s) with ISRC in the {mtype}')
+            if 'tidal' in active:
+                _tidal_guest_isrc_fetch(sorted(isrcs))  # 20 ISRCs per guest request
             for i, isrc in enumerate(sorted(isrcs), 1):
                 for svc in active:
                     cand = probe_isrc(core, svc, isrc)
