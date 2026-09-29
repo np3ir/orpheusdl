@@ -6,18 +6,23 @@ gives a dev-mode app a small quota, shared by all apps of the developer account;
 one call per track on a 400-track playlist exhausts it and Spotify answers
 ``429 QUOTA_EXCEEDED`` with a Retry-After of hours. This module protects it:
 
-  1. Playlists are read with GET /v1/playlists/{id}/items: 100 full track objects
-     (with external_ids.isrc) per call, so a 416-track playlist costs 5 calls
-     instead of 416. That endpoint sits in a different quota bucket than
-     GET /v1/tracks/{id}, so it keeps working while track lookups are blocked.
-  2. On-disk cache (config/spotify_isrc_cache.json): a track is asked once, ever.
+  1. Playlists are read with GET /v1/playlists/{id}/items (get-playlists-items in
+     the OpenAPI spec): 50 full track objects (with external_ids.isrc) per call,
+     so a 416-track playlist costs 9 calls instead of 416. It sits in a different
+     quota bucket than GET /v1/tracks/{id}. The spec documents this endpoint as
+     owner/collaborator-only (403 otherwise); a 403 there only disables the bulk
+     read and the per-track lookups take over.
+  2. ISRCs are kept in memory for the current run only (Spotify Developer Terms:
+     no caching beyond immediate use). A cache file left by an older version
+     (config/spotify_isrc_cache.json) is deleted.
   3. Throttle between live calls.
-  4. Any 429 stops that bucket. The block is remembered per bucket
-     (config/spotify_blocked_until.json) and that bucket gets NO calls until it
-     expires -- hammering a blocked app only extends the block. The message shows
+  4. Any 429 stops that bucket (user choice: no retries). The block is remembered
+     per bucket (config/spotify_blocked_until.json, no Spotify content in it) and
+     that bucket gets NO calls until Retry-After has passed. The message shows
      what Spotify sent (status, reason, message, Retry-After).
-  5. 401: renew the 1 h Client Credentials token once; a second 401 or a 403
-     stops everything. Repeated errors stop the bucket for the run.
+  5. 401 (bad/expired token): renew the 1 h Client Credentials token once.
+     403 on track lookups / a second 401: stop. 5xx and network errors: retried
+     with exponential backoff (1 s, 2 s, 4 s); repeated failures stop the bucket.
 """
 import json
 import os
@@ -26,6 +31,8 @@ import time
 import requests
 
 _SPOTIFY_INTERVAL = 0.35    # seconds between live Web API calls
+_PAGE_LIMIT = 50            # QueryLimit maximum in the OpenAPI spec
+_BACKOFF = (1, 2, 4)        # seconds, for 5xx / network errors
 _API = 'https://api.spotify.com/v1'
 _BUCKETS = {'tracks': 'track lookups (GET /tracks/{id})',
             'playlists': 'playlist reads (GET /playlists/{id}/items)'}
@@ -60,13 +67,14 @@ class SpotifyIsrcLookup:
     def __init__(self, api, config_dir, print_fn=print):
         self.api = api
         self.print = print_fn
-        self.cache_path = os.path.join(config_dir, 'spotify_isrc_cache.json')
         self.block_path = os.path.join(config_dir, 'spotify_blocked_until.json')
-        self.cache = dict(self._load(self.cache_path).get('spotify') or {})
+        self.cache = {}         # track id -> ISRC, this run only
+        try:
+            os.remove(os.path.join(config_dir, 'spotify_isrc_cache.json'))  # older versions
+        except OSError:
+            pass
         self.stopped_by = {b: None for b in _BUCKETS}   # bucket -> reason, once disabled
-        self.stats = {'cache': 0, 'spotify': 0, 'missing': 0}
-        self._fresh = set()     # ids fetched live this run (counted as Web API, not cache)
-        self._dirty = 0
+        self.stats = {'spotify': 0, 'missing': 0}
         self._last = 0.0
         self._failures = {b: 0 for b in _BUCKETS}
         blocks = self._blocks()
@@ -91,7 +99,7 @@ class SpotifyIsrcLookup:
             self.stats['missing'] += 1
             return None
         if tid in self.cache:
-            self.stats['spotify' if tid in self._fresh else 'cache'] += 1
+            self.stats['spotify'] += 1
             return self.cache[tid]
         found = None
         if not self.stopped:
@@ -105,40 +113,37 @@ class SpotifyIsrcLookup:
         return found
 
     def prefetch_playlist(self, playlist_id):
-        """Cache the ISRCs of a whole playlist, 100 tracks per call. Returns how many
-        ISRCs were read, or None if the playlist could not be read completely (what
-        was read is still cached; the caller falls back to per-track lookups)."""
+        """Read the ISRCs of a whole playlist, 50 tracks per call, for this run.
+        Returns how many ISRCs were read, or None if the playlist could not be read
+        completely (what was read is kept; the caller falls back to per-track
+        lookups for the rest)."""
         if self.stopped_by['playlists']:
             return None
-        url = f'{_API}/playlists/{playlist_id}/items?limit=100'
+        url = f'{_API}/playlists/{playlist_id}/items?limit={_PAGE_LIMIT}'
         got = pages = 0
-        try:
-            while url:
-                ok, page = self._call('playlists', lambda url=url: self._get(url))
-                if not ok or not isinstance(page, dict):
-                    return None
-                pages += 1
-                for row in page.get('items') or []:
-                    tr = (row or {}).get('item') or (row or {}).get('track') or {}
-                    tid, isrc = tr.get('id'), _isrc_of(tr)
-                    if tid and isrc:
-                        self._remember(str(tid), isrc)
-                        got += 1
-                url = page.get('next')
-        finally:
-            self.save()
-        self.print(f'  spotify: {got} ISRC(s) read from the playlist in {pages} call(s)')
+        while url:
+            ok, page = self._call('playlists', lambda url=url: self._get(url))
+            if not ok or not isinstance(page, dict):
+                return None
+            pages += 1
+            for row in page.get('items') or []:
+                tr = (row or {}).get('item') or {}   # PlaylistTrackObject.item (`track` is deprecated)
+                if tr.get('type') != 'track':
+                    continue                          # episodes / removed items carry no ISRC
+                tid, isrc = tr.get('id'), _isrc_of(tr)
+                if tid and isrc:
+                    self._remember(str(tid), isrc)
+                    got += 1
+            url = page.get('next')
+        self.print(f'  spotify: {got} ISRC(s) read from the playlist in {pages} call(s) (data: Spotify Web API)')
         return got
 
     def summary(self):
         s = self.stats
-        return (f'ISRC: {s["cache"]} from cache, {s["spotify"]} from the Spotify Web API, '
-                f'{s["missing"]} without ISRC')
+        return (f'ISRC (data: Spotify Web API): {s["spotify"]} read, {s["missing"]} without ISRC')
 
     def save(self):
-        if self._dirty:
-            self._write(self.cache_path, {'spotify': self.cache})
-            self._dirty = 0
+        """Kept for callers; nothing is written (no caching beyond this run)."""
 
     # --------------------------------------------------------------- spotify
     def _get(self, url):
@@ -148,7 +153,9 @@ class SpotifyIsrcLookup:
 
     def _call(self, bucket, fn):
         """Run one Web API call. Returns (ok, json); (True, None) on 404."""
-        for attempt in range(2):
+        renewed = False
+        backoff = list(_BACKOFF)
+        while True:
             try:
                 ready = self.api._init_web_api_client() and getattr(self.api, 'client', None)
             except Exception:
@@ -169,26 +176,40 @@ class SpotifyIsrcLookup:
                 if code == 429:
                     self._on_429(bucket, resp)
                     return False, None
-                if code == 401 and attempt == 0:
-                    # Client Credentials tokens last 1 h and have no refresh token:
-                    # drop the cached client so _init_web_api_client() gets a new one.
+                d = _detail(_error_of(resp))
+                if code == 401 and not renewed:
+                    # Bad or expired token. Client Credentials tokens last 1 h and have
+                    # no refresh token: drop the client so a new token is requested.
+                    renewed = True
                     self.api.client = None
                     continue
+                if code == 403 and bucket == 'playlists':
+                    # Spec: get-playlists-items is owner/collaborator-only (403 otherwise).
+                    self._stop('playlists', f'Spotify Web API 403{" " + d if d else ""} on '
+                                            f'{_BUCKETS["playlists"]}; reading its tracks one by one instead.')
+                    return False, None
                 if code in (401, 403):
-                    d = _detail(_error_of(resp))
                     self._stop_all(f'Spotify Web API {code}{" " + d if d else ""}. In dev mode the app '
                                    f'owner needs an active Premium subscription; check client_id/client_secret.')
                     return False, None
                 if code == 404:
                     return True, None
-                self._transient(bucket, f'HTTP {code}')
+                if code == 400:
+                    self._stop(bucket, f'Spotify Web API 400{" " + d if d else ""} on {_BUCKETS[bucket]}.')
+                    return False, None
+                if code and code >= 500 and backoff:
+                    time.sleep(backoff.pop(0))
+                    continue
+                self._transient(bucket, f'HTTP {code}{" " + d if d else ""}')
                 return False, None
             except Exception as e:
+                if backoff:
+                    time.sleep(backoff.pop(0))
+                    continue
                 self._transient(bucket, str(e))
                 return False, None
             self._failures[bucket] = 0
             return True, data
-        return False, None
 
     def _on_429(self, bucket, resp):
         """Stop the bucket on a 429 and report exactly what Spotify sent back, e.g.
@@ -233,12 +254,7 @@ class SpotifyIsrcLookup:
 
     # ------------------------------------------------------------- storage
     def _remember(self, tid, isrc):
-        self._fresh.add(tid)
-        if self.cache.get(tid) != isrc:
-            self.cache[tid] = isrc
-            self._dirty += 1
-            if self._dirty >= 100:
-                self.save()
+        self.cache[tid] = isrc
 
     def _blocks(self):
         data = self._load(self.block_path)

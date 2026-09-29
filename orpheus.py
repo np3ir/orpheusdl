@@ -505,7 +505,7 @@ def _spotify_isrc_only(orpheus, media_list, path):
     api = mod.spotify_api
 
     # ISRC via the Web API (Client Credentials = a Spotify *app*'s client_id/secret,
-    # NOT the user's login) -- cached, throttled, and stopped on the first 429
+    # NOT the user's login) -- throttled, bulk playlist reads, stopped on a 429
     # (utils/spotify_isrc.py). The anonymous embed GraphQL does not expose ISRC,
     # and get_track_info would trigger OAuth.
     from utils.spotify_isrc import SpotifyIsrcLookup
@@ -535,7 +535,7 @@ def _spotify_isrc_only(orpheus, media_list, path):
                 entries.append((str(mid), isrc, name))
             elif mt in (DownloadTypeEnum.playlist, DownloadTypeEnum.album):
                 if mt == DownloadTypeEnum.playlist:
-                    lookup.prefetch_playlist(str(mid))  # 100 ISRCs per Web API call
+                    lookup.prefetch_playlist(str(mid))  # 50 ISRCs per Web API call
                 info = (mod.get_playlist_info(str(mid)) if mt == DownloadTypeEnum.playlist
                         else mod.get_album_info(str(mid)))
                 # get_playlist_info/get_album_info return TrackInfo objects (metadata only)
