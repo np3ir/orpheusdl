@@ -1493,7 +1493,10 @@ def main():
     own_albums = cfg['own_albums_only'] if args.own_albums_only is None else args.own_albums_only
     out_path = args.output or (settings.get('global', {}).get('general', {}).get('download_path'))
     if out_path:
-        out_path = out_path.rstrip('/\\') or out_path
+        # Trailing separators removed, but 'Z:\\' (or a bare 'Z:') stays the drive
+        # ROOT: 'Z:' alone means "current directory on Z:" on Windows.
+        from utils.out_path import normalize_out_path
+        out_path = normalize_out_path(out_path)
 
     src_service, mtype, mid = parse_media_url(args.url)
     # Only real download services (qobuz/tidal/deezer) join the candidate pool.

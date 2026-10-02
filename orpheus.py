@@ -186,7 +186,9 @@ def main():
             raise Exception(f'Unknown module {module}') # TODO: replace with InvalidModuleError
     else:
         path = args.output if args.output else orpheus.settings['global']['general']['download_path']
-        if path[-1] == '/': path = path[:-1]  # removes '/' from end if it exists
+        # Trailing '/' or '\\' removed, but a drive root stays a root ('Z:' -> 'Z:\\').
+        from utils.out_path import normalize_out_path
+        path = normalize_out_path(path)
         os.makedirs(path, exist_ok=True)
 
         media_types = '/'.join(i.name for i in DownloadTypeEnum)
@@ -598,7 +600,8 @@ def _run_isrc_fallback(path):
     import os, sys, subprocess, time
     if os.environ.get('ORPHEUS_ISRC_RECOVERING'):
         return
-    base = str(path).rstrip('/\\')
+    from utils.out_path import normalize_out_path
+    base = normalize_out_path(str(path))   # 'Z:\\' stays the drive root, not 'Z:'
     if not os.path.isdir(base):
         return
     tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'isrc_recover.py')
