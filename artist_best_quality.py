@@ -268,9 +268,13 @@ def _track_artist_names(track, service):
                 names.add(a['name'])
         perf = track.get('performers')
         if isinstance(perf, str):
+            # "Name, MainArtist, Composer - Name2, Producer": only credits that
+            # PERFORM count; composers/producers/engineers are not the artist.
             for chunk in perf.split(' - '):
-                nm = chunk.split(',')[0].strip()
-                if nm:
+                parts = [x.strip() for x in chunk.split(',')]
+                nm, roles = parts[0], {_norm(r).replace(' ', '') for r in parts[1:] if r}
+                if nm and (not roles or roles & {'mainartist', 'featuredartist', 'artist',
+                                                 'primaryartist', 'performer', 'associatedperformer'}):
                     names.add(nm)
     elif service == 'tidal':
         arts = track.get('artists') or ([track.get('artist')] if track.get('artist') else [])
@@ -286,23 +290,30 @@ def _track_artist_names(track, service):
     return {_norm(n) for n in names if n}
 
 
+_GENERIC_NAME_TOKENS = {'the', 'and', 'his', 'her', 'y', 'e', 'el', 'la', 'los', 'las', 'de', 'del',
+                        'trio', 'duo', 'band', 'orchestra', 'orquesta', 'quartet', 'quintet',
+                        'sextet', 'ensemble', 'group', 'grupo', 'sound', 'sounds'}
+
+
 def _name_matches(target_norm, name_norm):
-    """Tolerant artist-name match. Handles alias entities like 'Nat King Cole' vs
-    'Nat King Cole Trio' / 'The King Cole Trio' (shared name tokens) while still
-    rejecting a genuinely different artist (e.g. 'Lester Young')."""
+    """Strict-ish artist-name match. Accepts the same name, or an alias entity whose
+    tokens CONTAIN the whole target name ('Nat King Cole' vs 'Nat King Cole Trio').
+    A single-token target only matches when the extra tokens are generic band words
+    ('the', 'trio', 'band'...), so 'Prince' != 'Prince Royce'. Sharing just a first
+    name ('Marc Anthony' vs 'Marc Cohn', 'Bad Bunny' vs 'Bad Gyal') is NOT a match."""
     if not target_norm or not name_norm:
         return False
     if target_norm == name_norm:
         return True
-    if target_norm in name_norm or name_norm in target_norm:
-        return True
-    tt = set(target_norm.split())
-    nt = set(name_norm.split())
-    if not tt:
+    tt = target_norm.split()
+    nt = name_norm.split()
+    small, big = (tt, nt) if len(tt) <= len(nt) else (nt, tt)
+    sset, bset = set(small), set(big)
+    if not sset <= bset:
         return False
-    overlap = len(tt & nt)
-    # keep when at least half of the target's name tokens appear in the credit
-    return overlap >= 1 and overlap / len(tt) >= 0.5
+    if len(small) >= 2:
+        return True
+    return (bset - sset) <= _GENERIC_NAME_TOKENS
 
 
 def _artist_on_track(track, service, artist_id, artist_name=None):
@@ -913,7 +924,7 @@ _LAST_ALBUM_IDS = {}  # (svc, artist_id) -> sorted album-id list, set by each en
 
 
 def _enum_sig(credited, own_albums_only, artist_filter):
-    return f'c{int(bool(credited))}o{int(bool(own_albums_only))}f{int(bool(artist_filter))}'
+    return f'c{int(bool(credited))}o{int(bool(own_albums_only))}f{int(bool(artist_filter))}v2'  # v2: strict name filter
 
 
 def _enum_cache_file(svc, artist_id, sig):
