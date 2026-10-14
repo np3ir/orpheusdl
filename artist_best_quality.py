@@ -155,6 +155,7 @@ def abq_config(settings):
     cfg.setdefault('library_root', '')
     cfg.setdefault('credited_albums', False)
     cfg.setdefault('own_albums_only', False)
+    cfg.setdefault('verify_hires', False)
     # keep only known services, preserve order, append any missing
     order = [s for s in cfg['prefer_order'] if s in ALL_SERVICES]
     for s in ALL_SERVICES:
@@ -1271,12 +1272,29 @@ def _playlist_isrcs(core, service, playlist_id):
                 break
             off += len(items)
     elif service == 'tidal':
-        r = call_timeout(lambda: s.get_playlist_items(str(playlist_id)), 90, default=None,
-                         label=f'tidal playlist {playlist_id}') or {}
-        for row in r.get('items') or []:
-            it = row.get('item') if isinstance(row, dict) and 'item' in row else row
-            if isinstance(it, dict) and _u(it.get('isrc')):
-                out.add(_u(it.get('isrc')))
+        # Page by hand (100 per request, each page with its own timeout + retries) so a
+        # huge playlist is read in full instead of one 90 s all-or-nothing call.
+        off, total, fails = 0, None, 0
+        while total is None or off < total:
+            page = call_timeout(
+                lambda off=off: s._get('playlists/' + str(playlist_id) + '/items',
+                                       {'offset': off, 'limit': 100}),
+                60, default=None, label=f'tidal playlist {playlist_id} @{off}')
+            if not isinstance(page, dict) or not page.get('items'):
+                fails += 1
+                if fails >= 4:
+                    log(f'    (giving up at item {off}: playlist read incomplete)')
+                    break
+                continue
+            fails = 0
+            total = page.get('totalNumberOfItems', total or 0)
+            for row in page['items']:
+                it = row.get('item') if isinstance(row, dict) and 'item' in row else row
+                if isinstance(it, dict) and _u(it.get('isrc')):
+                    out.add(_u(it.get('isrc')))
+            off += len(page['items'])
+            if off % 1000 < 100:
+                log(f'    ... {off}/{total} playlist items read')
     elif service == 'deezer':
         start = 0
         while True:
@@ -1330,9 +1348,13 @@ def _spotify_isrcs(core, mtype, mid):
         elif mtype == 'playlist':
             # 50 ISRCs per Web API call; the per-track pass below then only asks
             # Spotify for whatever the bulk read did not cover.
-            lookup.prefetch_playlist(str(mid))
-            from_tracklist(call_timeout(lambda: mod.get_playlist_info(str(mid)), 120,
-                                        default=None, label='spotify playlist'))
+            got = lookup.prefetch_playlist(str(mid))
+            if got:                               # whole playlist read via the Web API
+                out |= set(getattr(lookup, 'playlist_isrcs', ()) or ())
+            else:                                 # partial/failed -> slower full read (huge lists need time)
+                from_tracklist(call_timeout(lambda: mod.get_playlist_info(str(mid)), 1200,
+                                            default=None, label='spotify playlist'))
+                out |= set(getattr(lookup, 'playlist_isrcs', ()) or ())
         elif mtype == 'artist':
             info = call_timeout(lambda: mod.get_artist_info(str(mid)), 90,
                                 default=None, label='spotify artist')
@@ -1429,6 +1451,66 @@ def run_orpheus(urls, dlq, out_path):
     return p.returncode, ''.join(chunks)
 
 
+
+def verify_hires_files(new_isrcs, union, order_by_isrc, out_path, cfg, source_url, artist_name):
+    """Report-only check of the files just downloaded in hi-res: flags 'fake hi-res'
+    (CD/lossy upsampled or padded 16-bit) with confidence certain/likely. Never
+    deletes or replaces anything. Files are located through the library ISRC index
+    (orpheus registers each completed download there). Returns pendientes rows."""
+    try:
+        from utils import hires_check as hc
+    except Exception as e:
+        log(f'  [verify-hires] unavailable ({e})')
+        return []
+    if not hc.is_available():
+        log('  [verify-hires] numpy/soundfile missing -> skipped (pip install numpy soundfile)')
+        return []
+    try:
+        from orpheus.isrc_library_index import IsrcLibraryIndex
+        idx = IsrcLibraryIndex(cfg['library_root'] or out_path, CONFIG_DIR, print_fn=log)
+        if not idx.is_built():
+            log('  [verify-hires] ISRC index not built -> cannot locate files, skipped.')
+            return []
+    except Exception as e:
+        log(f'  [verify-hires] cannot open library index ({e})')
+        return []
+    cand = []
+    for isrc in sorted(new_isrcs):
+        order = order_by_isrc.get(isrc) or []
+        c = (union.get(isrc) or {}).get(order[0]) if order else None
+        if c and (c[1] > 16 or c[2] > 44.1):  # only tracks that claim more than CD
+            cand.append(isrc)
+    log(f'\n=== Verifying hi-res authenticity: {len(cand)} new hi-res file(s) ===')
+    rows, fake, ok, err = [], 0, 0, 0
+    stamp = time.strftime('%Y-%m-%d')
+    try:
+        for isrc in cand:
+            path = idx.find(isrc)
+            if not path:
+                err += 1
+                continue
+            try:
+                r = hc.check_file(path)
+            except Exception as e:
+                log(f'  [verify-hires] {os.path.basename(path)}: could not analyse ({e})')
+                err += 1
+                continue
+            if r.verdict == 'fake_hires' and r.confidence in ('certain', 'likely'):
+                fake += 1
+                log(f'  ⚠️ fake hi-res ({r.confidence}): {path}  [{r.reason}]')
+                rows.append({'date': stamp, 'source': source_url, 'artist': artist_name,
+                             'title': _TITLES.get(isrc, os.path.basename(path)), 'isrc': isrc,
+                             'reason': f'fake-hires-{r.confidence}: {r.reason}',
+                             'tried': '/'.join(order_by_isrc.get(isrc) or []), 'available_from': ''})
+            else:
+                if r.verdict == 'fake_hires':  # 'suspect': may be a genuine low-passed master -> log only
+                    log(f'  ? hi-res suspect (not reported): {path}  [{r.reason}]')
+                ok += 1
+    finally:
+        idx.close()
+    log(f'  [verify-hires] genuine/not-flagged={ok}  fake={fake}  not-checked={err}  (report only)')
+    return rows
+
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
@@ -1478,6 +1560,12 @@ def main():
     ap.add_argument('--all-albums', dest='own_albums_only', action='store_false',
                     help='(artist links) consider every album in the discography (overrides '
                          'own_albums_only from settings).')
+    ap.add_argument('--verify-hires', dest='verify_hires', action='store_true', default=None,
+                    help='After downloading hi-res (-q hires/best), analyse each new file and report '
+                         '"fake hi-res" (upsampled CD / padded 16-bit) to config/abq_pendientes.csv. '
+                         'Report only: nothing is deleted or replaced. Needs numpy + soundfile.')
+    ap.add_argument('--no-verify-hires', dest='verify_hires', action='store_false',
+                    help='Disable hi-res verification (overrides verify_hires from settings).')
     ap.add_argument('--dry', action='store_true', help='Show the plan (service + quality per track); download nothing.')
     ap.add_argument('--no-cache', action='store_true',
                     help='Ignore the per-artist enumeration cache (config/enum_cache); read metadata live.')
@@ -1502,6 +1590,7 @@ def main():
 
     credited = cfg['credited_albums'] if args.credited is None else args.credited
     own_albums = cfg['own_albums_only'] if args.own_albums_only is None else args.own_albums_only
+    verify_hires = cfg['verify_hires'] if args.verify_hires is None else args.verify_hires
     out_path = args.output or (settings.get('global', {}).get('general', {}).get('download_path'))
     if out_path:
         # Trailing separators removed, but 'Z:\\' (or a bare 'Z:') stays the drive
@@ -1671,6 +1760,7 @@ def main():
         # mode (404 / dead id / flac-omit / "Track unavailable" / region lock) with
         # no library walk and without trusting orpheus' always-zero exit code.
         failed_direct = set()
+        new_isrcs = set()  # ISRCs newly downloaded this run (for --verify-hires)
         for svc in [s for s in prefer if s in by_service]:
             entries = by_service[svc]
             log(f'\n=== Downloading {len(entries)} track(s) from {svc} @ {dlq} ===')
@@ -1682,6 +1772,8 @@ def main():
                 for isrc, tid, _u in chunk:
                     if tid not in ok:
                         failed_direct.add(isrc)
+                    elif tid in dl:
+                        new_isrcs.add(isrc)
 
         # ---- cross-service fallback: retry each failed ISRC on its next-best
         # service, in preference order, until one has it (downloaded or present). ----
@@ -1721,6 +1813,7 @@ def main():
                     dl, pres = outcomes_from_output(out)
                     if tid in dl:
                         recovered.add(isrc)
+                        new_isrcs.add(isrc)
                         break
                     if tid in pres:
                         present_elsewhere.add(isrc)
@@ -1745,6 +1838,12 @@ def main():
                 tried = '/'.join(tried_by_isrc.get(isrc) or order_by_isrc.get(isrc, [])) or '?'
                 log(f'    {isrc}  (tried: {tried})')
 
+        # ---- optional: verify hi-res authenticity of what was just downloaded ----
+        fake_rows = []
+        if verify_hires and dlq == 'hifi' and new_isrcs:
+            fake_rows = verify_hires_files(new_isrcs, union, order_by_isrc, out_path, cfg,
+                                           args.url, artist_name)
+
         # ---- persist for later revisit: config/abq_pendientes.csv ----
         stamp = time.strftime('%Y-%m-%d')
         pend = [{'date': stamp, 'source': args.url, 'artist': artist_name,
@@ -1760,7 +1859,7 @@ def main():
             pend.append({'date': stamp, 'source': args.url, 'artist': artist_name,
                          'title': title or _TITLES.get(isrc, ''), 'isrc': isrc,
                          'reason': 'pre-release', 'tried': svc, 'available_from': avail})
-        append_pendientes(pend)
+        append_pendientes(pend + fake_rows)
 
         log('\nDone.')
     finally:

@@ -246,6 +246,7 @@ def test_playlist_read_50_per_call_using_item(tmp_path, spotify):
     msgs = []
     lk = lookup(tmp_path, msgs)
     assert lk.prefetch_playlist('P') == 2
+    assert lk.playlist_isrcs == {'MXF140200162', 'USAAA0000003'}
     assert [u for u, _ in fake.urls] == ['https://api.spotify.com/v1/playlists/P/items?limit=50',
                                          'https://api.spotify.com/v1/playlists/P/items?offset=50&limit=50']
     assert '2 ISRC(s) read from the playlist in 2 call(s)' in msgs[0]

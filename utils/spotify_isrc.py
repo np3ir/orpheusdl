@@ -87,6 +87,7 @@ class SpotifyIsrcLookup:
         self.print = print_fn
         self.block_path = os.path.join(config_dir, 'spotify_blocked_until.json')
         self.cache = {}         # track id -> ISRC, this run only
+        self.playlist_isrcs = set()  # ISRCs read by the last prefetch_playlist()
         try:
             os.remove(os.path.join(config_dir, 'spotify_isrc_cache.json'))  # older versions
         except OSError:
@@ -141,6 +142,7 @@ class SpotifyIsrcLookup:
             return None
         url = f'{_API}/playlists/{playlist_id}/items?limit={_PAGE_LIMIT}'
         got = pages = 0
+        self.playlist_isrcs = set()               # every ISRC read from this playlist
         while url:
             ok, page = self._call('playlists', lambda tok, url=url: self._get(url, tok))
             if not ok or not isinstance(page, dict):
@@ -153,6 +155,7 @@ class SpotifyIsrcLookup:
                 tid, isrc = tr.get('id'), _isrc_of(tr)
                 if tid and isrc:
                     self._remember(str(tid), isrc)
+                    self.playlist_isrcs.add(str(isrc).strip().upper())
                     got += 1
             url = page.get('next')
         self.print(f'  spotify: {got} ISRC(s) read from the playlist in {pages} call(s) (data: Spotify Web API)')
