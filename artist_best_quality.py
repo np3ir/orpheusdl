@@ -1522,6 +1522,13 @@ def main():
         sys.stdin = open(os.devnull)
     except Exception:
         pass
+    # Piped / non-UTF-8 stdout (CI, scheduled tasks, cp1252): never crash on a
+    # progress-bar or title character the console encoding cannot represent.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors='replace')
+        except Exception:
+            pass
     _PRERELEASE.clear()
     _TITLES.clear()
 

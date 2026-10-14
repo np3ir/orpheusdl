@@ -119,7 +119,7 @@ def test_build_skips_quarantine_and_aborts_prune_on_walk_error(idx, monkeypatch)
     assert result['total_files'] == 1
     previous = idx.last_scan()
     def broken_walk():
-        idx._scan_error(OSError('NAS disconnected'))
+        idx._walk_error(OSError('NAS disconnected'))
         yield from ()
     monkeypatch.setattr(idx, '_iter_audio', broken_walk)
     assert idx.build()['error'] == 'incomplete_scan'
@@ -406,8 +406,10 @@ def test_scan_preserves_prior_evidence_on_read_failure(idx):
     path=audio(Path(idx.root)/'a.wav'); idx.build()
     previous=idx.last_scan()
     Path(path).write_bytes(b'unreadable')
-    assert idx.build()['error']=='incomplete_scan'
-    assert idx.last_scan()==previous
+    stats=idx.build()
+    # an unreadable single file is benign (dbc9eaa): the scan completes, the row
+    # is kept as evidence, and the file just is not trusted by find() this round
+    assert 'error' not in stats and stats['read_warnings']==1
     assert idx.row_count()==1
     assert idx.find('TEST00000001') is None
     audio(path)
