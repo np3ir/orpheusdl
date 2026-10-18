@@ -146,22 +146,30 @@ class GenreLookup:
             except Exception:
                 pass
 
-    def _remember(self, key, genres):
+    def _remember(self, key, genres, sp=False):
+        row = {'g': list(genres), 't': int(time.time())}
+        if sp:
+            row['sp'] = True        # Spotify was asked too and had nothing
         with self._lock:
-            self._cache[key] = {'g': list(genres), 't': int(time.time())}
+            self._cache[key] = row
             self._dirty += 1
             flush = self._dirty >= 25
         if flush:
             self.save()
 
-    def _cached(self, key):
+    def _row(self, key):
+        """Fresh cache row, or None (absent, or a stale 'nothing found')."""
         with self._lock:
             row = self._cache.get(key)
         if not isinstance(row, dict):
             return None
         if not row.get('g') and time.time() - float(row.get('t') or 0) > NEGATIVE_TTL_S:
-            return None  # stale "nothing found" -> ask again
-        return list(row.get('g') or [])
+            return None
+        return row
+
+    def _cached(self, key):
+        row = self._row(key)
+        return None if row is None else list(row.get('g') or [])
 
     # ---- sources -----------------------------------------------------------
     def _deezer(self, path):
@@ -194,36 +202,53 @@ class GenreLookup:
         except Exception:
             return []
 
+    @property
+    def spotify_ready(self):
+        return bool(self.use_spotify and self._spotify)
+
+    def spotify_blocked(self):
+        sp = self._spotify
+        return bool(sp and any(sp.stopped_by.get(b) for b in ('search', 'artists')))
+
     def spotify_genres(self, isrc):
-        if not (self.use_spotify and self._spotify):
-            return []
+        """List of library-vocabulary genres, [] when Spotify has none, None when it could not be asked."""
+        if not self.spotify_ready:
+            return None
         try:
             raw = self._spotify.artist_genres_by_isrc(isrc)
         except Exception:
-            return []
-        return normalize_spotify(raw) if raw else []
+            return None
+        if raw is None:
+            return None
+        return normalize_spotify(raw)
 
     # ---- public ------------------------------------------------------------
     def genres(self, isrc):
-        """Genre list for this ISRC ([] when none found). Cached on disk."""
+        """Genre list for this ISRC ([] when none found). Deezer first, Spotify second.
+
+        A cached "Deezer had nothing" does not block a later Spotify attempt when Spotify
+        has since been enabled/unblocked; Spotify-derived genres are never persisted."""
         isrc = str(isrc or '').strip().upper()
         if not isrc:
             return []
-        hit = self._cached('isrc:' + isrc)
-        if hit is not None:
-            return hit
+        key = 'isrc:' + isrc
+        row = self._row(key)
+        if row is not None and row.get('g'):
+            return list(row['g'])
         if isrc in self._mem:
             return list(self._mem[isrc])
-        found = self.deezer_genres(isrc)
+        if row is not None and (not self.spotify_ready or row.get('sp')):
+            return []                                  # known negative, nothing new to try
+        found = [] if row is not None else self.deezer_genres(isrc)
         if found:
-            self._remember('isrc:' + isrc, found)
+            self._remember(key, found)
             return found
-        found = self.spotify_genres(isrc)
-        if found:
-            self._mem[isrc] = list(found)        # Spotify content: not written to the disk cache
-        else:
-            self._remember('isrc:' + isrc, [])   # "nothing found" is our own result, safe to cache
-        return found
+        sp = self.spotify_genres(isrc)
+        if sp:
+            self._mem[isrc] = list(sp)               # Spotify content: not written to the disk cache
+            return list(sp)
+        self._remember(key, [], sp=(sp is not None))   # sp None = could not ask -> retry later
+        return []
 
 
 _shared = None

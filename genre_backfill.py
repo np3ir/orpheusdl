@@ -7,6 +7,7 @@ split_metadata is on). Files that already have a genre are never touched.
 
     python genre_backfill.py --dir Z:\\ --dry --limit 200      # preview, writes nothing
     python genre_backfill.py --dir Z:\\                          # real run, resumable
+    python genre_backfill.py --dir Z:\\ --spotify --retry-missing   # Spotify pass for what Deezer missed
 
 Resumable: config/genre_backfill.db remembers every file already handled.
 Files with no genre found anywhere go to config/genre_backfill_missing.csv.
@@ -69,6 +70,11 @@ def main():
             pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--dir', default=None, help='Library root (default: settings download_path).')
+    ap.add_argument('--retry-missing', action='store_true',
+                    help='Only re-check files an earlier run could not fill (use with --spotify to give '
+                         'them a Spotify pass once its API block has ended).')
+    ap.add_argument('--progress-db', default=os.path.join(CONFIG_DIR, 'genre_backfill.db'),
+                    help='Progress database (default config/genre_backfill.db).')
     ap.add_argument('--dry', action='store_true', help='Look up and report, write nothing.')
     ap.add_argument('--limit', type=int, default=0, help='Stop after N files that needed a lookup.')
     ap.add_argument('--workers', type=int, default=6, help='Parallel tag readers (NAS latency).')
@@ -103,15 +109,20 @@ def main():
 
     # progress db (resume)
     tag = hashlib.sha1(os.path.abspath(root).lower().encode('utf-8')).hexdigest()[:10]
-    prog = sqlite3.connect(os.path.join(CONFIG_DIR, 'genre_backfill.db'), check_same_thread=False)
+    prog = sqlite3.connect(args.progress_db, check_same_thread=False, timeout=60)
     prog.execute('CREATE TABLE IF NOT EXISTS done(root TEXT, path TEXT, status TEXT, PRIMARY KEY(root, path))')
     prog.commit()
     done = {r[0] for r in prog.execute('SELECT path FROM done WHERE root=?', (tag,))}
 
     src = sqlite3.connect(db_path)
-    rows = [(p, i) for p, i in src.execute("SELECT path, isrc FROM files WHERE isrc != '' AND lower(path) LIKE '%.flac'")
-            if p not in done]
+    every = list(src.execute("SELECT path, isrc FROM files WHERE isrc != '' AND lower(path) LIKE '%.flac'"))
     src.close()
+    if args.retry_missing:
+        pending = {r[0] for r in prog.execute("SELECT path FROM done WHERE root=? AND status='missing'", (tag,))}
+        rows = [(p, i) for p, i in every if p in pending]
+        done = set()
+    else:
+        rows = [(p, i) for p, i in every if p not in done]
     print(f'{len(rows)} FLAC file(s) to check ({len(done)} already handled in earlier runs). '
           f'{"DRY RUN - nothing is written. " if args.dry else ""}Spotify: {"on" if spotify else "off"}')
 
@@ -150,6 +161,12 @@ def main():
                 return
             stats['lookups'] += 1
         genres = lookup.genres(isrc)
+        if not genres and spotify is not None and lookup.spotify_blocked():
+            if not stop.is_set():
+                stop.set()
+                print('  Spotify API is blocked (quota) -> stopping; the files Deezer could not fill stay '
+                      'pending. Run again later with --spotify --retry-missing.')
+            return                      # not marked: still pending, not "missing"
         if not genres:
             with lock:
                 stats['missing'] += 1

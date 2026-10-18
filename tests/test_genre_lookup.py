@@ -130,3 +130,30 @@ def test_deezer_album_level_names_are_mapped():
                       ('Dancehall/Ragga', 'Dancehall'), ('Contemporary R&B', 'R&B'), ('Reggaeton', 'Reggaeton'),
                       ('Salsa', 'Salsa'), ('International Pop', 'International Pop')]:
         assert gl.normalize_deezer(raw) == want
+
+
+def test_deezer_negative_does_not_block_a_later_spotify_pass(tmp_path):
+    first = make(tmp_path, FakeDeezer(), spotify=None)            # run 1: Deezer only
+    assert first.genres('ZZZ') == []
+    first.save()
+    sp = FakeSpotify(['bachata'])
+    second = make(tmp_path, FakeDeezer(), sp)                      # run 2: Spotify enabled
+    assert second.genres('ZZZ') == ['Latin'] and sp.calls == ['ZZZ']
+
+
+def test_spotify_unavailable_is_not_recorded_as_tried(tmp_path):
+    down = FakeSpotify(None)                                       # blocked / error
+    lk = make(tmp_path, FakeDeezer(), down)
+    assert lk.genres('ZZZ') == []
+    lk.save()
+    up = FakeSpotify(['salsa'])
+    assert make(tmp_path, FakeDeezer(), up).genres('ZZZ') == ['Salsa']   # still gets its chance
+
+
+def test_spotify_that_answered_empty_is_not_asked_again(tmp_path):
+    sp = FakeSpotify([])
+    lk = make(tmp_path, FakeDeezer(), sp)
+    assert lk.genres('ZZZ') == []
+    lk.save()
+    sp2 = FakeSpotify(['rock'])
+    assert make(tmp_path, FakeDeezer(), sp2).genres('ZZZ') == [] and sp2.calls == []

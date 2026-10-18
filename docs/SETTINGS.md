@@ -226,7 +226,7 @@ El archivo tiene dos partes grandes: **`global`** (cómo se comporta el programa
 | `genre_fallback` | Si el servicio no da género (Tidal nunca lo da), buscarlo en Deezer por ISRC y escribirlo en el archivo (por defecto `true`). Las descargas hi-res siguen igual; solo se rellena un género vacío. |
 | `genre_spotify` | Si Deezer tampoco lo tiene, probar los géneros del artista en Spotify (por defecto `false`). Los términos de Spotify limitan guardar su contenido; los resultados no se guardan en la caché en disco, pero sí quedarían en las etiquetas del archivo. Actívalo bajo tu responsabilidad. |
 
-Para rellenar el género de lo que **ya tienes**: `python genre_backfill.py --dir Z:\ --dry --limit 200` (vista previa) y luego sin `--dry`. Solo toca archivos FLAC con el género vacío, se puede reanudar, y lo que no se encuentre queda en `config/genre_backfill_missing.csv`. Añade `--spotify` para usar también Spotify.
+Para rellenar el género de lo que **ya tienes**: `python genre_backfill.py --dir Z:\ --dry --limit 200` (vista previa) y luego sin `--dry`. Solo toca archivos FLAC con el género vacío, se puede reanudar, y lo que no se encuentre queda en `config/genre_backfill_missing.csv`. Añade `--spotify` para usar también Spotify; para darle una segunda pasada solo a lo que Deezer no encontró, cuando Spotify no esté bloqueado: `python genre_backfill.py --dir Z:\ --spotify --retry-missing`. Si Spotify está bloqueado el script se detiene y deja esos archivos pendientes.
 
 ### artist_downloading — al descargar un artista completo
 | Opción | Qué hace |
