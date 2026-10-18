@@ -1529,6 +1529,39 @@ def verify_hires_files(new_isrcs, union, order_by_isrc, out_path, cfg, source_ur
     log(f'  [verify-hires] genuine/not-flagged={ok}  fake={fake}  not-checked={err}  (report only)')
     return rows
 
+def _spotify_tracks_blocked():
+    """True while the Spotify Web API 'tracks' bucket is blocked by an earlier 429."""
+    try:
+        with open(os.path.join(CONFIG_DIR, 'spotify_blocked_until.json'), encoding='utf-8') as f:
+            blk = json.load(f)
+        row = blk.get('tracks') if isinstance(blk.get('tracks'), dict) else blk
+        return float((row or {}).get('until') or 0) > time.time()
+    except Exception:
+        return False
+
+
+def translate_with_musiclink(link, settings, prefer):
+    """Use MusicLink to turn `link` into a Qobuz/Tidal/Deezer link or a bare ISRC.
+    Returns the translate() dict, or None when it cannot be done (caller decides)."""
+    from utils import musiclink as ml
+    key = ml.api_key(settings)
+    if not key:
+        return 'nokey'
+
+    def readable(u):
+        try:
+            parse_media_url(u)
+            return True
+        except SystemExit:
+            return False
+    order = [s for s in prefer if s in ml.PLATFORM_KEYS] + [s for s in ml.PLATFORM_KEYS if s not in prefer]
+    try:
+        return ml.translate(link, ml.MusicLink(key), prefer=order, accept=readable)
+    except ml.MusicLinkError as e:
+        log(f'  MusicLink: {e}')
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
@@ -1585,6 +1618,10 @@ def main():
     ap.add_argument('--all-albums', dest='own_albums_only', action='store_false',
                     help='(artist links) consider every album in the discography (overrides '
                          'own_albums_only from settings).')
+    ap.add_argument('--musiclink', action='store_true',
+                    help='Also translate Spotify TRACK/ALBUM links with MusicLink (needs its API key) instead of '
+                         'the Spotify API. Links from platforms abq cannot read (Apple Music, YouTube Music, '
+                         '...) are always translated that way.')
     ap.add_argument('--verify-hires', dest='verify_hires', action='store_true', default=None,
                     help='After downloading hi-res (-q hires/best), analyse each new file and report '
                          '"fake hi-res" (upsampled CD / padded 16-bit) to config/abq_pendientes.csv. '
@@ -1623,7 +1660,38 @@ def main():
         from utils.out_path import normalize_out_path
         out_path = normalize_out_path(out_path)
 
-    src_service, mtype, mid = parse_media_url(args.url)
+    link = args.url
+    forced_isrcs = None
+    from utils import musiclink as _ml
+    foreign = _ml.is_foreign(link)
+    spotify_item = ('spotify.com' in link) and ('/track/' in link or '/album/' in link)
+    if foreign or (spotify_item and (args.musiclink or _spotify_tracks_blocked())):
+        res = translate_with_musiclink(link, settings, prefer)
+        if res == 'nokey':
+            if foreign:
+                raise SystemExit(
+                    'This link is not on Tidal / Deezer / Qobuz. To read links from other platforms (Apple Music, '
+                    'YouTube Music, ...) abq translates them with MusicLink: create a free key at '
+                    'https://musiclink.one and put it in config/settings.json > modules > musiclink > api_key '
+                    '(or the MUSICLINK_API_KEY environment variable).')
+            log('  (no MusicLink key set -> using the Spotify API)')
+        elif res:
+            who = f'{res.get("artist") or "?"} - {res.get("title") or "?"}'
+            if res.get('url'):
+                link = res['url']
+                log(f'MusicLink: {who} -> {res["via"]}: {link}')
+            else:
+                forced_isrcs = {res['isrc']}
+                log(f'MusicLink: {who} -> ISRC {res["isrc"]} (no Qobuz/Tidal/Deezer link; probing by ISRC)')
+        elif foreign:
+            raise SystemExit('MusicLink found no match for this link (only tracks, albums and artists can be '
+                             'translated; playlists cannot).')
+        else:
+            log('  MusicLink had no answer -> using the Spotify API')
+    if forced_isrcs is not None:
+        src_service, mtype, mid = 'musiclink', 'track', next(iter(forced_isrcs))
+    else:
+        src_service, mtype, mid = parse_media_url(link)
     # Only real download services (qobuz/tidal/deezer) join the candidate pool.
     # A Spotify source is metadata-only: it supplies ISRCs, never FLAC.
     if src_service in ALL_SERVICES and src_service not in active:
@@ -1690,7 +1758,7 @@ def main():
             # ---- track / album / playlist: read the source ISRCs, then look each
             # recording up on every service and keep the best FLAC ----
             log(f'\nReading {mtype} {mid} from {src_service}...')
-            isrcs = source_isrcs(core, src_service, mtype, mid)
+            isrcs = forced_isrcs if forced_isrcs is not None else source_isrcs(core, src_service, mtype, mid)
             log(f'  {len(isrcs)} recording(s) with ISRC in the {mtype}')
             if 'tidal' in active:
                 _tidal_guest_isrc_fetch(sorted(isrcs))  # 20 ISRCs per guest request

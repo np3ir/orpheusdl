@@ -390,4 +390,11 @@ cada servicio. Una opción común:
 |---|---|
 | `rate_limit_rpm` | Máximo de peticiones por minuto a ese servicio, para proteger tu cuenta (menor = más suave; `0` = sin límite). |
 
+**`musiclink`** (opcional): para que `abq` lea enlaces de plataformas que no conoce (Apple Music, YouTube Music, Amazon Music, Pandora…) y también enlaces de pista o álbum de Spotify sin gastar la cuota de su API.
+| Opción | Qué hace |
+|---|---|
+| `api_key` | Tu clave gratuita de https://musiclink.one (300 consultas al mes, 10 por minuto, uso no comercial). También vale la variable de entorno `MUSICLINK_API_KEY`. |
+
+MusicLink devuelve el **ISRC** de la pista y sus enlaces en Qobuz/Tidal/Deezer, y `abq` sigue desde ahí como siempre. Funciona con pistas, álbumes y artistas (no con playlists). Cada enlace se consulta una sola vez: el resultado se guarda en `config/musiclink_cache.json`. Con `--musiclink` también se usa para enlaces de Spotify (pista/álbum), y lo hace solo si la API de Spotify está bloqueada.
+
 Tus cuentas son privadas y este archivo **no** se sube a GitHub.
