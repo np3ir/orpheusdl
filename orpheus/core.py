@@ -121,6 +121,11 @@ class Orpheus:
                 "reverify_existing_files": False,
                 "isrc_library_dedup": False,
                 "isrc_library_upgrade": False,
+                # Empty GENRE tag fallback (utils/genre_lookup.py): Deezer, then Qobuz, then Spotify.
+                # Must be listed here: the core drops settings.json keys that are not in this template.
+                "genre_fallback": True,
+                "genre_qobuz": True,
+                "genre_spotify": False,
             },
             "artist_downloading":{
                 "return_credited_albums": True,
@@ -139,6 +144,7 @@ class Orpheus:
                 "library_root": "",
                 "credited_albums": False,
                 "own_albums_only": False,
+                "verify_hires": False,
             },
             "formatting": {
                 "discography_format": "{name} {quality}",
