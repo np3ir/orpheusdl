@@ -29,9 +29,28 @@ class FakeSpotify:
         return self.result
 
 
-def make(tmp_path, deezer, spotify=None, use_spotify=True):
-    return gl.GenreLookup(deezer_get=deezer, spotify=spotify, use_spotify=use_spotify,
+def make(tmp_path, deezer, spotify=None, use_spotify=True, qobuz=None):
+    return gl.GenreLookup(deezer_get=deezer, spotify=spotify, use_spotify=use_spotify, qobuz=qobuz,
                           cache_path=str(tmp_path / 'g.json'), interval=0, sleep=lambda s: None)
+
+
+class FakeQobuz:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def genres_by_isrc(self, isrc):
+        self.calls.append(isrc)
+        return self.result
+
+
+class FakeHttp:
+    def __init__(self, status=200, body=None):
+        self.status, self.body, self.calls = status, body or {}, []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append(params)
+        return SimpleNamespace(status_code=self.status, json=lambda: self.body)
 
 
 def album(*names):
@@ -157,3 +176,49 @@ def test_spotify_that_answered_empty_is_not_asked_again(tmp_path):
     lk.save()
     sp2 = FakeSpotify(['rock'])
     assert make(tmp_path, FakeDeezer(), sp2).genres('ZZZ') == [] and sp2.calls == []
+
+
+def test_qobuz_is_second_and_its_genre_is_persisted(tmp_path):
+    qb = FakeQobuz(['World'])
+    lk = make(tmp_path, FakeDeezer(), qobuz=qb)
+    assert lk.genres('ZZZ') == ['World']
+    lk.save()
+    qb2 = FakeQobuz(['Pop'])
+    assert make(tmp_path, FakeDeezer(), qobuz=qb2).genres('ZZZ') == ['World'] and qb2.calls == []
+
+
+def test_deezer_wins_over_qobuz_and_spotify_comes_last(tmp_path):
+    dz = FakeDeezer({'AAA': {'album': {'id': 1}}}, {'1': album('Pop')})
+    qb, sp = FakeQobuz(['World']), FakeSpotify(['rock'])
+    assert make(tmp_path, dz, sp, qobuz=qb).genres('AAA') == ['Pop'] and qb.calls == [] and sp.calls == []
+    qb2, sp2 = FakeQobuz([]), FakeSpotify(['rock'])
+    assert make(tmp_path / 'b', FakeDeezer(), sp2, qobuz=qb2).genres('ZZZ') == ['Rock']
+    assert qb2.calls == ['ZZZ'] and sp2.calls == ['ZZZ']
+
+
+def test_qobuz_unavailable_is_retried_later_but_empty_answer_is_final(tmp_path):
+    down = FakeQobuz(None)
+    lk = make(tmp_path, FakeDeezer(), qobuz=down)
+    assert lk.genres('ZZZ') == []
+    lk.save()
+    up = FakeQobuz(['Latin'])
+    lk2 = make(tmp_path, FakeDeezer(), qobuz=up)
+    assert lk2.genres('ZZZ') == ['Latin']
+    none_found = FakeQobuz([])
+    lk3 = make(tmp_path / 'c', FakeDeezer(), qobuz=none_found)
+    assert lk3.genres('YYY') == []
+    lk3.save()
+    again = FakeQobuz(['Pop'])
+    assert make(tmp_path / 'c', FakeDeezer(), qobuz=again).genres('YYY') == [] and again.calls == []
+
+
+def test_qobuz_genres_by_isrc_parses_and_matches_exactly():
+    body = {'tracks': {'items': [
+        {'isrc': 'OTHER0000001', 'album': {'genre': {'name': 'Jazz'}}},
+        {'isrc': 'usug12400919', 'album': {'genre': {'name': 'Hip-Hop/Rap'}}}]}}
+    q = gl.QobuzGenres(http=FakeHttp(200, body), interval=0, sleep=lambda s: None)
+    assert q.genres_by_isrc('USUG12400919') == ['Hip-Hop/Rap']
+    assert q.genres_by_isrc('NOMATCH00001') == []
+    assert gl.QobuzGenres(http=FakeHttp(500), interval=0).genres_by_isrc('USUG12400919') is None
+    assert q.app_id == gl.QobuzGenres.GUEST_APP_ID
+    assert gl.QobuzGenres(app_id=123).app_id == '123'

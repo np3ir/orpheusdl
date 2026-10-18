@@ -1,13 +1,15 @@
 """Genre fallback for tracks whose service gave no genre (Tidal never does).
 
-Order: Deezer public API by ISRC (track -> album -> album genres), then Spotify
-(per-artist genres, coarse) when Deezer has nothing. Results are normalised to the
+Order: Deezer public API by ISRC (track -> album -> album genres), then Qobuz
+(catalog search by ISRC -> album genre, already the library's vocabulary), then Spotify
+(per-artist genres, coarse, opt-in) when the earlier ones have nothing. Results are normalised to the
 vocabulary already used in the library (Qobuz-style names) and cached on disk in
 config/genre_cache.json, so every ISRC is asked at most once.
 
 Settings (config/settings.json > global > general):
   genre_fallback   true  -> fill empty genres at tagging time (default true)
-  genre_spotify    true  -> use Spotify when Deezer has none (default FALSE)
+  genre_qobuz      true  -> use Qobuz when Deezer has none (default true)
+  genre_spotify    true  -> use Spotify when Deezer/Qobuz have none (default FALSE)
 Spotify needs client_id/client_secret under modules > spotify (same as ISRC reads).
 Spotify's Developer Terms (IV.3) forbid storing its content beyond what is strictly
 necessary, so Spotify-derived genres are kept in memory only (never in the disk
@@ -108,11 +110,56 @@ def normalize_spotify(genres):
     return out
 
 
+class QobuzGenres:
+    """Album genre of a track, from Qobuz catalog search by ISRC (metadata only).
+
+    Uses the web player's public guest app id (the same one modules/qobuz already uses
+    for previews) unless an app_id is given; no login, no credentials involved."""
+    URL = 'https://www.qobuz.com/api.json/0.2/catalog/search'
+    GUEST_APP_ID = '712109809'
+
+    def __init__(self, app_id=None, interval=0.5, http=None, sleep=time.sleep):
+        self.app_id = str(app_id or self.GUEST_APP_ID)
+        self.interval = interval
+        self._http = http
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def genres_by_isrc(self, isrc):
+        """[name] (library vocabulary already), [] when Qobuz has none, None when it could not be asked."""
+        isrc = str(isrc or '').strip().upper()
+        if not isrc:
+            return []
+        with self._lock:
+            wait = self._last + self.interval - time.monotonic()
+            self._last = time.monotonic() + max(0.0, wait)
+        if wait > 0:
+            self._sleep(wait)
+        try:
+            http = self._http
+            if http is None:
+                import requests as http
+            resp = http.get(self.URL, params={'query': isrc, 'limit': 5, 'app_id': self.app_id},
+                            headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
+            if resp.status_code != 200:
+                return None
+            items = ((resp.json() or {}).get('tracks') or {}).get('items') or []
+        except Exception:
+            return None
+        for it in items:
+            if str(it.get('isrc') or '').strip().upper() == isrc:       # exact recording only
+                name = (((it.get('album') or {}).get('genre')) or {}).get('name')
+                return [name] if name else []
+        return []
+
+
 class GenreLookup:
-    def __init__(self, deezer_get=None, spotify=None, use_spotify=True, cache_path=CACHE_FILE,
+    def __init__(self, deezer_get=None, spotify=None, use_spotify=True, qobuz=None, cache_path=CACHE_FILE,
                  interval=DEEZER_INTERVAL_S, sleep=time.sleep):
         self._deezer_get = deezer_get
         self._spotify = spotify
+        self._qobuz = qobuz
         self.use_spotify = use_spotify
         self.cache_path = cache_path
         self.interval = interval
@@ -146,8 +193,10 @@ class GenreLookup:
             except Exception:
                 pass
 
-    def _remember(self, key, genres, sp=False):
+    def _remember(self, key, genres, sp=False, q=False):
         row = {'g': list(genres), 't': int(time.time())}
+        if q:
+            row['q'] = True         # Qobuz was asked too and had nothing
         if sp:
             row['sp'] = True        # Spotify was asked too and had nothing
         with self._lock:
@@ -203,6 +252,19 @@ class GenreLookup:
             return []
 
     @property
+    def qobuz_ready(self):
+        return self._qobuz is not None
+
+    def qobuz_genres(self, isrc):
+        """[name], [] when Qobuz has none, None when it could not be asked."""
+        if self._qobuz is None:
+            return None
+        try:
+            return self._qobuz.genres_by_isrc(isrc)
+        except Exception:
+            return None
+
+    @property
     def spotify_ready(self):
         return bool(self.use_spotify and self._spotify)
 
@@ -224,10 +286,11 @@ class GenreLookup:
 
     # ---- public ------------------------------------------------------------
     def genres(self, isrc):
-        """Genre list for this ISRC ([] when none found). Deezer first, Spotify second.
+        """Genre list for this ISRC ([] when none found): Deezer, then Qobuz, then Spotify.
 
-        A cached "Deezer had nothing" does not block a later Spotify attempt when Spotify
-        has since been enabled/unblocked; Spotify-derived genres are never persisted."""
+        A cached negative never blocks a source that was unavailable/off at the time (a
+        source is only skipped once it answered "nothing"); Spotify-derived genres are
+        never persisted (Developer Terms IV.3)."""
         isrc = str(isrc or '').strip().upper()
         if not isrc:
             return []
@@ -237,17 +300,30 @@ class GenreLookup:
             return list(row['g'])
         if isrc in self._mem:
             return list(self._mem[isrc])
-        if row is not None and (not self.spotify_ready or row.get('sp')):
-            return []                                  # known negative, nothing new to try
-        found = [] if row is not None else self.deezer_genres(isrc)
+        deezer_done = row is not None
+        q_done = bool(row and row.get('q')) or not self.qobuz_ready
+        sp_done = bool(row and row.get('sp')) or not self.spotify_ready
+        if deezer_done and q_done and sp_done:
+            return []
+        found = [] if deezer_done else self.deezer_genres(isrc)
         if found:
             self._remember(key, found)
             return found
-        sp = self.spotify_genres(isrc)
-        if sp:
-            self._mem[isrc] = list(sp)               # Spotify content: not written to the disk cache
-            return list(sp)
-        self._remember(key, [], sp=(sp is not None))   # sp None = could not ask -> retry later
+        q_flag = bool(row and row.get('q'))
+        if not q_done:
+            qg = self.qobuz_genres(isrc)
+            if qg:
+                self._remember(key, qg)
+                return list(qg)
+            q_flag = q_flag or (qg is not None)
+        sp_flag = bool(row and row.get('sp'))
+        if not sp_done:
+            sp = self.spotify_genres(isrc)
+            if sp:
+                self._mem[isrc] = list(sp)           # Spotify content: not written to the disk cache
+                return list(sp)
+            sp_flag = sp_flag or (sp is not None)
+        self._remember(key, [], sp=sp_flag, q=q_flag)    # a flag stays False if that source could not answer
         return []
 
 
@@ -275,7 +351,11 @@ def shared():
                                                 print_fn=lambda *a, **k: None)
             except Exception:
                 spotify = None
-        _shared = GenreLookup(spotify=spotify, use_spotify=spotify is not None)
+        qobuz = None
+        if general.get('genre_qobuz', True):
+            qcfg = (_settings().get('modules') or {}).get('qobuz') or {}
+            qobuz = QobuzGenres(app_id=qcfg.get('app_id') or None)
+        _shared = GenreLookup(spotify=spotify, use_spotify=spotify is not None, qobuz=qobuz)
         import atexit
         atexit.register(_shared.save)
         return _shared

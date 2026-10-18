@@ -11,6 +11,7 @@ split_metadata is on). Files that already have a genre are never touched.
 
 Resumable: config/genre_backfill.db remembers every file already handled.
 Files with no genre found anywhere go to config/genre_backfill_missing.csv.
+Sources, in order: Deezer, Qobuz (catalog search by ISRC), Spotify (only with --spotify).
 """
 import argparse
 import csv
@@ -70,6 +71,7 @@ def main():
             pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--dir', default=None, help='Library root (default: settings download_path).')
+    ap.add_argument('--no-qobuz', action='store_true', help='Do not use Qobuz as a second source.')
     ap.add_argument('--retry-missing', action='store_true',
                     help='Only re-check files an earlier run could not fill (use with --spotify to give '
                          'them a Spotify pass once its API block has ended).')
@@ -105,7 +107,11 @@ def main():
                 spotify = SpotifyIsrcLookup(types.SimpleNamespace(config=cfg), CONFIG_DIR, print_fn=print)
         except Exception as e:
             print(f'Spotify disabled ({e})')
-    lookup = genre_lookup.GenreLookup(spotify=spotify, use_spotify=spotify is not None)
+    qobuz = None
+    if not args.no_qobuz:
+        qcfg = (settings.get('modules') or {}).get('qobuz') or {}
+        qobuz = genre_lookup.QobuzGenres(app_id=qcfg.get('app_id') or None)
+    lookup = genre_lookup.GenreLookup(spotify=spotify, use_spotify=spotify is not None, qobuz=qobuz)
 
     # progress db (resume)
     tag = hashlib.sha1(os.path.abspath(root).lower().encode('utf-8')).hexdigest()[:10]
@@ -124,7 +130,8 @@ def main():
     else:
         rows = [(p, i) for p, i in every if p not in done]
     print(f'{len(rows)} FLAC file(s) to check ({len(done)} already handled in earlier runs). '
-          f'{"DRY RUN - nothing is written. " if args.dry else ""}Spotify: {"on" if spotify else "off"}')
+          f'{"DRY RUN - nothing is written. " if args.dry else ""}'
+          f'Sources: Deezer{", Qobuz" if qobuz else ""}{", Spotify" if spotify else ""}')
 
     lock = threading.Lock()
     stats = {'checked': 0, 'had': 0, 'filled': 0, 'missing': 0, 'errors': 0, 'lookups': 0}
