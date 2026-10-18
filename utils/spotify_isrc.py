@@ -49,7 +49,9 @@ _API = 'https://api.spotify.com/v1'
 _TOKEN_URL = 'https://accounts.spotify.com/api/token'
 _TOKEN_MARGIN = 60          # renew this many seconds before expires_in
 _BUCKETS = {'tracks': 'track lookups (GET /tracks/{id})',
-            'playlists': 'playlist reads (GET /playlists/{id}/items)'}
+            'playlists': 'playlist reads (GET /playlists/{id}/items)',
+            'search': 'ISRC searches (GET /search)',
+            'artists': 'artist reads (GET /artists/{id})'}
 
 
 def _fmt_wait(seconds):
@@ -160,6 +162,33 @@ class SpotifyIsrcLookup:
             url = page.get('next')
         self.print(f'  spotify: {got} ISRC(s) read from the playlist in {pages} call(s) (data: Spotify Web API)')
         return got
+
+    def artist_genres_by_isrc(self, isrc):
+        """Genres Spotify lists for the first artist of the track with this ISRC.
+
+        Spotify only exposes genres per ARTIST (not per track/album), so this is a
+        coarse fallback. Returns a list (possibly empty when Spotify has none),
+        or None when it could not be asked (bucket stopped, error)."""
+        isrc = str(isrc or '').strip().upper()
+        if not isrc or self.stopped_by['search'] or self.stopped_by['artists']:
+            return None
+        ok, data = self._call('search', lambda tok: self._get(
+            f'{_API}/search?q=isrc:{isrc}&type=track&limit=1', tok))
+        if not ok:
+            return None
+        items = ((data or {}).get('tracks') or {}).get('items') or []
+        artists = (items[0].get('artists') or []) if items else []
+        aid = (artists[0] or {}).get('id') if artists else None
+        if not aid:
+            return []
+        cache = self.__dict__.setdefault('_artist_genres', {})
+        if aid in cache:
+            return cache[aid]
+        ok, art = self._call('artists', lambda tok: self._get(f'{_API}/artists/{aid}', tok))
+        if not ok:
+            return None
+        cache[aid] = [str(g) for g in ((art or {}).get('genres') or []) if g]
+        return cache[aid]
 
     def summary(self):
         s = self.stats

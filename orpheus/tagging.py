@@ -112,6 +112,13 @@ def _ogg_tags_appear_written(file_path: str) -> bool:
 
 
 def tag_file(file_path: str, image_path: str, track_info: TrackInfo, credits_list: list, embedded_lyrics: str, container: ContainerEnum, metadata_separator: str = ', ', split_metadata: bool = False, enable_zfill: bool = False, _repair_retry: bool = False, service_name: str = ''):
+    # No genre from the service (Tidal never gives one): fill it from Deezer/Spotify by ISRC.
+    try:
+        from utils.genre_lookup import fill_genres
+        fill_genres(track_info)
+    except Exception:
+        pass
+
     # Keep featured artists in ARTIST, but avoid duplicating them in TITLE.
     artist_names = []
     for artist in (track_info.artists if isinstance(track_info.artists, list) else [track_info.artists]):
