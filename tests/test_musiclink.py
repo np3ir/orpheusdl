@@ -79,12 +79,13 @@ def test_errors(tmp_path):
         client(tmp_path / 'd', resp(500), resp(500), resp(500)).resolve('a')
 
 
-def test_api_key_from_env_or_settings(monkeypatch):
+def test_api_key_from_env_or_settings(monkeypatch, tmp_path):
+    nofile = str(tmp_path / 'no-key-file.txt')      # never read the user's real config/musiclink_key.txt
     monkeypatch.delenv('MUSICLINK_API_KEY', raising=False)
-    assert ml.api_key({'modules': {'musiclink': {'api_key': ' abc '}}}) == 'abc'
-    assert ml.api_key({}) == ''
+    assert ml.api_key({'modules': {'musiclink': {'api_key': ' abc '}}}, key_file=nofile) == 'abc'
+    assert ml.api_key({}, key_file=nofile) == ''
     monkeypatch.setenv('MUSICLINK_API_KEY', 'envkey')
-    assert ml.api_key({}) == 'envkey'
+    assert ml.api_key({}, key_file=nofile) == 'envkey'
 
 
 def test_api_key_from_file(monkeypatch, tmp_path):
