@@ -123,3 +123,10 @@ def test_spotify_source_is_off_by_default(monkeypatch):
     lk = gl.shared()
     assert lk is not None and lk._spotify is None
     monkeypatch.setattr(gl, '_shared', None)
+
+
+def test_deezer_album_level_names_are_mapped():
+    for raw, want in [('Techno/House', 'Electronic'), ('Film Scores', 'Film Soundtracks'), ('Indie Pop', 'Alternative & Indie'),
+                      ('Dancehall/Ragga', 'Dancehall'), ('Contemporary R&B', 'R&B'), ('Reggaeton', 'Reggaeton'),
+                      ('Salsa', 'Salsa'), ('International Pop', 'International Pop')]:
+        assert gl.normalize_deezer(raw) == want
