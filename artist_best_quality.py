@@ -1427,6 +1427,24 @@ def outcomes_from_output(text):
     return downloaded, present
 
 
+_SUSPECT_RE = re.compile(r'Download check: SUSPECT - (.+)')
+
+
+def suspects_from_output(text):
+    """{track_id: reason} for tracks orpheus flagged with 'Download check: SUSPECT'
+    (empty/truncated/unreadable file, preview-length or other-version duration)."""
+    out, cur = {}, None
+    for line in (text or '').splitlines():
+        m = _TRACK_START_RE.search(line)
+        if m:
+            cur = m.group(1)
+            continue
+        m = _SUSPECT_RE.search(line)
+        if m and cur is not None:
+            out[cur] = m.group(1).strip()
+    return out
+
+
 def run_orpheus(urls, dlq, out_path):
     """Run orpheus.py for these track URLs. Streams orpheus output live AND
     captures it, so the caller can tell which tracks failed to resolve (a 404 /
@@ -1768,6 +1786,7 @@ def main():
         # no library walk and without trusting orpheus' always-zero exit code.
         failed_direct = set()
         new_isrcs = set()  # ISRCs newly downloaded this run (for --verify-hires)
+        suspect_files = {}  # isrc -> reason, from orpheus' post-download check
         for svc in [s for s in prefer if s in by_service]:
             entries = by_service[svc]
             log(f'\n=== Downloading {len(entries)} track(s) from {svc} @ {dlq} ===')
@@ -1776,11 +1795,14 @@ def main():
                 _rc, out = run_orpheus([u for _i, _t, u in chunk], dlq, out_path)
                 dl, pres = outcomes_from_output(out)
                 ok = dl | pres
+                susp = suspects_from_output(out)
                 for isrc, tid, _u in chunk:
                     if tid not in ok:
                         failed_direct.add(isrc)
                     elif tid in dl:
                         new_isrcs.add(isrc)
+                        if tid in susp:
+                            suspect_files[isrc] = susp[tid]
 
         # ---- cross-service fallback: retry each failed ISRC on its next-best
         # service, in preference order, until one has it (downloaded or present). ----
@@ -1821,6 +1843,9 @@ def main():
                     if tid in dl:
                         recovered.add(isrc)
                         new_isrcs.add(isrc)
+                        why = suspects_from_output(out).get(tid)
+                        if why:
+                            suspect_files[isrc] = why
                         break
                     if tid in pres:
                         present_elsewhere.add(isrc)
@@ -1866,7 +1891,17 @@ def main():
             pend.append({'date': stamp, 'source': args.url, 'artist': artist_name,
                          'title': title or _TITLES.get(isrc, ''), 'isrc': isrc,
                          'reason': 'pre-release', 'tried': svc, 'available_from': avail})
-        append_pendientes(pend + fake_rows)
+        sus_rows = []
+        if suspect_files:
+            log(f'\n⚠️ {len(suspect_files)} downloaded file(s) look wrong (kept, not deleted) -> '
+                f'listed in abq_pendientes.csv:')
+            for isrc, why in suspect_files.items():
+                log(f'    {isrc}: {why}')
+                sus_rows.append({'date': stamp, 'source': args.url, 'artist': artist_name,
+                                 'title': _TITLES.get(isrc, ''), 'isrc': isrc,
+                                 'reason': f'download-check: {why}',
+                                 'tried': '/'.join(order_by_isrc.get(isrc) or []), 'available_from': ''})
+        append_pendientes(pend + fake_rows + sus_rows)
 
         log('\nDone.')
     finally:

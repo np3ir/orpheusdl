@@ -5759,6 +5759,15 @@ class Downloader:
                 if details_indent_adjustment != 0:
                     self.set_indent_number(indent_level)
 
+                # Report-only sanity check of the file we just wrote (never deletes).
+                try:
+                    from utils.download_check import download_problem
+                    _problem = download_problem(final_location, getattr(track_info, 'duration', None))
+                    if _problem:
+                        d_print(f'Download check: SUSPECT - {_problem}')
+                except Exception:
+                    pass
+
                 symbols = self._get_status_symbols()
                 d_print(f'=== {symbols["success"]} Track completed ===', drop_level=header_drop_level)
                 self.track_download_count += 1
