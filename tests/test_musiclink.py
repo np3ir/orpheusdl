@@ -85,3 +85,15 @@ def test_api_key_from_env_or_settings(monkeypatch):
     assert ml.api_key({}) == ''
     monkeypatch.setenv('MUSICLINK_API_KEY', 'envkey')
     assert ml.api_key({}) == 'envkey'
+
+
+def test_api_key_from_file(monkeypatch, tmp_path):
+    monkeypatch.delenv('MUSICLINK_API_KEY', raising=False)
+    f = tmp_path / 'k.txt'
+    f.write_text('  filekey  
+ignored second line
+', encoding='utf-8')
+    assert ml.api_key({}, key_file=str(f)) == 'filekey'
+    assert ml.api_key({}, key_file=str(tmp_path / 'missing.txt')) == ''
+    monkeypatch.setenv('MUSICLINK_API_KEY', 'envwins')
+    assert ml.api_key({}, key_file=str(f)) == 'envwins'

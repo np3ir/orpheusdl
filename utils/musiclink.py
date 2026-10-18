@@ -7,7 +7,8 @@ MusicLink returns the recording's ISRC and its links on other platforms, so abq 
 continue the normal way (by ISRC) instead of guessing from titles.
 
 Key: free account at musiclink.one (300 requests / month, 10 / min, personal use).
-Put it in config/settings.json > modules > musiclink > api_key, or in the
+Put it, alone on one line, in the file config/musiclink_key.txt (orpheus rewrites
+settings.json and may drop unknown module entries, so it does not live there), or in the
 MUSICLINK_API_KEY environment variable. Never printed or logged.
 
 Results are cached on disk (config/musiclink_cache.json) so a link is only ever
@@ -39,8 +40,18 @@ def is_foreign(url):
     return bool(host) and not any(h in host for h in NATIVE_HOSTS)
 
 
-def api_key(settings=None):
+KEY_FILE = os.path.join(SCRIPT_DIR, 'config', 'musiclink_key.txt')
+
+
+def api_key(settings=None, key_file=KEY_FILE):
+    """Key from MUSICLINK_API_KEY, else config/musiclink_key.txt, else legacy settings.json entry."""
     key = os.environ.get('MUSICLINK_API_KEY', '').strip()
+    if not key:
+        try:
+            with open(key_file, encoding='utf-8-sig') as f:
+                key = f.readline().strip()
+        except OSError:
+            key = ''
     if not key and settings:
         key = str(((settings.get('modules') or {}).get('musiclink') or {}).get('api_key') or '').strip()
     return key

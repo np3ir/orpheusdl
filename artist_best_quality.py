@@ -1672,8 +1672,8 @@ def main():
                 raise SystemExit(
                     'This link is not on Tidal / Deezer / Qobuz. To read links from other platforms (Apple Music, '
                     'YouTube Music, ...) abq translates them with MusicLink: create a free key at '
-                    'https://musiclink.one and put it in config/settings.json > modules > musiclink > api_key '
-                    '(or the MUSICLINK_API_KEY environment variable).')
+                    'https://musiclink.one and save it, alone on one line, in config/musiclink_key.txt '
+                    '(or in the MUSICLINK_API_KEY environment variable).')
             log('  (no MusicLink key set -> using the Spotify API)')
         elif res:
             who = f'{res.get("artist") or "?"} - {res.get("title") or "?"}'
