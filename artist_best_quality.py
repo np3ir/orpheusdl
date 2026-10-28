@@ -2010,6 +2010,7 @@ def main():
                 st = stage_box['stage'].finish()
                 log(f'  [stage] delivered {st["moved"]} file(s)'
                     f'{", " + str(st["reused"]) + " already identical in the library" if st["reused"] else ""}'
+                    f'{", " + str(st["skipped"]) + " dropped (recording already in the library)" if st["skipped"] else ""}'
                     f'{", " + str(len(st["failed"])) + " kept in staging for retry" if st["failed"] else ""}')
             except Exception as e:
                 log(f'  [stage] final delivery failed ({e}); files stay in staging and are retried next run')

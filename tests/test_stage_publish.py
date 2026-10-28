@@ -161,3 +161,52 @@ def test_sweep_stale_temp_keeps_live_and_staging(tmp_path):
     removed = sweep_stale_temp(str(root), alive=lambda pid: pid == '222')
     left = sorted(p.name for p in root.iterdir())
     assert removed == 1 and left == ['222', 'loose.txt', 'notapid', 'staging']
+
+
+class FakeIndex:
+    """Stands in for the library ISRC index: remembers delivered recordings, serialises per ISRC."""
+    def __init__(self):
+        self.have = {}          # isrc -> evidence
+        self.claims = []
+        self.added = []
+
+    def candidates(self, isrc):
+        return [self.have[isrc]] if isrc in self.have else []
+
+    def claim(self, isrc, timeout=3600):
+        import contextlib
+        self.claims.append(isrc)
+        return contextlib.nullcontext()
+
+    def add(self, isrc, path):
+        self.added.append((isrc, path))
+        from types import SimpleNamespace
+        self.have[isrc] = SimpleNamespace(isrc=isrc, channels=2, duration=200.0)
+        return True
+
+
+def test_two_runs_delivering_the_same_recording_leave_one_copy(tmp_path):
+    from types import SimpleNamespace
+    ev = lambda p: SimpleNamespace(isrc='ISRC00000001', channels=2, duration=200.0)   # noqa: E731
+    lib, index = str(tmp_path / 'lib'), FakeIndex()
+    a, b = str(tmp_path / 'stageA'), str(tmp_path / 'stageB')
+    write(os.path.join(a, 'A', 'Artist', '(2020) Alb', '01-01. T.flac'), b'download-from-run-A')
+    write(os.path.join(b, 'A', 'Artist', '(2020) Single', '01-01. T.flac'), b'download-from-run-B')
+    sa = sp.publish_dir(a, lib, index, log=lambda *x: None, evidence_of=ev)
+    sb = sp.publish_dir(b, lib, index, log=lambda *x: None, evidence_of=ev)
+    assert sa['moved'] == 1 and sb['moved'] == 0 and sb['skipped'] == 1
+    delivered = [os.path.join(d, n) for d, _, ns in os.walk(lib) for n in ns]
+    assert len(delivered) == 1 and ' (2)' not in delivered[0]
+    assert not os.path.exists(os.path.join(b, 'A', 'Artist', '(2020) Single', '01-01. T.flac'))   # staged copy dropped
+    assert index.claims == ['ISRC00000001', 'ISRC00000001']                                       # delivered under the ISRC claim
+
+
+def test_a_different_duration_is_not_treated_as_the_same_recording(tmp_path):
+    from types import SimpleNamespace
+    lib, index = str(tmp_path / 'lib'), FakeIndex()
+    index.have['ISRC00000002'] = SimpleNamespace(isrc='ISRC00000002', channels=2, duration=100.0)
+    s = str(tmp_path / 'stage')
+    write(os.path.join(s, 'X', 'x.flac'), b'long version')
+    ev = lambda p: SimpleNamespace(isrc='ISRC00000002', channels=2, duration=250.0)   # noqa: E731
+    st = sp.publish_dir(s, lib, index, log=lambda *x: None, evidence_of=ev)
+    assert st['moved'] == 1 and st['skipped'] == 0

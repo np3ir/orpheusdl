@@ -142,22 +142,57 @@ def copy_verified(src, dst):
         raise
 
 
-def publish_dir(src_root, dst_root, index=None, log=print, copy=None):
+def _evidence(path):
+    try:
+        from orpheus.audio_evidence import inspect_audio
+        return inspect_audio(path)
+    except Exception:
+        return None
+
+
+def _library_has(index, ev):
+    """True when the library already holds this same recording (same ISRC, channels, duration +-2 s)."""
+    try:
+        from orpheus.audio_evidence import compatible
+        return any(compatible(c, ev) for c in index.candidates(ev.isrc))
+    except Exception:
+        return False
+
+
+def publish_dir(src_root, dst_root, index=None, log=print, copy=None, evidence_of=None):
     """Move every finished file under src_root into dst_root (same relative paths).
-    Returns {'moved','reused','failed':[(path, why)]}. Never overwrites."""
+
+    Returns {'moved','reused','skipped','failed':[(path, why)]}. Never overwrites.
+    With an ISRC index, each audio file is delivered under that ISRC's claim: when another run
+    (or an earlier download) already put the same recording in the library, the staged copy is
+    dropped instead of creating a numbered duplicate."""
+    import contextlib
     copy = copy or copy_verified          # looked up per call, so it can be replaced
-    stats = {'moved': 0, 'reused': 0, 'failed': []}
+    evidence_of = evidence_of or _evidence
+    stats = {'moved': 0, 'reused': 0, 'skipped': 0, 'failed': []}
     for src in list(_iter_files(src_root)):
         rel = os.path.relpath(src, src_root)
         dst = os.path.join(dst_root, rel)
+        ev = evidence_of(src) if (index is not None and os.path.splitext(src)[1].lower() in AUDIO_EXT) else None
         try:
-            if os.path.exists(dst):
-                if os.path.getsize(dst) == os.path.getsize(src) and _sha256(dst) == _sha256(src):
-                    os.remove(src)                         # identical: reuse what is already there
-                    stats['reused'] += 1
+            with (index.claim(ev.isrc) if ev else contextlib.nullcontext()):
+                if ev and _library_has(index, ev):
+                    os.remove(src)
+                    stats['skipped'] += 1
+                    log(f'  [stage] {rel}: the library already has this recording; staged copy dropped')
                     continue
-                dst = _numbered(dst)                       # different content, same name
-            final = copy(src, dst)
+                if os.path.exists(dst):
+                    if os.path.getsize(dst) == os.path.getsize(src) and _sha256(dst) == _sha256(src):
+                        os.remove(src)                     # identical: reuse what is already there
+                        stats['reused'] += 1
+                        continue
+                    dst = _numbered(dst)                   # different content, same name
+                final = copy(src, dst)
+                if ev:
+                    try:
+                        index.add(ev.isrc, final)
+                    except Exception:
+                        pass
         except Exception as e:
             stats['failed'].append((src, str(e)))
             log(f'  [stage] could not deliver {rel}: {e} (kept in staging)')
@@ -167,14 +202,6 @@ def publish_dir(src_root, dst_root, index=None, log=print, copy=None):
         except OSError:
             pass
         stats['moved'] += 1
-        if index is not None and os.path.splitext(final)[1].lower() in AUDIO_EXT:
-            try:
-                from orpheus.isrc_library_index import read_isrc
-                isrc = read_isrc(final, dst_root)
-                if isrc:
-                    index.add(isrc, final)
-            except Exception:
-                pass
     _prune_empty(src_root)
     return stats
 
@@ -207,7 +234,7 @@ class Stage:
         os.makedirs(self.run_dir, exist_ok=True)
         with open(os.path.join(self.run_dir, 'run.pid'), 'w') as f:
             f.write(str(os.getpid()))
-        self.stats = {'moved': 0, 'reused': 0, 'failed': []}
+        self.stats = {'moved': 0, 'reused': 0, 'skipped': 0, 'failed': []}
         self._open_index = open_index or self._default_index
         self.staging_dir = staging_dir
 
@@ -230,6 +257,7 @@ class Stage:
                 idx.close()
         self.stats['moved'] += s['moved']
         self.stats['reused'] += s['reused']
+        self.stats['skipped'] += s.get('skipped', 0)
         self.stats['failed'] += s['failed']
         return s
 
@@ -304,7 +332,7 @@ def recover_leftovers(staging_dir, final_root, config_dir, log=print, open_index
         finally:
             if idx is not None:
                 idx.close()
-        recovered += s['moved'] + s['reused']
+        recovered += s['moved'] + s['reused'] + s.get('skipped', 0)
         if not list(_iter_files(run)):
             shutil.rmtree(run, ignore_errors=True)
             Stage._drop_run_index(run, config_dir)
