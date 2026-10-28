@@ -19,6 +19,7 @@ Safety rules (own implementation, same ideas as any careful file delivery):
 """
 import hashlib
 import os
+import re
 import shutil
 import sys
 import time
@@ -44,6 +45,25 @@ def _remove_quietly(path, tries=3):
             if i + 1 < tries:
                 time.sleep(1)
     return False
+
+
+_PART_RE = re.compile(r'^\.orpheus-pub-(\d+)-\d+\.part$')
+
+
+def clean_dead_parts(folder):
+    """Remove delivery temp files left in `folder` by processes that no longer exist
+    (a run killed mid-copy). Files of live processes are never touched."""
+    removed = 0
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return 0
+    for name in names:
+        m = _PART_RE.match(name)
+        if m and not pid_alive(m.group(1)):
+            if _remove_quietly(os.path.join(folder, name), tries=1):
+                removed += 1
+    return removed
 
 
 def sweep_orphan_parts():
@@ -195,9 +215,14 @@ def publish_dir(src_root, dst_root, index=None, log=print, copy=None, evidence_o
     copy = copy or copy_verified          # looked up per call, so it can be replaced
     evidence_of = evidence_of or _evidence
     stats = {'moved': 0, 'reused': 0, 'skipped': 0, 'failed': []}
+    cleaned = set()
     for src in list(_iter_files(src_root)):
         rel = os.path.relpath(src, src_root)
         dst = os.path.join(dst_root, rel)
+        folder = os.path.dirname(dst)
+        if folder not in cleaned:
+            cleaned.add(folder)
+            clean_dead_parts(folder)          # leftovers of runs that died mid-copy
         ev = evidence_of(src) if (index is not None and os.path.splitext(src)[1].lower() in AUDIO_EXT) else None
         outcome = None
         failure = None

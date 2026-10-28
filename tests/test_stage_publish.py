@@ -290,3 +290,15 @@ def test_delivery_lock_makes_a_second_delivery_wait(tmp_path):
         assert not done.is_set() and not os.path.exists(os.path.join(lib, 'B', 'b.flac'))   # B waits
     th.join(timeout=10)
     assert done.is_set() and os.path.exists(os.path.join(lib, 'B', 'b.flac'))               # then delivers
+
+
+def test_delivery_cleans_temp_parts_of_dead_runs_only(tmp_path):
+    lib, s = str(tmp_path / 'lib'), str(tmp_path / 'stage')
+    folder = os.path.join(lib, 'A', 'Artist')
+    dead = write(os.path.join(folder, '.orpheus-pub-999999999-123.part'), b'junk')
+    live = write(os.path.join(folder, f'.orpheus-pub-{os.getpid()}-456.part'), b'in progress')
+    other = write(os.path.join(folder, '.orpheus-abc.part.flac'), b'orpheus own temp')
+    write(os.path.join(s, 'A', 'Artist', 'x.flac'))
+    sp.publish_dir(s, lib, log=lambda *a: None)
+    assert not os.path.exists(dead) and os.path.exists(live) and os.path.exists(other)
+    assert os.path.exists(os.path.join(folder, 'x.flac'))
