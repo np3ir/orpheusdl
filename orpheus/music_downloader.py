@@ -495,7 +495,9 @@ class Downloader:
         """Short-lived connection per guarded track; never scan the NAS here."""
         if not self._isrc_library_dedup_enabled():
             return None
-        root = self.path
+        # abq stages downloads in a local folder and delivers them to the library afterwards:
+        # the duplicate check must still look at the real library, not at the staging folder.
+        root = os.environ.get('ORPHEUS_DEDUP_ROOT') or self.path
         if not root or not os.path.isdir(root):
             return None
         idx = None
@@ -3538,6 +3540,16 @@ class Downloader:
         elif not track_info.tags.total_tracks and number_of_tracks:
             track_info.tags.total_tracks = number_of_tracks
 
+    def _projected_final_length(self, path: str) -> int:
+        """Length the path will have in the LIBRARY. When abq stages downloads in a local folder
+        (ORPHEUS_DEDUP_ROOT = the real library), file names must be sized for the library path,
+        not for the longer staging path, or titles would be shortened for no reason."""
+        final_root = os.environ.get('ORPHEUS_DEDUP_ROOT')
+        base = os.path.abspath(self.path) if getattr(self, 'path', None) else ''
+        if final_root and base and os.path.normcase(path).startswith(os.path.normcase(base)):
+            return len(final_root.rstrip(chr(92) + '/')) + len(path) - len(base.rstrip(chr(92) + '/'))
+        return len(path)
+
     def _create_track_location(self, album_location: str, track_info: TrackInfo, override_codec=None, extra_kwargs=None) -> str:
         """Create the full file path for a track. Use override_codec (e.g. from download_info.different_codec) for the file extension when the downloaded file is in a different container."""
         # Clean up track tags and add special formats
@@ -3682,7 +3694,8 @@ class Downloader:
                     if segment
                 )
                 filename_component_ok = len(candidate_name.encode('utf-8')) <= 150
-                projected_total_ok = len(os.path.abspath(os.path.join(album_location, candidate_rel + '.flac'))) <= 220
+                projected_total_ok = self._projected_final_length(
+                    os.path.abspath(os.path.join(album_location, candidate_rel + '.flac'))) <= 220
 
                 if dir_segments_ok and filename_component_ok and projected_total_ok:
                     break

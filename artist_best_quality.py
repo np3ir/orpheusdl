@@ -1445,7 +1445,7 @@ def suspects_from_output(text):
     return out
 
 
-def run_orpheus(urls, dlq, out_path):
+def run_orpheus(urls, dlq, out_path, dedup_root=None):
     """Run orpheus.py for these track URLs. Streams orpheus output live AND
     captures it, so the caller can tell which tracks failed to resolve (a 404 /
     dead id writes no error.txt). Returns (returncode, captured_stdout).
@@ -1457,6 +1457,8 @@ def run_orpheus(urls, dlq, out_path):
     # (accents, full-width chars) match our decode and don't turn into U+FFFD.
     env = dict(os.environ)
     env['PYTHONIOENCODING'] = 'utf-8'
+    if dedup_root:      # staging: keep the duplicate check pointed at the real library
+        env['ORPHEUS_DEDUP_ROOT'] = dedup_root
     p = subprocess.Popen(cmd, cwd=SCRIPT_DIR, stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, encoding='utf-8', errors='replace', bufsize=1, env=env)
@@ -1618,6 +1620,13 @@ def main():
     ap.add_argument('--all-albums', dest='own_albums_only', action='store_false',
                     help='(artist links) consider every album in the discography (overrides '
                          'own_albums_only from settings).')
+    ap.add_argument('--no-stage', action='store_true',
+                    help='Download straight into the destination. By default, when the destination is a '
+                         'network drive, abq downloads and tags in a local folder and delivers the finished '
+                         'files afterwards (verified, never overwriting).')
+    ap.add_argument('--stage-dir', default=None, metavar='PATH',
+                    help='Force staging in this local folder (default: general.staging_dir in settings, '
+                         'else temp/staging next to abq).')
     ap.add_argument('--musiclink', action='store_true',
                     help='Also translate Spotify TRACK/ALBUM links with MusicLink (needs its API key) instead of '
                          'the Spotify API. Links from platforms abq cannot read (Apple Music, YouTube Music, '
@@ -1659,6 +1668,29 @@ def main():
         # ROOT: 'Z:' alone means "current directory on Z:" on Windows.
         from utils.out_path import normalize_out_path
         out_path = normalize_out_path(out_path)
+
+    from utils import stage_publish as _sp
+    stage_dir = _sp.resolve_stage_dir(settings, out_path, args.no_stage, args.stage_dir, SCRIPT_DIR)
+    stage_box = {'stage': None}
+
+    def get_stage():
+        if stage_dir and stage_box['stage'] is None:
+            try:
+                _sp.recover_leftovers(stage_dir, out_path, CONFIG_DIR, log)
+                stage_box['stage'] = _sp.Stage(stage_dir, out_path, CONFIG_DIR, log)
+                log(f'  [stage] downloads are prepared in {stage_box["stage"].run_dir} and delivered to {out_path} '
+                    f'when each batch finishes (verified, never overwriting)')
+            except Exception as e:
+                log(f'  [stage] could not start staging ({e}); downloading straight into {out_path}')
+        return stage_box['stage']
+
+    def run_batch(urls):
+        stg = get_stage()
+        _rc_, out_ = run_orpheus(urls, dlq, stg.run_dir if stg else out_path,
+                                 dedup_root=out_path if stg else None)
+        if stg:
+            stg.publish()
+        return _rc_, out_
 
     link = args.url
     forced_isrcs = None
@@ -1860,7 +1892,7 @@ def main():
             log(f'\n=== Downloading {len(entries)} track(s) from {svc} @ {dlq} ===')
             for i in range(0, len(entries), 40):
                 chunk = entries[i:i + 40]
-                _rc, out = run_orpheus([u for _i, _t, u in chunk], dlq, out_path)
+                _rc, out = run_batch([u for _i, _t, u in chunk])
                 dl, pres = outcomes_from_output(out)
                 ok = dl | pres
                 susp = suspects_from_output(out)
@@ -1906,7 +1938,7 @@ def main():
                 for svc in alts:
                     tid = str(union[isrc][svc][0])
                     log(f'  retry {isrc} via {svc}')
-                    _rc, out = run_orpheus([track_url(svc, tid)], dlq, out_path)
+                    _rc, out = run_batch([track_url(svc, tid)])
                     dl, pres = outcomes_from_output(out)
                     if tid in dl:
                         recovered.add(isrc)
@@ -1973,6 +2005,14 @@ def main():
 
         log('\nDone.')
     finally:
+        if stage_box['stage'] is not None:
+            try:
+                st = stage_box['stage'].finish()
+                log(f'  [stage] delivered {st["moved"]} file(s)'
+                    f'{", " + str(st["reused"]) + " already identical in the library" if st["reused"] else ""}'
+                    f'{", " + str(len(st["failed"])) + " kept in staging for retry" if st["failed"] else ""}')
+            except Exception as e:
+                log(f'  [stage] final delivery failed ({e}); files stay in staging and are retried next run')
         core.close()
 
 

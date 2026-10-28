@@ -223,6 +223,8 @@ El archivo tiene dos partes grandes: **`global`** (cómo se comporta el programa
 | `reverify_existing_files` | Volver a comprobar los archivos existentes cada vez (más lento; normalmente `false`). |
 | `isrc_library_dedup` | No bajar una canción que ya tienes, aunque esté en otra carpeta (por ISRC). |
 | `isrc_library_upgrade` | Reemplazar un archivo si aparece una versión de mayor calidad. |
+| `stage_network_downloads` | Si `download_path` es una unidad de red (como un NAS), `abq` **descarga y etiqueta primero en una carpeta local** y entrega los archivos terminados a la red con verificación (tamaño y SHA-256), sin sobrescribir nunca. Así el NAS recibe una escritura ordenada por archivo y un proceso cortado no deja archivos a medio etiquetar en tu biblioteca. Es automático con el mismo comando `abq <enlace>` (por defecto `true`; si el destino es un disco local no hace nada). |
+| `staging_dir` | Carpeta local de preparación. Vacío = `temp/staging` junto a `abq`. Cada ejecución usa una subcarpeta corta; lo que no se pudo entregar se conserva y se reintenta solo en la siguiente ejecución. |
 | `genre_fallback` | Si el servicio no da género (Tidal nunca lo da), buscarlo en Deezer por ISRC y escribirlo en el archivo (por defecto `true`). Las descargas hi-res siguen igual; solo se rellena un género vacío. |
 | `genre_qobuz` | Si Deezer no lo tiene, buscar el género en Qobuz por ISRC (búsqueda de catálogo pública, sin iniciar sesión; por defecto `true`). Usa los mismos nombres que ya tiene tu biblioteca. |
 | `genre_spotify` | Si Deezer tampoco lo tiene, probar los géneros del artista en Spotify (por defecto `false`). Los términos de Spotify limitan guardar su contenido; los resultados no se guardan en la caché en disco, pero sí quedarían en las etiquetas del archivo. Actívalo bajo tu responsabilidad. |
@@ -397,3 +399,5 @@ Necesita tu clave gratuita de https://musiclink.one (300 consultas al mes, 10 po
 MusicLink devuelve el **ISRC** de la pista y sus enlaces en Qobuz/Tidal/Deezer, y `abq` sigue desde ahí como siempre. Funciona con pistas, álbumes y artistas (no con playlists). Cada enlace se consulta una sola vez: el resultado se guarda en `config/musiclink_cache.json`. Con `--musiclink` también se usa para enlaces de Spotify (pista/álbum), y lo hace solo si la API de Spotify está bloqueada.
 
 Tus cuentas son privadas y este archivo **no** se sube a GitHub.
+
+**Preparación local (opcional, para casos puntuales):** `abq --no-stage ...` descarga directamente en el destino, y `abq --stage-dir RUTA ...` fuerza la preparación en otra carpeta, aunque el destino sea local.

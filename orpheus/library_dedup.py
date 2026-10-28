@@ -103,6 +103,11 @@ def decision(idx, info, location, upgrade=False):
 def register_completed(idx, info, location):
     if idx is None:
         return
+    staged_root = os.environ.get('ORPHEUS_DEDUP_ROOT')
+    if staged_root:
+        from orpheus.audio_evidence import in_library
+        if not in_library(os.path.abspath(location), staged_root):
+            return   # file sits in abq's staging folder; it is indexed when it is delivered
     try:
         if not idx.add(track_isrc(info), location):
             logging.warning('Completed audio was not indexed: missing/mismatched ISRC or unreadable metadata: %s', location)

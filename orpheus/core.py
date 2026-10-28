@@ -126,6 +126,11 @@ class Orpheus:
                 "genre_fallback": True,
                 "genre_qobuz": True,
                 "genre_spotify": False,
+                # abq: download and tag in a local folder, then deliver to the library with
+                # verification. Automatic when download_path is a network drive/UNC path.
+                # (Keep these here: the core drops settings.json keys that are not in this template.)
+                "stage_network_downloads": True,
+                "staging_dir": "",
             },
             "artist_downloading":{
                 "return_credited_albums": True,
