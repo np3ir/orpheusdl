@@ -149,3 +149,15 @@ def test_name_budget_uses_the_library_path_not_the_staging_path(monkeypatch):
     monkeypatch.setenv('ORPHEUS_DEDUP_ROOT', lib)
     assert Downloader._projected_final_length(me, stage + rel) == len('Z:' + rel)       # sized for Z:, not for staging
     assert Downloader._projected_final_length(me, 'D:' + bs + 'elsewhere.flac') == len('D:' + bs + 'elsewhere.flac')
+
+
+def test_sweep_stale_temp_keeps_live_and_staging(tmp_path):
+    from utils.temp_cleanup import sweep_stale_temp
+    root = tmp_path / 'temp'
+    for name in ('111', '222', 'staging', 'notapid'):
+        (root / name).mkdir(parents=True)
+    (root / '111' / 'cover-file').write_bytes(b'x')       # dead process, has a leftover file
+    (root / 'loose.txt').write_text('keep')
+    removed = sweep_stale_temp(str(root), alive=lambda pid: pid == '222')
+    left = sorted(p.name for p in root.iterdir())
+    assert removed == 1 and left == ['222', 'loose.txt', 'notapid', 'staging']

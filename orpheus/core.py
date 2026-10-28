@@ -612,8 +612,15 @@ def orpheus_core_download(orpheus_session: Orpheus, media_to_download, third_par
     # Per-process temp dir so multiple OrpheusDL windows running at once don't share
     # or delete each other's temp files (was a fixed 'temp' -> WinError 32 on cleanup).
     _run_temp = os.path.join('temp', str(os.getpid()))
+    try:   # folders left by runs that were stopped/killed before they could clean up
+        from utils.temp_cleanup import sweep_stale_temp
+        sweep_stale_temp('temp')
+    except Exception:
+        pass
     os.makedirs(_run_temp, exist_ok=True)
     downloader.temp_dir = os.path.abspath(_run_temp)
+    import atexit
+    atexit.register(shutil.rmtree, _run_temp, ignore_errors=True)   # also when the run ends early
 
     spotify_warning_shown = False
 
