@@ -24,6 +24,33 @@ import sys
 import time
 
 CHUNK = 1024 * 1024
+RETRY_DELAYS = (3, 8, 20, 45)          # seconds; "too many open files" on a busy NAS clears by itself
+_ORPHAN_PARTS = set()                  # our own temp files that could not be removed after a failure
+
+
+def _is_handle_limit(exc):
+    """EMFILE / Windows ERROR_TOO_MANY_OPEN_FILES (4): the NAS or the SMB client ran out of open handles."""
+    return isinstance(exc, OSError) and (getattr(exc, 'errno', None) == 24 or getattr(exc, 'winerror', None) == 4)
+
+
+def _remove_quietly(path, tries=3):
+    for i in range(tries):
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            if i + 1 < tries:
+                time.sleep(1)
+    return False
+
+
+def sweep_orphan_parts():
+    """Try again to remove temp files left by failed copies (this process only)."""
+    for path in list(_ORPHAN_PARTS):
+        if _remove_quietly(path, tries=1):
+            _ORPHAN_PARTS.discard(path)
 TEMP_PREFIX = '.orpheus-'
 PUB_PREFIX = '.orpheus-pub-'
 AUDIO_EXT = {'.flac', '.m4a', '.mp3', '.ogg', '.opus', '.wav', '.aac', '.alac'}
@@ -135,10 +162,8 @@ def copy_verified(src, dst):
         os.replace(tmp, dst)
         return dst
     except BaseException:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+        if not _remove_quietly(tmp):
+            _ORPHAN_PARTS.add(tmp)          # removed later by sweep_orphan_parts()
         raise
 
 
@@ -174,36 +199,61 @@ def publish_dir(src_root, dst_root, index=None, log=print, copy=None, evidence_o
         rel = os.path.relpath(src, src_root)
         dst = os.path.join(dst_root, rel)
         ev = evidence_of(src) if (index is not None and os.path.splitext(src)[1].lower() in AUDIO_EXT) else None
-        try:
-            with (index.claim(ev.isrc) if ev else contextlib.nullcontext()):
-                if ev and _library_has(index, ev):
-                    os.remove(src)
-                    stats['skipped'] += 1
-                    log(f'  [stage] {rel}: the library already has this recording; staged copy dropped')
+        outcome = None
+        failure = None
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            try:
+                with (index.claim(ev.isrc) if ev else contextlib.nullcontext()):
+                    if ev and _library_has(index, ev):
+                        os.remove(src)
+                        outcome = 'skipped'
+                        log(f'  [stage] {rel}: the library already has this recording; staged copy dropped')
+                        break
+                    target = dst
+                    if os.path.exists(target):
+                        if os.path.getsize(target) == os.path.getsize(src) and _sha256(target) == _sha256(src):
+                            os.remove(src)                 # identical: reuse what is already there
+                            outcome = 'reused'
+                            break
+                        target = _numbered(target)         # different content, same name
+                    final = copy(src, target)
+                    if ev:
+                        try:
+                            index.add(ev.isrc, final)
+                        except Exception:
+                            pass
+                    outcome = 'moved'
+                    break
+            except Exception as e:
+                failure = e
+                if _is_handle_limit(e) and attempt < len(RETRY_DELAYS):
+                    wait = RETRY_DELAYS[attempt]
+                    log(f'  [stage] the destination reports too many open files; retrying {rel} in {wait}s')
+                    time.sleep(wait)
                     continue
-                if os.path.exists(dst):
-                    if os.path.getsize(dst) == os.path.getsize(src) and _sha256(dst) == _sha256(src):
-                        os.remove(src)                     # identical: reuse what is already there
-                        stats['reused'] += 1
-                        continue
-                    dst = _numbered(dst)                   # different content, same name
-                final = copy(src, dst)
-                if ev:
-                    try:
-                        index.add(ev.isrc, final)
-                    except Exception:
-                        pass
-        except Exception as e:
-            stats['failed'].append((src, str(e)))
-            log(f'  [stage] could not deliver {rel}: {e} (kept in staging)')
+                break
+        if outcome is None:
+            stats['failed'].append((src, str(failure)))
+            log(f'  [stage] could not deliver {rel}: {failure} (kept in staging)')
+            continue
+        if outcome in ('skipped', 'reused'):
+            stats[outcome] += 1
             continue
         try:
             os.remove(src)
         except OSError:
             pass
         stats['moved'] += 1
+    sweep_orphan_parts()
     _prune_empty(src_root)
     return stats
+
+
+def delivery_lock(staging_dir, final_root):
+    """Cross-process lock: one abq instance delivers to a given library at a time."""
+    from utils.atomic_io import file_lock
+    key = hashlib.sha256(os.path.normcase(os.path.abspath(final_root)).encode('utf-8')).hexdigest()[:16]
+    return file_lock(os.path.join(staging_dir, f'.delivery-{key}'), timeout=3600)
 
 
 def _prune_empty(root):
@@ -246,12 +296,16 @@ class Stage:
         idx.close()
         return None
 
+    def _delivery_lock(self):
+        return delivery_lock(self.staging_dir, self.final_root)
+
     def publish(self):
         """Deliver everything finished so far; safe to call after every orpheus batch."""
         idx = None
         try:
-            idx = self._open_index()
-            s = publish_dir(self.run_dir, self.final_root, idx, self.log)
+            with self._delivery_lock():
+                idx = self._open_index()
+                s = publish_dir(self.run_dir, self.final_root, idx, self.log)
         finally:
             if idx is not None:
                 idx.close()
@@ -328,7 +382,8 @@ def recover_leftovers(staging_dir, final_root, config_dir, log=print, open_index
                     idx = cand
                 else:
                     cand.close()
-            s = publish_dir(run, final_root, idx, log)
+            with delivery_lock(staging_dir, final_root):
+                s = publish_dir(run, final_root, idx, log)
         finally:
             if idx is not None:
                 idx.close()

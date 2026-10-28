@@ -210,3 +210,83 @@ def test_a_different_duration_is_not_treated_as_the_same_recording(tmp_path):
     ev = lambda p: SimpleNamespace(isrc='ISRC00000002', channels=2, duration=250.0)   # noqa: E731
     st = sp.publish_dir(s, lib, index, log=lambda *x: None, evidence_of=ev)
     assert st['moved'] == 1 and st['skipped'] == 0
+
+
+def test_handle_limit_is_retried_then_delivered(tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(sp.time, 'sleep', lambda s: sleeps.append(s))
+    s, d = str(tmp_path / 'stage'), str(tmp_path / 'lib')
+    write(os.path.join(s, 'A', 'x.flac'))
+    calls = {'n': 0}
+    real = sp.copy_verified
+
+    def flaky(src, dst):
+        calls['n'] += 1
+        if calls['n'] <= 2:
+            raise OSError(24, 'Too many open files')
+        return real(src, dst)
+    st = sp.publish_dir(s, d, log=lambda *a: None, copy=flaky)
+    assert st['moved'] == 1 and not st['failed'] and calls['n'] == 3
+    assert sleeps[:2] == [3, 8] and os.path.exists(os.path.join(d, 'A', 'x.flac'))
+
+
+def test_handle_limit_that_never_clears_keeps_the_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(sp.time, 'sleep', lambda s: None)
+    s, d = str(tmp_path / 'stage'), str(tmp_path / 'lib')
+    write(os.path.join(s, 'A', 'x.flac'))
+
+    def always(src, dst):
+        e = OSError('The system cannot open the file')
+        e.winerror = 4
+        raise e
+    st = sp.publish_dir(s, d, log=lambda *a: None, copy=always)
+    assert st['moved'] == 0 and len(st['failed']) == 1 and os.path.exists(os.path.join(s, 'A', 'x.flac'))
+
+
+def test_other_errors_are_not_retried(tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(sp.time, 'sleep', lambda s: sleeps.append(s))
+    s, d = str(tmp_path / 'stage'), str(tmp_path / 'lib')
+    write(os.path.join(s, 'A', 'x.flac'))
+
+    def denied(src, dst):
+        raise PermissionError(13, 'denied')
+    st = sp.publish_dir(s, d, log=lambda *a: None, copy=denied)
+    assert len(st['failed']) == 1 and sleeps == []
+
+
+def test_failed_copy_cleans_its_temp_file_or_remembers_it(tmp_path, monkeypatch):
+    src = write(str(tmp_path / 's' / 'a.flac'))
+    dst = str(tmp_path / 'd' / 'a.flac')
+    monkeypatch.setattr(sp, '_sha256', lambda p: 'bad')
+    with pytest.raises(OSError):
+        sp.copy_verified(src, dst)
+    assert os.listdir(os.path.dirname(dst)) == [] and not sp._ORPHAN_PARTS
+    # if the temp file cannot be removed, it is remembered and removed by the next sweep
+    monkeypatch.setattr(sp, '_remove_quietly', lambda p, tries=3: False)
+    with pytest.raises(OSError):
+        sp.copy_verified(src, dst)
+    left = list(sp._ORPHAN_PARTS)
+    assert len(left) == 1 and os.path.exists(left[0])
+    monkeypatch.undo()
+    sp.sweep_orphan_parts()
+    assert not os.path.exists(left[0]) and not sp._ORPHAN_PARTS
+
+
+def test_delivery_lock_makes_a_second_delivery_wait(tmp_path):
+    import threading
+    import time as _time
+    lib = str(tmp_path / 'lib')
+    os.makedirs(lib)
+    quiet = lambda *x: None      # noqa: E731
+    a = sp.Stage(str(tmp_path / 'staging'), lib, str(tmp_path / 'cfg'), log=quiet, open_index=lambda: None)
+    b = sp.Stage(str(tmp_path / 'staging'), lib, str(tmp_path / 'cfg'), log=quiet, open_index=lambda: None)
+    write(os.path.join(b.run_dir, 'B', 'b.flac'))
+    done = threading.Event()
+    with a._delivery_lock():                       # instance A is delivering
+        th = threading.Thread(target=lambda: (b.publish(), done.set()))
+        th.start()
+        _time.sleep(0.6)
+        assert not done.is_set() and not os.path.exists(os.path.join(lib, 'B', 'b.flac'))   # B waits
+    th.join(timeout=10)
+    assert done.is_set() and os.path.exists(os.path.join(lib, 'B', 'b.flac'))               # then delivers
