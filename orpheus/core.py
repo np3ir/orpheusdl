@@ -10,6 +10,18 @@ from utils.module_settings import merge_module_settings
 import tempfile
 
 
+def _replace_retry(src, dst, attempts=12):
+    """os.replace that survives another instance holding dst open (WinError 5/32 on Windows)."""
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(0.05 * (i + 1) + 0.05 * (os.getpid() % 5))
+
+
 def _atomic_write_text(path, text):
     """Write text to path atomically (temp file in the same dir + os.replace),
     so a concurrent/interrupted write can never leave a truncated/corrupt file."""
@@ -24,7 +36,7 @@ def _atomic_write_text(path, text):
                 os.fsync(f.fileno())
             except OSError:
                 pass
-        os.replace(tmp, path)
+        _replace_retry(tmp, path)
     except BaseException:
         try:
             if os.path.exists(tmp):
@@ -71,7 +83,13 @@ def _save_settings_safe(path, settings):
     is only refreshed with a real config (non-empty, has 'global'), so an empty or
     reset write can never clobber a good backup."""
     text = json.dumps(settings, indent=4, sort_keys=False)
-    _atomic_write_text(path, text)
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            unchanged = f.read() == text
+    except OSError:
+        unchanged = False
+    if not unchanged:
+        _atomic_write_text(path, text)
     try:
         if isinstance(settings, dict) and settings.get('global'):
             _atomic_write_text(path + '.bak', text)

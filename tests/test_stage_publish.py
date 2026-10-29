@@ -302,3 +302,20 @@ def test_delivery_cleans_temp_parts_of_dead_runs_only(tmp_path):
     sp.publish_dir(s, lib, log=lambda *a: None)
     assert not os.path.exists(dead) and os.path.exists(live) and os.path.exists(other)
     assert os.path.exists(os.path.join(folder, 'x.flac'))
+
+
+def test_settings_replace_retries_on_permission_error(monkeypatch, tmp_path):
+    from orpheus import core
+    calls = {'n': 0}
+    real = core.os.replace
+
+    def flaky(a, b):
+        calls['n'] += 1
+        if calls['n'] < 3:
+            raise PermissionError(5, 'Access denied')
+        return real(a, b)
+    monkeypatch.setattr(core.os, 'replace', flaky)
+    monkeypatch.setattr(core.time, 'sleep', lambda s: None)
+    target = tmp_path / 's.json'
+    core._atomic_write_text(str(target), '{"a": 1}')
+    assert target.read_text() == '{"a": 1}' and calls['n'] == 3
