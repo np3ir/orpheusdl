@@ -51,6 +51,18 @@ def file_lock(target, timeout=30.0):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def replace_retry(src, dst, attempts=12):
+    """os.replace that survives another process holding dst open (WinError 5/32 on Windows)."""
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(0.05 * (i + 1) + 0.05 * (os.getpid() % 5))
+
+
 def temporary_sibling(target):
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -75,7 +87,7 @@ def atomic_pickle_write(target, value):
             pickle.dump(value, handle, protocol=pickle.HIGHEST_PROTOCOL)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, target)
+        replace_retry(temporary, target)
     finally:
         remove_temporary(temporary)
 
@@ -104,5 +116,5 @@ def publish_download(temporary, target, skip_if_exists):
     with file_lock(target):
         if skip_if_exists and os.path.isfile(target):
             return False
-        os.replace(temporary, target)
+        replace_retry(temporary, target)
         return True

@@ -319,3 +319,20 @@ def test_settings_replace_retries_on_permission_error(monkeypatch, tmp_path):
     target = tmp_path / 's.json'
     core._atomic_write_text(str(target), '{"a": 1}')
     assert target.read_text() == '{"a": 1}' and calls['n'] == 3
+
+
+def test_session_pickle_replace_retries(monkeypatch, tmp_path):
+    from utils import atomic_io
+    calls = {'n': 0}
+    real = atomic_io.os.replace
+
+    def flaky(a, b):
+        calls['n'] += 1
+        if calls['n'] < 3:
+            raise PermissionError(5, 'Access denied')
+        return real(a, b)
+    monkeypatch.setattr(atomic_io.os, 'replace', flaky)
+    monkeypatch.setattr(atomic_io.time, 'sleep', lambda s: None)
+    target = tmp_path / 'login.bin'
+    atomic_io.atomic_pickle_write(str(target), {'modules': {}})
+    assert atomic_io.read_pickle(str(target)) == {'modules': {}} and calls['n'] == 3
