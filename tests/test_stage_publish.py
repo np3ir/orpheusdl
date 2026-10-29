@@ -336,3 +336,15 @@ def test_session_pickle_replace_retries(monkeypatch, tmp_path):
     target = tmp_path / 'login.bin'
     atomic_io.atomic_pickle_write(str(target), {'modules': {}})
     assert atomic_io.read_pickle(str(target)) == {'modules': {}} and calls['n'] == 3
+
+
+def test_error_txt_is_appended_not_numbered(tmp_path):
+    from utils import stage_publish as sp
+    src, dst = tmp_path / 'src', tmp_path / 'dst'
+    src.mkdir(); dst.mkdir()
+    (dst / 'error.txt').write_bytes(b'old')
+    (src / 'error.txt').write_bytes(b'new')
+    st = sp.publish_dir(str(src), str(dst))
+    assert sorted(os.listdir(dst)) == ['error.txt'] and not st['failed']
+    assert b'old' in (dst / 'error.txt').read_bytes() and b'new' in (dst / 'error.txt').read_bytes()
+    assert not (src / 'error.txt').exists()

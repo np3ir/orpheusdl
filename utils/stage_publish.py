@@ -204,6 +204,21 @@ def _library_has(index, ev):
         return False
 
 
+def _merge_error_log(src, dst, stats, log):
+    """orpheus writes error.txt next to the run's files; append it to the one in the library
+    (what a direct run does) instead of delivering a new 'error (N).txt' per run."""
+    try:
+        with open(src, 'rb') as f:
+            data = f.read()
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, 'ab') as f:
+            f.write(os.linesep.encode() + data)
+        os.remove(src)
+    except OSError as e:
+        stats['failed'].append((src, f'error.txt: {e}'))
+        log(f'  [stage] could not merge {src}: {e}')
+
+
 def publish_dir(src_root, dst_root, index=None, log=print, copy=None, evidence_of=None):
     """Move every finished file under src_root into dst_root (same relative paths).
 
@@ -223,6 +238,9 @@ def publish_dir(src_root, dst_root, index=None, log=print, copy=None, evidence_o
         if folder not in cleaned:
             cleaned.add(folder)
             clean_dead_parts(folder)          # leftovers of runs that died mid-copy
+        if os.path.basename(src).lower() == 'error.txt':
+            _merge_error_log(src, dst, stats, log)    # a report, not content: never numbered copies
+            continue
         ev = evidence_of(src) if (index is not None and os.path.splitext(src)[1].lower() in AUDIO_EXT) else None
         outcome = None
         failure = None
