@@ -49,6 +49,7 @@ The file has two big parts: **`global`** (how the program behaves) and
 | Option | What it does |
 |---|---|
 | `default_quality` | Quality used when you don't pass `-q`: `best`, `hires`/`24`, or `lossless`/`16`. |
+| `disabled_services` | Services never contacted, e.g. `["qobuz"]` after an account suspension. `prefer_order` alone cannot do this: missing services are appended to it. Default `[]`. |
 | `prefer_order` | Which service wins when quality ties (list, e.g. `["qobuz","tidal","deezer"]`). |
 | `dedup_with_library` | Skip songs you already own (by ISRC). |
 | `library_root` | Folder to compare against; empty = your download folder. |
@@ -244,6 +245,7 @@ Para rellenar el género de lo que **ya tienes**: `python genre_backfill.py --di
 | Opción | Qué hace |
 |---|---|
 | `default_quality` | Calidad cuando no pasas `-q`: `best`, `hires`/`24` o `lossless`/`16`. |
+| `disabled_services` | Servicios que no se contactan nunca, p. ej. `["qobuz"]` tras suspender una cuenta. `prefer_order` por sí sola no lo logra: los servicios que faltan se le añaden. Por defecto `[]`. |
 | `prefer_order` | Qué servicio gana cuando hay empate de calidad (lista, p. ej. `["qobuz","tidal","deezer"]`). |
 | `dedup_with_library` | Saltar canciones que ya tienes (por ISRC). |
 | `library_root` | Carpeta con la que comparar; vacío = tu carpeta de descargas. |

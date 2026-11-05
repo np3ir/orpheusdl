@@ -163,6 +163,7 @@ class Orpheus:
             "artist_best_quality": {
                 "default_quality": "best",
                 "prefer_order": ["qobuz", "tidal", "deezer"],
+                "disabled_services": [],
                 "dedup_with_library": True,
                 "library_root": "",
                 "credited_albums": False,

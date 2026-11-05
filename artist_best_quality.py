@@ -161,6 +161,11 @@ def abq_config(settings):
     for s in ALL_SERVICES:
         if s not in order:
             order.append(s)
+    # services switched off on purpose (suspended account...): never contacted at all
+    off = {str(s).strip().lower() for s in (cfg.get('disabled_services') or [])}
+    order = [s for s in order if s not in off]
+    if not order:
+        raise SystemExit('disabled_services leaves no service to use; edit it in settings.json.')
     cfg['prefer_order'] = order
     return cfg
 
