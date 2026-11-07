@@ -375,7 +375,11 @@ def fetch_album_retry(fn, seconds, label, attempts=3, wait=3.0):
     return None
 
 
+_FAILED_ALBUMS_TOTAL = [0]   # running count of albums that could not be read this process
+
+
 def _report_failed_albums(service, failed):
+    _FAILED_ALBUMS_TOTAL[0] += len(failed or ())
     if failed:
         shown = ', '.join(str(a) for a in failed[:20])
         more = f' … (+{len(failed) - 20})' if len(failed) > 20 else ''
@@ -1031,11 +1035,17 @@ def enumerate_cached(svc, session, artist_id, credited, max_albums, artist_filte
         log(f'  {svc}: cache stale (new/changed albums) -> re-enumerating')
     t_before = set(_TITLES)
     p_before = len(_PRERELEASE)
+    f_before = _FAILED_ALBUMS_TOTAL[0]
     out = real(session, artist_id, credited, max_albums, artist_filter,
                own_albums_only, artist_name)
     titles_delta = {k: _TITLES[k] for k in _TITLES if k not in t_before}
     pre_delta = [list(x) for x in _PRERELEASE[p_before:]]
     album_ids = _LAST_ALBUM_IDS.get((svc, str(artist_id)), [])
+    if _FAILED_ALBUMS_TOTAL[0] > f_before or not out:
+        # Incomplete read (albums failed after retries, or nothing came back): never
+        # cache it, or the next run would see a "fresh" cache that is missing tracks.
+        log(f'  {svc}: incomplete enumeration -> not cached (next run will read it again)')
+        return out
     _write_enum_cache(path, out, titles_delta, pre_delta, album_ids)
     return out
 

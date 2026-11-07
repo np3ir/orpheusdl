@@ -78,3 +78,33 @@ def test_refine_keeps_proxy_on_failure(monkeypatch):
     union = {'X': {'qobuz': ('1', 24, 96.0), 'tidal': ('2', 24, 96.0)}}
     abq.refine_tidal_quality(union)
     assert union['X']['tidal'] == ('2', 24, 96.0)
+
+
+def _enum_with(monkeypatch, tmp_path, fake):
+    import artist_best_quality as abq
+    path = str(tmp_path / 'enum.json')
+    monkeypatch.setattr(abq, '_enum_cache_file', lambda *a, **k: path)
+    monkeypatch.setitem(abq.ENUMERATORS, 'qobuz', fake)
+    abq._LAST_ALBUM_IDS[('qobuz', '1')] = ['a1', 'a2']
+    return abq, path
+
+
+def test_incomplete_enumeration_is_not_cached(monkeypatch, tmp_path):
+    import os
+
+    def fake(*a, **k):
+        import artist_best_quality as abq
+        abq._report_failed_albums('qobuz', ['a2'])   # an album failed after retries
+        return {'ISRC1': ('1', 16, 44.1)}
+
+    abq, path = _enum_with(monkeypatch, tmp_path, fake)
+    out = abq.enumerate_cached('qobuz', None, 1, False, 0, True, False, 'X')
+    assert out == {'ISRC1': ('1', 16, 44.1)} and not os.path.exists(path)
+
+
+def test_complete_enumeration_is_cached(monkeypatch, tmp_path):
+    import os
+    abq, path = _enum_with(monkeypatch, tmp_path,
+                           lambda *a, **k: {'ISRC1': ('1', 16, 44.1)})
+    abq.enumerate_cached('qobuz', None, 1, False, 0, True, False, 'X')
+    assert os.path.exists(path)
