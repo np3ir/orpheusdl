@@ -1206,65 +1206,63 @@ def probe_isrc(core, service, isrc):
     return None
 
 
-def tidal_stream_quality(stream_data):
-    """(bit_depth, sample_rate_kHz) a Tidal stream really delivers, read from the
-    playback info (audioQuality + DASH audioSamplingRate); None when it is not a
-    FLAC DASH stream or the rate cannot be read."""
+def tidal_manifest_quality(attrs):
+    """(bit_depth, sample_rate_kHz) from a v2 /trackManifests `attributes` dict
+    (guest token; the preview manifest carries the full track's real format).
+    None when it is not a FLAC DASH manifest or the rate cannot be read."""
     import base64
     try:
-        if stream_data.get('manifestMimeType') != 'application/dash+xml':
+        uri = attrs.get('uri') or ''
+        if not uri.startswith('data:application/dash+xml'):
             return None
-        xml = base64.b64decode(stream_data['manifest']).decode('utf-8', 'replace')
+        xml = base64.b64decode(uri.split(',', 1)[1]).decode('utf-8', 'replace')
         if 'flac' not in xml.lower():
             return None
         m = re.search(r'audioSamplingRate="(\d+)"', xml)
         if not m:
             return None
-        sr = int(m.group(1)) / 1000.0
-        hi = str(stream_data.get('audioQuality', '')).upper() in ('HI_RES_LOSSLESS', 'HI_RES')
-        return (24 if hi else 16, sr)
+        hi = 'FLAC_HIRES' in (attrs.get('formats') or [])
+        return (24 if hi else 16, int(m.group(1)) / 1000.0)
     except Exception:
         return None
 
 
-def refine_tidal_quality(core, union):
+_TIDAL_MANIFEST_CACHE = {}   # track_id -> (bd, sr) | None
+
+
+def tidal_real_quality(track_id):
+    """Real (bit_depth, sample_rate) of a Tidal track. Metadata endpoints only say
+    "hi-res"; the v2 trackManifests endpoint, called with the guest token (no
+    account, so no 429 on the user's session), exposes the true DASH sample rate."""
+    tid = str(track_id)
+    if tid not in _TIDAL_MANIFEST_CACHE:
+        j = _tidal_guest_get(f'/trackManifests/{tid}?manifestType=MPEG_DASH&formats=FLAC_HIRES'
+                             f'&uriScheme=DATA&usage=PLAYBACK&adaptive=false')
+        attrs = ((j or {}).get('data') or {}).get('attributes') or {}
+        _TIDAL_MANIFEST_CACHE[tid] = tidal_manifest_quality(attrs) if attrs else None
+    return _TIDAL_MANIFEST_CACHE[tid]
+
+
+def refine_tidal_quality(union):
     """Tidal's catalog only says "hi-res" (proxied as 24/96). When another service
-    also offers 24-bit for the same ISRC, ask Tidal for the real stream so the
-    comparison uses the true sample rate (e.g. 24/192 beats Qobuz 24/96).
-    Failures keep the proxy value."""
+    also offers 24-bit below 192 kHz for the same ISRC, read Tidal's real sample
+    rate so the comparison is true (e.g. 24/192 beats Qobuz 24/96, and a 24/48
+    master no longer ties a real 24/96). Failures keep the proxy value."""
     todo = [(isrc, c) for isrc, c in union.items()
             if 'tidal' in c and c['tidal'][1] >= 24
-            and any(s != 'tidal' and v[1] >= 24 for s, v in c.items())]
+            and any(s != 'tidal' and v[1] >= 24 and v[2] < 192 for s, v in c.items())]
     if not todo:
         return
     log(f'\nRefining Tidal quality for {len(todo)} hi-res recording(s) also offered elsewhere...')
-    # Hi-res streams need the logged-in MOBILE_DEFAULT session (the default/guest
-    # session only ever answers CD-quality), same as the real download does.
-    try:
-        mod = core.module('tidal')
-        sess = mod.session
-        mod._ensure_credentials(force=True)
-        from modules.tidal.tidal_api import SessionType
-        hires_session = SessionType.MOBILE_DEFAULT
-        if hires_session.name not in getattr(mod, 'available_sessions', ()):
-            raise RuntimeError('no hi-res capable Tidal session')
-    except Exception as e:
-        log(f'  Tidal real quality unavailable ({e}); keeping catalog estimate.')
-        return
-    previous = sess.default
-    try:
-        sess.default = hires_session
-        for isrc, c in todo:
-            tid = c['tidal'][0]
-            sd = call_timeout(lambda tid=tid: sess.get_stream_url(tid, 'HI_RES_LOSSLESS'),
-                              30, default=None, label=f'tidal stream {tid}')
-            q = tidal_stream_quality(sd) if isinstance(sd, dict) else None
-            if q:
-                c['tidal'] = (c['tidal'][0], q[0], q[1]) + tuple(c['tidal'][3:])
-                if q != (24, 96.0):
-                    log(f'  {isrc}: Tidal real quality {q[0]}/{q[1]:g}')
-    finally:
-        sess.default = previous
+    changed = 0
+    for isrc, c in todo:
+        q = tidal_real_quality(c['tidal'][0])
+        if q:
+            if q != tuple(c['tidal'][1:3]):
+                changed += 1
+            c['tidal'] = (c['tidal'][0], q[0], q[1]) + tuple(c['tidal'][3:])
+    log(f'  Tidal real quality read for {sum(1 for _, c in todo if tidal_real_quality(c["tidal"][0]))}'
+        f'/{len(todo)}; {changed} differ from the catalog estimate.')
 
 
 # --------------------------------------------------------------------------- #
@@ -1869,7 +1867,7 @@ def main():
                     log(f'  probed {i}/{len(isrcs)} ISRCs across services...')
             log(f'\nChecked {len(union)}/{len(isrcs)} recording(s) available on {", ".join(active)}')
 
-        refine_tidal_quality(core, union)
+        refine_tidal_quality(union)
 
         # ---- library dedup ----
         idx = None
