@@ -1658,6 +1658,39 @@ class Downloader:
         """True when a track download actually transferred data (not skip/rate-limit)."""
         return result is not None and result not in ("SKIPPED", "RATE_LIMITED", "ALREADY_EXISTS")
 
+    def _quality_and_codec_options(self):
+        """The configured download quality and codec options, as the modules expect them."""
+        general = self.global_settings['general']
+        codecs = self.global_settings['codecs']
+        return (QualityEnum[general['download_quality'].upper()],
+                CodecOptions(spatial_codecs=codecs['spatial_codecs'],
+                             proprietary_codecs=codecs['proprietary_codecs']))
+
+    def _make_url_refresher(self, track_id, quality_tier, codec_options, extra_kwargs):
+        """Return a callable that fetches a fresh stream URL, or None if the module can't.
+
+        Stream URLs are signed and expire; a 401/403 mid-download is answered by asking
+        the module again for the same track. Only modules that resolve a track id to a
+        URL through ``url_or_track_id`` (Qobuz) qualify: for the others that positional
+        argument means something else, so they are left alone rather than guessed at.
+        """
+        method = getattr(self.service, 'get_track_download', None)
+        if track_id is None or method is None:
+            return None
+        try:
+            if 'url_or_track_id' not in inspect.signature(method).parameters:
+                return None
+        except (TypeError, ValueError):
+            return None
+        kwargs = self._filter_kwargs_for_method(method, extra_kwargs or {})
+
+        def refresh():
+            info = method(track_id, quality_tier, codec_options, **kwargs)
+            if getattr(info, 'download_type', None) is DownloadEnum.URL and info.file_url:
+                return info.file_url
+            return None
+        return refresh
+
     def _apply_tidal_inter_track_pacing(self):
         """Apply TIDAL inter-track delay only before a real download (not skipped files)."""
         gate = getattr(self, '_active_tidal_gate', None)
@@ -4779,6 +4812,8 @@ class Downloader:
                         enable_progress_bar=False,  # Disable progress bar for concurrent downloads
                         indent_level=0,
                         skip_if_exists=self._skip_existing_files_enabled(),
+                        refresh_url=self._make_url_refresher(
+                            track_id, *self._quality_and_codec_options(), extra_kwargs),
                     )
                     # Extract file location and bytes downloaded
                     if isinstance(result_tuple, tuple):
@@ -4798,6 +4833,9 @@ class Downloader:
                     except OSError:
                         bytes_downloaded = 0
             except Exception as e:
+                # Never swallow the reason: without it a failed track is undiagnosable.
+                self.print(f'Download failed for {getattr(track_info, "name", track_id)}: '
+                           f'{type(e).__name__}: {e}')
                 return None
 
             if not final_location:
@@ -5620,6 +5658,7 @@ class Downloader:
                     enable_progress_bar=self.global_settings['general'].get('progress_bar', False) and verbose,
                     indent_level=self.indent_number,
                     skip_if_exists=self._skip_existing_files_enabled(),
+                    refresh_url=self._make_url_refresher(track_id, quality_tier, codec_options, extra_kwargs),
                 ) if download_info.download_type is DownloadEnum.URL else shutil.move(download_info.temp_file_path, track_location)
             
             

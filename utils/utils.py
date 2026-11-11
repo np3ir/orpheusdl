@@ -4,7 +4,7 @@ import aiohttp
 import aiofiles
 from urllib.parse import urlparse, urlunparse
 from tqdm import tqdm as original_tqdm
-import threading
+import threading, time
 
 # Global flag for progress bar settings (more reliable than thread-local in async contexts)
 _progress_bars_enabled = True
@@ -271,8 +271,49 @@ def fix_byte_limit(path: str, byte_limit=250):
 
 r_session = create_requests_session()
 
-async def _download_file_async_into(session, url, file_location, headers={}, enable_progress_bar=False, indent_level=0, artwork_settings=None, max_retries=3, skip_if_exists=True):
-    """Async version of download_file using aiohttp - returns (file_location, bytes_downloaded)"""
+_RETRY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def _range_headers(headers, resume_from):
+    """Copy of ``headers`` asking only for the bytes not yet on disk."""
+    out = dict(headers or {})
+    if resume_from:
+        out['Range'] = f'bytes={resume_from}-'
+    return out
+
+
+def _resume_plan(status, response_headers, resume_from, known_total):
+    """Decide where this response's body starts and the resource's full size.
+
+    Returns ``(start, full_total)``. ``start`` is ``resume_from`` for a genuine 206 that
+    begins exactly there and describes the same resource, and 0 when the server sent the
+    whole body (caller rewrites the file). ``start`` is None when the body is a partial
+    range that cannot be used; the caller must discard the file and ask again without Range.
+    ``full_total`` may be None when unknown.
+    """
+    length = response_headers.get('content-length')
+    length = int(length) if length is not None and str(length).isdigit() else None
+    if not resume_from:
+        return 0, length
+    if status != 206:
+        return 0, length  # server ignored Range and sent the whole body
+    m = re.match(r'bytes (\d+)-\d+/(\d+|\*)', response_headers.get('content-range', ''))
+    if not m or int(m.group(1)) != resume_from:
+        return None, None  # partial range at the wrong offset
+    full = int(m.group(2)) if m.group(2) != '*' else None
+    if full is not None and known_total is not None and full != known_total:
+        return None, None  # different resource after a URL renewal
+    if full is None and length is not None:
+        full = resume_from + length
+    return resume_from, full
+
+
+async def _download_file_async_into(session, url, file_location, headers={}, enable_progress_bar=False, indent_level=0, artwork_settings=None, max_retries=3, skip_if_exists=True, refresh_url=None):
+    """Async version of download_file using aiohttp - returns (file_location, bytes_downloaded)
+
+    A failed attempt resumes from the bytes already on disk (HTTP Range). A 401/403 from
+    the CDN means the signed URL expired: renew it through ``refresh_url`` when given,
+    otherwise fail at once instead of repeating the same dead URL."""
     if skip_if_exists and os.path.isfile(file_location):
         # File already exists - return 0 bytes downloaded
         return (file_location, 0)
@@ -283,19 +324,28 @@ async def _download_file_async_into(session, url, file_location, headers={}, ena
         os.makedirs(directory, exist_ok=True)
 
     bytes_downloaded = 0
+    attempt = 0
+    refreshes_left = 2 if refresh_url else 0
+    known_total = None  # full size of the resource, to keep a resume honest across URL renewals
 
-    for attempt in range(max_retries):
+    while attempt < max_retries:
+        resume_from = os.path.getsize(file_location) if os.path.isfile(file_location) else 0
         bytes_downloaded = 0
         try:
-            async with session.get(url, headers=headers) as response:
+            async with session.get(url, headers=_range_headers(headers, resume_from)) as response:
                 response.raise_for_status()
-                
-                total = None
-                if 'content-length' in response.headers:
-                    total = int(response.headers['content-length'])
+                resume_from, total = _resume_plan(
+                    getattr(response, 'status', 200), response.headers, resume_from, known_total)
+                if resume_from is None:
+                    silentremove(file_location)
+                    known_total = None
+                    continue
+                if total is not None:
+                    known_total = total
 
                 # Use aiofiles for async file writing
-                async with aiofiles.open(file_location, 'wb') as f:
+                async with aiofiles.open(file_location, 'ab' if resume_from else 'wb') as f:
+                    bytes_downloaded = resume_from
                     if enable_progress_bar and total:
                         # Create indented progress bar with proper formatting
                         import sys
@@ -324,7 +374,7 @@ async def _download_file_async_into(session, url, file_location, headers={}, ena
                             unit='B', 
                             unit_scale=True, 
                             unit_divisor=1024, 
-                            initial=0, 
+                            initial=resume_from,
                             miniters=1,
                             leave=False,
                             file=IndentedOutput(indent_level)
@@ -362,9 +412,37 @@ async def _download_file_async_into(session, url, file_location, headers={}, ena
                 
         except (aiohttp.ClientConnectorCertificateError, aiohttp.ClientSSLError):
             raise
+        except aiohttp.ClientResponseError as e:
+            if e.status == 416 and resume_from:
+                # Stale partial no longer matches the resource: restart from zero.
+                silentremove(file_location)
+                known_total = None
+                attempt += 1
+                if attempt < max_retries:
+                    continue
+            elif e.status in (401, 403):
+                # Expired/invalid signed URL: repeating it cannot work.
+                if refreshes_left > 0:
+                    refreshes_left -= 1
+                    try:
+                        new_url = await asyncio.to_thread(refresh_url)
+                    except Exception:
+                        new_url = None
+                    if new_url:
+                        url = new_url
+                        continue  # same attempt number: a renewal is not a failed retry
+            elif e.status in _RETRY_STATUSES:
+                attempt += 1
+                if attempt < max_retries:
+                    await asyncio.sleep(2 ** (attempt - 1))
+                    continue
+            if os.path.isfile(file_location):
+                silentremove(file_location)
+            raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+            attempt += 1
+            if attempt < max_retries:
+                await asyncio.sleep(2 ** (attempt - 1))  # Exponential backoff
                 continue
             else:
                 # Clean up partial file on final failure
@@ -389,7 +467,11 @@ async def _download_file_async_into(session, url, file_location, headers={}, ena
                     pass
             raise
 
-def _download_file_into(url, file_location, headers={}, enable_progress_bar=False, indent_level=0, artwork_settings=None, skip_if_exists=True):
+class _RangeMismatch(Exception):
+    """A Range reply cannot be appended to the partial file; restart without Range."""
+
+
+def _download_file_into(url, file_location, headers={}, enable_progress_bar=False, indent_level=0, artwork_settings=None, skip_if_exists=True, resume_from=0, keep_partial=False, known_total=None):
     """Transfer into a private temporary file; publication belongs to the caller."""
     if skip_if_exists and os.path.isfile(file_location):
         return None
@@ -402,15 +484,14 @@ def _download_file_into(url, file_location, headers={}, enable_progress_bar=Fals
     # TLS validation restored (verify defaults to enabled). Explicit (connect, read) timeouts and a
     # context manager so the response/connection is always closed.
     try:
-        with r_session.get(url, stream=True, headers=headers, timeout=(10, 60)) as r:
+        with r_session.get(url, stream=True, headers=_range_headers(headers, resume_from), timeout=(10, 60)) as r:
             r.raise_for_status()
 
-            total = None
-            if 'content-length' in r.headers:
-                total = int(r.headers['content-length'])
-
-            bytes_downloaded = 0
-            with open(file_location, 'wb') as f:
+            resume_from, total = _resume_plan(getattr(r, 'status_code', 200), r.headers, resume_from, known_total)
+            if resume_from is None:
+                raise _RangeMismatch()
+            bytes_downloaded = resume_from
+            with open(file_location, 'ab' if resume_from else 'wb') as f:
                 if enable_progress_bar and total:
                     # Create indented progress bar with proper formatting
                     import sys
@@ -439,7 +520,7 @@ def _download_file_into(url, file_location, headers={}, enable_progress_bar=Fals
                         unit='B',
                         unit_scale=True,
                         unit_divisor=1024,
-                        initial=0,
+                        initial=resume_from,
                         miniters=1,
                         leave=False,
                         file=IndentedOutput(indent_level)
@@ -479,8 +560,9 @@ def _download_file_into(url, file_location, headers={}, enable_progress_bar=Fals
         raise KeyboardInterrupt
     except Exception:
         # Clean up the partial file on any failure so skip-if-exists logic can
-        # never treat a broken download as a complete file (issue #96).
-        if os.path.isfile(file_location):
+        # never treat a broken download as a complete file (issue #96). A caller that
+        # resumes (keep_partial) owns that cleanup itself.
+        if os.path.isfile(file_location) and not keep_partial:
             silentremove(file_location)
         raise
 
@@ -489,13 +571,54 @@ def _download_file_into(url, file_location, headers={}, enable_progress_bar=Fals
 
 
 def download_file(url, file_location, headers=None, enable_progress_bar=False, indent_level=0,
-                  artwork_settings=None, skip_if_exists=True):
+                  artwork_settings=None, skip_if_exists=True, refresh_url=None, max_retries=3):
     if skip_if_exists and os.path.isfile(file_location):
         return None
     temporary = temporary_sibling(file_location)
     try:
-        _download_file_into(url, temporary, headers or {}, enable_progress_bar, indent_level,
-                            artwork_settings, skip_if_exists=False)
+        attempt = 0
+        refreshes_left = 2 if refresh_url else 0
+        known_total = None
+        while True:
+            offset = os.path.getsize(temporary) if os.path.isfile(temporary) else 0
+            try:
+                _download_file_into(url, temporary, headers or {}, enable_progress_bar, indent_level,
+                                    artwork_settings, skip_if_exists=False, resume_from=offset,
+                                    keep_partial=True, known_total=known_total)
+                break
+            except _RangeMismatch:
+                open(temporary, 'wb').close()
+                known_total = None
+                attempt += 1
+                if attempt >= max_retries:
+                    raise
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else None
+                if status in (401, 403) and refreshes_left > 0:
+                    refreshes_left -= 1
+                    new_url = refresh_url()
+                    if not new_url:
+                        raise
+                    url = new_url  # signed URL expired: a renewal is not a failed retry
+                elif status == 416 and offset:
+                    open(temporary, 'wb').close()
+                    known_total = None
+                    attempt += 1
+                    if attempt >= max_retries:
+                        raise
+                elif status in _RETRY_STATUSES and attempt + 1 < max_retries:
+                    attempt += 1
+                    time.sleep(2 ** (attempt - 1))
+                else:
+                    raise
+            except requests.exceptions.SSLError:
+                raise  # a certificate problem never fixes itself: no retry, no insecure fallback
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                    requests.exceptions.ChunkedEncodingError):
+                attempt += 1
+                if attempt >= max_retries:
+                    raise
+                time.sleep(2 ** (attempt - 1))
         if publish_download(temporary, file_location, skip_if_exists):
             return file_location
         return None
@@ -505,7 +628,7 @@ def download_file(url, file_location, headers=None, enable_progress_bar=False, i
 
 async def download_file_async(session, url, file_location, headers=None, enable_progress_bar=False,
                               indent_level=0, artwork_settings=None, max_retries=3,
-                              skip_if_exists=True):
+                              skip_if_exists=True, refresh_url=None):
     if max_retries < 1:
         raise ValueError('max_retries must be at least 1')
     if skip_if_exists and os.path.isfile(file_location):
@@ -514,7 +637,7 @@ async def download_file_async(session, url, file_location, headers=None, enable_
     try:
         _, downloaded = await _download_file_async_into(
             session, url, temporary, headers or {}, enable_progress_bar, indent_level,
-            artwork_settings, max_retries, skip_if_exists=False)
+            artwork_settings, max_retries, skip_if_exists=False, refresh_url=refresh_url)
         # Keep a potentially contended process lock off the event loop. Once commit
         # starts, finish it before handling cancellation so cleanup cannot race it.
         commit = asyncio.create_task(asyncio.to_thread(
