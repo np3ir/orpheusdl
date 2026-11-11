@@ -1767,6 +1767,15 @@ def main():
         return _rc_, out_
 
     link = args.url
+    from utils import short_links
+    if short_links.is_short_link(link):
+        try:
+            resolved = short_links.resolve(link)
+        except short_links.ShortLinkError as e:
+            raise SystemExit(f'Could not resolve the Deezer share link: {e}\n'
+                             f'Open it in a browser and pass the deezer.com/track|album|playlist|artist URL.')
+        log(f'Share link -> {resolved}')
+        link = resolved
     forced_isrcs = None
     from utils import musiclink as _ml
     foreign = _ml.is_foreign(link)
