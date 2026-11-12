@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cross-service best-quality FLAC downloader (matched by ISRC).
 
-Give it ONE link from Tidal, Deezer or Qobuz -- artist, album, playlist or track:
+Give it ONE link from Tidal, Deezer or Qobuz -- artist, album, playlist, track (or a Tidal mix):
 
     python artist_best_quality.py https://tidal.com/artist/10411
     python artist_best_quality.py https://www.deezer.com/album/1603029 -q 16
@@ -12,7 +12,7 @@ and it will:
   1. Collect the recordings' ISRCs from the link:
      - artist  -> the whole discography, plus the SAME artist on the other two
        services (matched by ISRC; the union captures service-exclusive tracks);
-     - album/playlist/track -> the ISRCs in that album, playlist or track.
+     - album/playlist/track/mix -> the ISRCs in that album, playlist, track or mix.
   2. Look each recording up on all three services by ISRC (the ISRC identifies the
      exact recording, so no wrong-match guessing).
   3. Skip anything you already own (checked against the library ISRC index).
@@ -173,12 +173,13 @@ def abq_config(settings):
 # --------------------------------------------------------------------------- #
 # URL parsing
 # --------------------------------------------------------------------------- #
-MEDIA_SEGMENTS = ('artist', 'album', 'playlist', 'track')
+MEDIA_SEGMENTS = ('artist', 'album', 'playlist', 'track', 'mix')
 
 
 def parse_media_url(url):
     """Return (service, media_type, media_id) for a Tidal/Deezer/Qobuz link.
-    media_type is one of artist/album/playlist/track."""
+    media_type is one of artist/album/playlist/track/mix (mixes exist on Tidal only,
+    and their id is a hex string, not a number)."""
     u = urlparse(url if '://' in url else 'https://' + url)
     service = None
     for netloc_sub, svc in NETLOC_MAP.items():
@@ -192,8 +193,15 @@ def parse_media_url(url):
     if not seg:
         raise SystemExit(
             f'Unsupported link: {url}\n'
-            f'Use an artist, album, playlist or track URL.')
+            f'Use an artist, album, playlist, mix or track URL.')
     idx = parts.index(seg)
+    if seg == 'mix':
+        if service != 'tidal':
+            raise SystemExit(f'Unsupported link: {url}\nMixes only exist on Tidal.')
+        mix_id = parts[idx + 1] if idx + 1 < len(parts) else ''
+        if not re.fullmatch(r'[0-9A-Za-z]{10,}', mix_id):
+            raise SystemExit(f'Could not extract a mix id from: {url}')
+        return service, seg, mix_id
     mid = parts[idx + 1] if idx + 1 < len(parts) else None
     if not (mid and mid.isdigit()):
         nums = [p for p in parts if p.isdigit()]
@@ -1302,6 +1310,38 @@ def source_isrcs(core, service, mtype, mid):
         out |= _album_isrcs(core, service, mid)
     elif mtype == 'playlist':
         out |= _playlist_isrcs(core, service, mid)
+    elif mtype == 'mix' and service == 'tidal':
+        out |= _tidal_item_isrcs(s, f'mixes/{mid}/items', f'tidal mix {mid}', 'mix')
+    return out
+
+
+def _tidal_item_isrcs(s, path, label, kind):
+    """ISRCs of a Tidal `.../items` listing (playlist or mix), read 100 per request.
+
+    Each page has its own timeout + retries, so a huge playlist is read in full instead of
+    one 90 s all-or-nothing call. Rows that are not tracks (videos) carry no ISRC and are
+    skipped."""
+    out = set()
+    off, total, fails = 0, None, 0
+    while total is None or off < total:
+        page = call_timeout(
+            lambda off=off: s._get(path, {'offset': off, 'limit': 100}),
+            60, default=None, label=f'{label} @{off}')
+        if not isinstance(page, dict) or not page.get('items'):
+            fails += 1
+            if fails >= 4:
+                log(f'    (giving up at item {off}: {kind} read incomplete)')
+                break
+            continue
+        fails = 0
+        total = page.get('totalNumberOfItems', total or 0)
+        for row in page['items']:
+            it = row.get('item') if isinstance(row, dict) and 'item' in row else row
+            if isinstance(it, dict) and _u(it.get('isrc')):
+                out.add(_u(it.get('isrc')))
+        off += len(page['items'])
+        if off % 1000 < 100:
+            log(f'    ... {off}/{total} {kind} items read')
     return out
 
 
@@ -1346,29 +1386,8 @@ def _playlist_isrcs(core, service, playlist_id):
                 break
             off += len(items)
     elif service == 'tidal':
-        # Page by hand (100 per request, each page with its own timeout + retries) so a
-        # huge playlist is read in full instead of one 90 s all-or-nothing call.
-        off, total, fails = 0, None, 0
-        while total is None or off < total:
-            page = call_timeout(
-                lambda off=off: s._get('playlists/' + str(playlist_id) + '/items',
-                                       {'offset': off, 'limit': 100}),
-                60, default=None, label=f'tidal playlist {playlist_id} @{off}')
-            if not isinstance(page, dict) or not page.get('items'):
-                fails += 1
-                if fails >= 4:
-                    log(f'    (giving up at item {off}: playlist read incomplete)')
-                    break
-                continue
-            fails = 0
-            total = page.get('totalNumberOfItems', total or 0)
-            for row in page['items']:
-                it = row.get('item') if isinstance(row, dict) and 'item' in row else row
-                if isinstance(it, dict) and _u(it.get('isrc')):
-                    out.add(_u(it.get('isrc')))
-            off += len(page['items'])
-            if off % 1000 < 100:
-                log(f'    ... {off}/{total} playlist items read')
+        out |= _tidal_item_isrcs(s, 'playlists/' + str(playlist_id) + '/items',
+                                 f'tidal playlist {playlist_id}', 'playlist')
     elif service == 'deezer':
         start = 0
         while True:
@@ -1666,9 +1685,10 @@ def main():
     cfg = abq_config(settings)
 
     ap = argparse.ArgumentParser(
-        description='Download an artist/album/playlist/track as best-quality FLAC across '
+        description='Download an artist/album/playlist/track/mix as best-quality FLAC across '
                     'Tidal/Deezer/Qobuz (matched by ISRC).')
-    ap.add_argument('url', help='Tidal/Deezer/Qobuz/Spotify URL: artist, album, playlist or track. '
+    ap.add_argument('url', help='Tidal/Deezer/Qobuz/Spotify URL: artist, album, playlist or track '
+                                '(or a tidal.com/mix/... link). '
                                 '(Spotify is a metadata-only source: audio comes from the other services.)')
     ap.add_argument('-q', '--quality', default=None,
                     help='best|max | hires|24|hifi | lossless|16  (default from settings.json: %(default)s)')

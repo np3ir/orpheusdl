@@ -7,7 +7,7 @@
 ## English
 
 `artist_best_quality.py` takes **one** link from Tidal, Deezer, Qobuz **or Spotify**
-— an **artist, album, playlist or track** — and downloads it as the **best FLAC
+— an **artist, album, playlist or track** (or a Tidal **mix**) — and downloads it as the **best FLAC
 available across the three FLAC services**, matching recordings by **ISRC** (the code
 that identifies the exact recording, so there is no wrong-match guessing).
 
@@ -23,8 +23,10 @@ that identifies the exact recording, so there is no wrong-match guessing).
 3. Builds the **union** of every recording across the three services, deduplicated
    by ISRC — so a track that only exists on one service is still captured.
 
-**For an album / playlist / track link:**
-1. Reads the ISRCs contained in that album, playlist or track.
+**For an album / playlist / track / mix link:**
+1. Reads the ISRCs contained in that album, playlist, track or mix. A **mix**
+   (`tidal.com/mix/...`) is a Tidal-only, personalised radio-style list: it is read as
+   it is at that moment, so the same link can give other songs later.
 2. Looks each recording up on all three services directly by ISRC.
 
 **Then, in both cases:**
@@ -44,11 +46,12 @@ The install folder is on PATH, so from **any** directory use the short launcher
 `abq` (Windows). It forwards all flags to the script:
 
 ```powershell
-# Any link type works: artist, album, playlist or track
+# Any link type works: artist, album, playlist, track or Tidal mix
 abq "https://tidal.com/artist/10411"
 abq "https://www.deezer.com/album/1603029"
 abq "https://www.deezer.com/playlist/908622995"
 abq "https://tidal.com/browse/track/96594261"
+abq "https://tidal.com/mix/002eb4d20492751cbd38cfacec9390"
 
 # Ask for a specific quality
 abq "https://www.deezer.com/en/artist/221" -q 16
@@ -149,7 +152,7 @@ skip). Positive matches are re-verified against the real file on disk.
 ## Español
 
 `artist_best_quality.py` toma **un** enlace de Tidal, Deezer, Qobuz **o Spotify**
-— de **artista, álbum, playlist o track** — y lo descarga con el **mejor FLAC
+— de **artista, álbum, playlist o track** (o un **mix** de Tidal) — y lo descarga con el **mejor FLAC
 disponible entre los tres servicios FLAC**, emparejando las grabaciones por **ISRC**
 (el código que identifica la grabación exacta, así que no hay emparejamientos
 equivocados).
@@ -167,8 +170,11 @@ equivocados).
 3. Construye la **unión** de todas las grabaciones entre los tres servicios,
    deduplicada por ISRC — así un tema que solo existe en un servicio también entra.
 
-**Para un enlace de álbum / playlist / track:**
-1. Lee los ISRC contenidos en ese álbum, playlist o track.
+**Para un enlace de álbum / playlist / track / mix:**
+1. Lee los ISRC contenidos en ese álbum, playlist, track o mix. Un **mix**
+   (`tidal.com/mix/...`) es una lista personalizada tipo radio, exclusiva de Tidal: se
+   lee tal como está en ese momento, así que el mismo enlace puede dar otros temas más
+   adelante.
 2. Busca cada grabación directamente por ISRC en los tres servicios.
 
 **Después, en ambos casos:**
@@ -188,11 +194,12 @@ La carpeta de instalación está en el PATH, así que desde **cualquier** carpet
 usa el lanzador corto `abq` (Windows). Pasa todos los flags al script:
 
 ```powershell
-# Sirve cualquier tipo de enlace: artista, álbum, playlist o track
+# Sirve cualquier tipo de enlace: artista, álbum, playlist, track o mix de Tidal
 abq "https://tidal.com/artist/10411"
 abq "https://www.deezer.com/album/1603029"
 abq "https://www.deezer.com/playlist/908622995"
 abq "https://tidal.com/browse/track/96594261"
+abq "https://tidal.com/mix/002eb4d20492751cbd38cfacec9390"
 
 # Pedir una calidad concreta
 abq "https://www.deezer.com/en/artist/221" -q 16
