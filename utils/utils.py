@@ -36,11 +36,23 @@ def hash_string(input_str: str, hash_type: str = 'MD5'):
     else:
         raise Exception('Invalid hash type selected')
 
+DEFAULT_HTTP_TIMEOUT = (10, 60)  # (connect, read) seconds
+
+
+class TimeoutHTTPAdapter(HTTPAdapter):
+    """requests waits forever by default; give every call a timeout unless it sets one."""
+
+    def send(self, request, **kwargs):
+        if kwargs.get('timeout') is None:
+            kwargs['timeout'] = DEFAULT_HTTP_TIMEOUT
+        return super().send(request, **kwargs)
+
+
 def create_requests_session():
     session_ = requests.Session()
     retries = Retry(total=10, backoff_factor=0.4, status_forcelist=[429, 500, 502, 503, 504])
-    session_.mount('http://', HTTPAdapter(max_retries=retries))
-    session_.mount('https://', HTTPAdapter(max_retries=retries))
+    session_.mount('http://', TimeoutHTTPAdapter(max_retries=retries))
+    session_.mount('https://', TimeoutHTTPAdapter(max_retries=retries))
     return session_
 
 def create_aiohttp_session():

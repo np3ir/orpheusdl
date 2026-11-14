@@ -18,5 +18,4 @@ protobuf==3.20.1
 httpx
 pybase62
 Unidecode
-flask
 librespot==0.0.10

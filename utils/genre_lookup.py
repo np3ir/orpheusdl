@@ -18,6 +18,7 @@ that tagging a file with them still stores them in the file.
 Never raises: any failure just means "no genre found".
 """
 import json
+import logging
 import os
 import threading
 import time
@@ -183,15 +184,20 @@ class GenreLookup:
         with self._lock:
             if not self._dirty:
                 return
+            tmp = f'{self.cache_path}.{os.getpid()}.tmp'
             try:
                 os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
-                tmp = f'{self.cache_path}.{os.getpid()}.tmp'
                 with open(tmp, 'w', encoding='utf-8') as f:
                     json.dump(self._cache, f, ensure_ascii=False)
                 os.replace(tmp, self.cache_path)
                 self._dirty = 0
-            except Exception:
-                pass
+            except Exception as e:
+                logging.warning('genre cache not saved: %s: %s', type(e).__name__, e)
+            finally:
+                try:
+                    os.remove(tmp)  # gone after a successful replace; removes the leftover on failure
+                except OSError:
+                    pass
 
     def _remember(self, key, genres, sp=False, q=False):
         row = {'g': list(genres), 't': int(time.time())}

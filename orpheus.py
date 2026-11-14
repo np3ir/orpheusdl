@@ -28,7 +28,6 @@ from urllib.parse import urlparse
 try:
     import requests
     import urllib3
-    import flask
 except ImportError as e:
     missing_module = str(e).split("'")[-2] if "'" in str(e) else str(e)
     print(f"\n[FATAL ERROR] Missing dependency: {missing_module}")

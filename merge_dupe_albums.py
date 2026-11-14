@@ -5,8 +5,9 @@ in separate folders:
     Artista/(2019) Album  +  Artista/(2020) Album   (mismo album, distinto servicio)
 
 This merges them into ONE folder (the one with the MOST tracks is kept; ties -> earliest
-year), moving tracks in and DE-DUPING by ISRC (same ISRC/size -> drop; genuinely different
--> kept as " (N)"). Genuinely different same-named albums (different ISRCs, e.g. Chayanne
+year), moving tracks in and DE-DUPING by ISRC (same ISRC -> the better-quality copy stays, the
+other goes to a reversible quarantine <dir>\_duplicados, never a hard delete; genuinely
+different -> kept as " (N)"). Undo: python purge_non_flac.py --rollback config/merge_dupe_albums_journal.csv. Genuinely different same-named albums (different ISRCs, e.g. Chayanne
 1988 vs 1998) are matched by ISRC and LEFT ALONE. Folders with no readable ISRC are left
 alone (conservative).
 
@@ -15,7 +16,9 @@ alone (conservative).
 """
 import os, argparse, shutil
 from collections import defaultdict
-from mutagen import File as MutFile
+
+from purge_non_flac import quarantine_move
+from utils.library_tools import isrc_of, quality_key
 
 ap = argparse.ArgumentParser()
 ap.add_argument('--dir', default='Z:\\')
@@ -23,35 +26,15 @@ ap.add_argument('--apply', action='store_true')
 args = ap.parse_args()
 
 AUDIO = {'.flac', '.m4a', '.mp3', '.ogg', '.opus', '.wav'}
+ROOT = os.path.abspath(args.dir)
+QDIR = os.path.join(ROOT, '_duplicados')
+JOURNAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config', 'merge_dupe_albums_journal.csv')
 
 
 def strip_year(name):
     if len(name) > 7 and name[0] == '(' and name[5] == ')' and name[6] == ' ' and name[1:5].isdigit():
         return name[7:], name[1:5]
     return name, None
-
-
-def isrc_of(path):
-    try:
-        mf = MutFile(path)
-        tags = getattr(mf, 'tags', None)
-        if not tags:
-            return None
-        for k in ('isrc', 'ISRC', 'TSRC', '----:com.apple.iTunes:ISRC'):
-            if k in tags:
-                v = tags[k]
-                v = v[0] if isinstance(v, (list, tuple)) and v else v
-                if hasattr(v, 'text'):
-                    t = v.text
-                    v = t[0] if isinstance(t, (list, tuple)) and t else t
-                if isinstance(v, bytes):
-                    v = v.decode('utf-8', 'ignore')
-                v = str(v).strip().upper()
-                if v:
-                    return v
-    except Exception:
-        return None
-    return None
 
 
 def audio_files(folder):
@@ -69,6 +52,7 @@ def folder_isrcs(folder):
 # 1. collect album folders (dirs that directly contain audio), grouped by (parent, stripped name)
 groups = defaultdict(list)
 for dp, _dirs, files in os.walk(args.dir):
+    _dirs[:] = [d for d in _dirs if d.lower() != '_duplicados']  # skip the quarantine
     if any(os.path.splitext(f)[1].lower() in AUDIO for f in files):
         base, _yr = strip_year(os.path.basename(dp))
         groups[(os.path.dirname(dp), base)].append(dp)
@@ -115,19 +99,32 @@ for (parent, base), folders in groups.items():
                     if not os.path.exists(tfp):
                         shutil.move(sfp, tfp); files_moved += 1
                         continue
-                    same = os.path.getsize(sfp) == os.path.getsize(tfp)
+                    si = ti = None
                     if ext in AUDIO:
                         si, ti = isrc_of(sfp), isrc_of(tfp)
-                        if si and ti:
-                            same = (si == ti)
-                    if same or ext not in AUDIO:
-                        os.remove(sfp); dups_dropped += 1
+                    if ext not in AUDIO:
+                        # cover/lyrics with the same name: the keeper's copy wins, ours is quarantined
+                        quarantine_move([sfp], ROOT, QDIR, JOURNAL); dups_dropped += 1
+                    elif si and ti and si == ti:
+                        # same recording: keep the better quality, quarantine the other
+                        if quality_key(sfp) > quality_key(tfp):
+                            quarantine_move([tfp], ROOT, QDIR, JOURNAL)
+                            shutil.move(sfp, tfp)
+                        else:
+                            quarantine_move([sfp], ROOT, QDIR, JOURNAL)
+                        dups_dropped += 1
                     else:
+                        # different recording (or no readable ISRC): keep both
                         b, e = os.path.splitext(tfp); n = 2
                         while os.path.exists(f'{b} ({n}){e}'):
                             n += 1
                         shutil.move(sfp, f'{b} ({n}){e}'); kept_variants += 1
-            shutil.rmtree(src, ignore_errors=True); folders_removed += 1
+            for r, _d, _f in os.walk(src, topdown=False):  # only empty folders: never rmtree files
+                try:
+                    os.rmdir(r)
+                except OSError:
+                    pass
+            folders_removed += not os.path.exists(src)
 
 print(f"\n{'APLICADO' if args.apply else 'DRY-RUN'}: grupos a fusionar={merged_groups}"
       f" | nombres con albumes distintos dejados aparte={kept_separate}"
